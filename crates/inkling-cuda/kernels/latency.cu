@@ -41,12 +41,14 @@ __device__ __forceinline__ void block_rs(float (&v)[N], float (*red)[32], float*
 }
 
 // RMS-normalize up to 4 vectors (one block of 768 threads each, D = 2304) -> y_j and q8_1.
+// Batched: grid.y = tokens, every array advances by D (scales by D/32) per token.
 INK_EXTERN void __launch_bounds__(768) ink_rmsnorm_q2(NormQ4 a, int D_, float eps) {
     constexpr int D = 2304, NT = 768, EPT = 3;
     __shared__ float red[NT / 32][32];
     __shared__ float tot[1];
     const int j = blockIdx.x;
-    const float* x = a.x[j];
+    const size_t to = (size_t)blockIdx.y * D;
+    const float* x = a.x[j] + to;
     const float* wt = a.w[j];
     float xv[EPT], wv[EPT];
 #pragma unroll
@@ -63,8 +65,8 @@ INK_EXTERN void __launch_bounds__(768) ink_rmsnorm_q2(NormQ4 a, int D_, float ep
     for (int e = 0; e < EPT; ++e) {
         const int i = threadIdx.x + e * NT;
         const float v = xv[e] * inv * wv[e];
-        if (a.y[j]) a.y[j][i] = v;
-        if (a.xq[j]) warp_quant32(v, a.xq[j] + (i & ~31), a.xd[j] + (i >> 5));
+        if (a.y[j]) a.y[j][to + i] = v;
+        if (a.xq[j]) warp_quant32(v, a.xq[j] + to + (i & ~31), a.xd[j] + to / 32 + (i >> 5));
     }
 }
 
@@ -80,6 +82,10 @@ __device__ __forceinline__ void mix6(const MixArgsQ& A) {
     __shared__ float prob[NQ][MS];
     const int n = a.n;
     const bool want_n = a.outn != nullptr;
+    // batched: token t of T (grid.y); states are [T][D], outputs [NQ][T][D]
+    const int t = blockIdx.y, T = gridDim.y;
+    const size_t so = (size_t)t * D;
+    auto oo = [&](int q) { return ((size_t)q * T + t) * D; };
     float v[EPT][MS], nwv[EPT][NQ];
     float part[NVP];
 #pragma unroll
@@ -94,7 +100,7 @@ __device__ __forceinline__ void mix6(const MixArgsQ& A) {
             nwv[e][q] = want_n && a.nw[q] ? __ldg(a.nw[q] + i) : 0.0f;
         }
 #pragma unroll
-        for (int s = 0; s < MS; ++s) v[e][s] = s < n ? a.st[s][i] : 0.0f;
+        for (int s = 0; s < MS; ++s) v[e][s] = s < n ? a.st[s][so + i] : 0.0f;
 #pragma unroll
         for (int s = 0; s < MS; ++s) {
             part[s] = fmaf(v[e][s], v[e][s], part[s]);
@@ -131,7 +137,7 @@ __device__ __forceinline__ void mix6(const MixArgsQ& A) {
 #pragma unroll
             for (int s = 0; s < MS; ++s) acc = fmaf(prob[q][s], v[e][s], acc);
             o[e][q] = acc;
-            a.out[q * D + i] = acc;
+            a.out[oo(q) + i] = acc;
             osq[q] = fmaf(acc, acc, osq[q]);
         }
     }
@@ -145,8 +151,8 @@ __device__ __forceinline__ void mix6(const MixArgsQ& A) {
         for (int e = 0; e < EPT; ++e) {
             const int i = threadIdx.x + e * NT;  // a warp covers 32 consecutive i: one q8_1 block
             const float val = o[e][q] * on * nwv[e][q];
-            a.outn[q * D + i] = val;
-            if (A.xq) warp_quant32(val, A.xq + q * D + (i & ~31), A.xd + q * (D / 32) + (i >> 5));
+            a.outn[oo(q) + i] = val;
+            if (A.xq) warp_quant32(val, A.xq + oo(q) + (i & ~31), A.xd + oo(q) / 32 + (i >> 5));
         }
     }
 }
@@ -221,6 +227,7 @@ INK_EXTERN void __launch_bounds__(192) ink_ctrl_down2(Ctrl4H a, int D_, int R) {
     __shared__ float red[NT / 32][32];
     __shared__ float tot[4];
     const int j = blockIdx.y, r = blockIdx.x;
+    const size_t to = (size_t)blockIdx.z * D;  // batched: token = grid.z (c, m advance by D, g by R)
     const uint4* row = reinterpret_cast<const uint4*>(a.wd[j] + (size_t)r * 2 * D);
     uint4 u[PT];
     float4 x0[PT], x1[PT];
@@ -228,7 +235,7 @@ INK_EXTERN void __launch_bounds__(192) ink_ctrl_down2(Ctrl4H a, int D_, int R) {
     for (int t = 0; t < PT; ++t) {
         const int ui = threadIdx.x + t * NT, base = ui * 8;
         u[t] = __ldg(row + ui);
-        const float* src = base >= D ? a.m[j] + (base - D) : a.c[j] + base;
+        const float* src = base >= D ? a.m[j] + to + (base - D) : a.c[j] + to + base;
         x0[t] = *reinterpret_cast<const float4*>(src);
         x1[t] = *reinterpret_cast<const float4*>(src + 4);
     }
@@ -251,5 +258,5 @@ INK_EXTERN void __launch_bounds__(192) ink_ctrl_down2(Ctrl4H a, int D_, int R) {
         acc[3] += second ? q : 0.0f;
     }
     block_rs<4, NT / 32>(acc, red, tot);
-    if (threadIdx.x == 0) a.g[j][r] = tot[0] * rsqrtf(tot[2] / D + 1e-6f) + tot[1] * rsqrtf(tot[3] / D + 1e-6f);
+    if (threadIdx.x == 0) a.g[j][(size_t)blockIdx.z * R + r] = tot[0] * rsqrtf(tot[2] / D + 1e-6f) + tot[1] * rsqrtf(tot[3] / D + 1e-6f);
 }

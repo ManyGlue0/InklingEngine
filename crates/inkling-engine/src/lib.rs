@@ -4,13 +4,14 @@
 //! Activations feeding the quantized matvecs are int8 (q8_1 blocks of 32, as llama.cpp's mmvq), produced by the
 //! kernel that computes them (depth-attention mix, norms, attention output, expert gate_up).
 
+mod prefill;
 pub mod repack;
 pub mod weights;
 
 use anyhow::{Context, Result, ensure};
 use inkling_core::{Config, Gguf};
 use inkling_cuda::cudarc::driver::{CudaGraph, sys};
-use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, Gpu, HostMapped, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
+use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, GemmArgs, GemmSeg, Gpu, HostMapped, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
 
 pub use weights::{ExpertFmt, LayerW, Weights};
 
@@ -112,6 +113,8 @@ pub struct Engine {
     attn_splits: u32,
     /// INKLING_MOE_TL: per-slot, per-block phase timestamps of the persistent MoE kernel (u64 [slot][block][8])
     pub moe_tl: Option<DevBuf>,
+    /// batched prompt-processing buffers
+    pre: Option<prefill::PrefillBufs>,
 }
 
 /// Optional per-pass hook, called after each layer pass with (slot, engine); use `Engine::debug_buf` to read state.
@@ -137,7 +140,8 @@ impl Engine {
         }
         let mut slots = Vec::with_capacity(cfg.n_slots());
         for s in 0..cfg.n_slots() {
-            let cap = if cfg.is_swa[slot_phys[s]] { cfg.n_swa.min(n_ctx) } else { n_ctx };
+            // sliding-window ring: a prefill chunk writes its K/V before attending, so window + chunk - 1 must fit
+            let cap = if cfg.is_swa[slot_phys[s]] { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
             slots.push(Slot {
                 k: gpu.alloc(cap * kvw * 2)?,
                 v: gpu.alloc(cap * kvw * 2)?,
@@ -206,8 +210,9 @@ impl Engine {
         } else {
             ATTN_SPLITS_MAX as u32
         };
+        let pre = Some(prefill::PrefillBufs::new(&gpu, &cfg)?);
         let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits })
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -227,6 +232,59 @@ impl Engine {
         let raw = self.gpu.read_f32(b.at(slot * nb * 64), nb * 16)?;
         let words: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
         Ok((0..nb).map(|i| std::array::from_fn(|k| words[i * 16 + 2 * k] as u64 | (words[i * 16 + 2 * k + 1] as u64) << 32)).collect())
+    }
+
+    /// Self-test of the prefill int8 GEMM against the decode matvec: random q8_1 activations for `t` tokens through
+    /// layer `layer`'s q|r|gate, k and v projections. Returns (max abs error, max abs value), and the GEMM time (ms)
+    /// of `reps` repetitions.
+    pub fn test_gemm(&self, layer: usize, t: usize, reps: usize) -> Result<(f32, f32, f64)> {
+        let cfg = &self.cfg;
+        let (d, kvw, qd) = (cfg.n_embd, cfg.n_head_kv * cfg.head_dim, cfg.n_head * cfg.head_dim);
+        let lw = self.w.layers[layer];
+        let nq = 2 * qd + cfg.n_head * cfg.n_rel;
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let xq: Vec<i8> = (0..t * d).map(|_| (rnd() % 255) as i64 as i8).map(|v| v.wrapping_sub(127)).collect();
+        let xd: Vec<f32> = (0..t * d / 32).map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4).collect();
+        let bx = self.gpu.upload(inkling_cuda::as_bytes(&xq))?;
+        let bxd = self.gpu.upload_f32(&xd)?;
+        let outs = [nq, kvw, kvw];
+        let yg: Vec<DevBuf> = outs.iter().map(|&n| self.gpu.alloc(t * n * F32)).collect::<Result<_>>()?;
+        let ym: Vec<DevBuf> = outs.iter().map(|&n| self.gpu.alloc(t * n * F32)).collect::<Result<_>>()?;
+        let ws = [lw.wqrg, lw.wk, lw.wv];
+        let mut a = GemmArgs { nseg: 3, t: t as i32, k: d as i32, ..Default::default() };
+        for j in 0..3 {
+            a.s[j] = GemmSeg { w: ws[j].qs, wd: ws[j].d, x: bx.ptr, xd: bxd.ptr, y: yg[j].ptr, n: outs[j] as i32, ldy: outs[j] as i32 };
+        }
+        let tiles: usize = outs.iter().map(|n| n.div_ceil(64)).sum();
+        let launch = || self.gpu.launch("ink_gemm_q8", (tiles as u32, t.div_ceil(64) as u32), 128, &[Arg::Gemm(a)]);
+        launch()?;
+        for tok in 0..t {
+            let segs: Vec<_> = (0..3).map(|j| (ws[j], (bx.at(tok * d), bxd.at(tok * d / 32 * F32)), ym[j].at(tok * outs[j] * F32), outs[j])).collect();
+            self.mv(&segs, d)?;
+        }
+        self.gpu.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            launch()?;
+        }
+        self.gpu.sync()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / reps.max(1) as f64;
+        let (mut err, mut mag) = (0.0f32, 0.0f32);
+        for j in 0..3 {
+            let g = self.gpu.read_f32(yg[j].ptr, t * outs[j])?;
+            let m = self.gpu.read_f32(ym[j].ptr, t * outs[j])?;
+            for (x, y) in g.iter().zip(&m) {
+                err = err.max((x - y).abs());
+                mag = mag.max(y.abs());
+            }
+        }
+        Ok((err, mag, ms))
     }
 
     /// Read a scratch buffer by name (debugging / validation).
@@ -448,7 +506,7 @@ if self.attn_splits > 0 {
                     Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
                     Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                     Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
-                    Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr),
+                    Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr), Arg::I32((2 * qd + cfg.n_head * cfg.n_rel) as i32), Arg::I32(0),
                 ])?;
             } else {
                             self.gpu.launch("ink_attn_decode2", (cfg.n_head as u32, 1), 128, &[
@@ -563,9 +621,16 @@ if self.attn_splits > 0 {
         self.reset()?;
         let p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
         self.gpu.write(self.act.prompt.ptr, inkling_cuda::as_bytes(&p))?;
-        self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[0], 0, 0, 0]))?;
-        for _ in 0..prompt.len() - 1 {
-            self.launch_graph(Tail::Prefill)?;
+        let n = prompt.len();
+        if n > 1 && std::env::var_os("INKLING_NO_PREFILL").is_none() {
+            // batched prompt processing for all but the last token; the last one runs as the first decode step
+            self.prefill(&prompt[..n - 1], 0)?;
+            self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[n - 1], (n - 1) as i32, 0, 0]))?;
+        } else {
+            self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[0], 0, 0, 0]))?;
+            for _ in 0..n - 1 {
+                self.launch_graph(Tail::Prefill)?;
+            }
         }
         const AHEAD: usize = 3;
         let mut events = Vec::with_capacity(max_new);

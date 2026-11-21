@@ -130,6 +130,27 @@ pub struct NormQ4 {
     pub xq: [u64; 4],
     pub xd: [u64; 4],
 }
+/// One segment of the prefill int8 GEMM (mirrors `GemmSeg` in prefill.cu).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GemmSeg {
+    pub w: u64,
+    pub wd: u64,
+    pub x: u64,
+    pub xd: u64,
+    pub y: u64,
+    pub n: i32,
+    pub ldy: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GemmArgs {
+    pub s: [GemmSeg; 4],
+    pub nseg: i32,
+    pub t: i32,
+    pub k: i32,
+}
+unsafe impl DeviceRepr for GemmArgs {}
 unsafe impl DeviceRepr for MvQ4 {}
 unsafe impl DeviceRepr for MixArgsQ {}
 unsafe impl DeviceRepr for NormQ4 {}
@@ -154,6 +175,7 @@ pub enum Arg {
     MvQ(MvQ4),
     MixQ(MixArgsQ),
     NormQ(NormQ4),
+    Gemm(GemmArgs),
 }
 
 impl From<&DevBuf> for Arg {
@@ -307,6 +329,11 @@ impl Gpu {
 
     /// Launch kernel `name` with a 1-D/2-D grid.
     pub fn launch(&self, name: &str, grid: (u32, u32), block: u32, args: &[Arg]) -> Result<()> {
+        self.launch3(name, (grid.0, grid.1, 1), block, args)
+    }
+
+    /// Launch with a 3-D grid.
+    pub fn launch3(&self, name: &str, grid: (u32, u32, u32), block: u32, args: &[Arg]) -> Result<()> {
         let f = self.func(name)?;
         let mut l = self.stream.launch_builder(&f);
         for a in args {
@@ -323,9 +350,10 @@ impl Gpu {
                 Arg::MvQ(v) => l.arg(v),
                 Arg::MixQ(v) => l.arg(v),
                 Arg::NormQ(v) => l.arg(v),
+                Arg::Gemm(v) => l.arg(v),
             };
         }
-        let cfg = LaunchConfig { grid_dim: (grid.0, grid.1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 };
         unsafe { l.launch(cfg) }.with_context(|| format!("launching {name}"))?;
         Ok(())
     }

@@ -10,11 +10,49 @@ fn main() -> Result<()> {
         Some("smoke") => smoke(),
         Some("inspect") if args.len() > 1 => inspect(&args[1]),
         Some("tokenize") if args.len() > 2 => tokenize(&args[1], &args[2], args.iter().any(|a| a == "--special")),
+        Some("validate") if args.len() > 2 && args.iter().any(|a| a == "--prefill") => validate_prefill(&args[1], &args[2]),
         Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
+        Some("gemmtest") if args.len() > 1 => gemmtest(&args[1]),
+        Some("benchpp") if args.len() > 1 => benchpp(&args[1], args.get(2).and_then(|s| s.parse().ok())),
         Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
         _ => bail!("usage: inkling smoke | inkling inspect <model.gguf> | inkling tokenize <model.gguf> <file> [--special]"),
     }
+}
+
+/// Prefill GEMM self-test vs the decode matvec, plus GEMM throughput.
+fn gemmtest(model: &str) -> Result<()> {
+    let eng = inkling_engine::Engine::load(model, 4096)?;
+    for t in [1usize, 37, 64, 512] {
+        let (err, mag, ms) = eng.test_gemm(0, t, 20)?;
+        let flops = 2.0 * t as f64 * 2304.0 * (6528.0 + 2048.0);
+        println!("T={t:4}: max |gemm - matvec| = {err:.3e} (max |y| {mag:.2}) | {ms:.3} ms = {:.1} TOPS", flops / ms / 1e9);
+    }
+    Ok(())
+}
+
+/// Prompt-processing throughput of the batched prefill at several prompt lengths.
+fn benchpp(model: &str, only: Option<usize>) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 16384)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let text = std::fs::read_to_string("tests/data/prompt_long.txt").unwrap_or_else(|_| "The quick brown fox jumps over the lazy dog. ".repeat(50));
+    let base = tok.encode(&text, true)?;
+    for n in only.map_or(vec![128usize, 512, 2048, 8192], |n| vec![n]) {
+        let ids: Vec<u32> = base.iter().cycle().take(n).copied().collect();
+        eng.reset()?;
+        eng.prefill(&ids, 0)?; // warm-up
+        eng.gpu.sync()?;
+        let reps = (4096 / n).max(1);
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            eng.reset()?;
+            eng.prefill(&ids, 0)?;
+        }
+        eng.gpu.sync()?;
+        let s = t0.elapsed().as_secs_f64() / reps as f64;
+        println!("pp{n}: {:.0} tok/s ({:.1} ms)", n as f64 / s, s * 1e3);
+    }
+    Ok(())
 }
 
 /// Throughput with the device-side loop: prompt processing + greedy decode of `n` tokens, no printing.
@@ -33,7 +71,7 @@ fn bench(model: &str, n: usize) -> Result<()> {
     let m = out.len() - 1;
     println!("prompt {} tok: {:.1} tok/s | decode {m} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, m as f64 / dec, dec * 1e3 / m as f64);
     if eng.moe_tl.is_some() {
-        for slot in [0usize, 10, 30] {
+        for slot in [10usize, 21] {
             let tl = eng.moe_timeline(slot)?;
             let t0 = tl.iter().map(|r| r[0]).min().unwrap();
             let rel = |k: usize, f: fn(u64, u64) -> u64| tl.iter().map(|r| r[k] - t0).fold(if f(0, 1) == 0 { u64::MAX } else { 0 }, f) as f64 / 1e3;
@@ -50,32 +88,32 @@ fn bench(model: &str, n: usize) -> Result<()> {
 /// Greedy generation from a raw prompt (special tokens parsed); reports prefill and decode speed.
 fn generate(model: &str, prompt: &str, n_gen: usize) -> Result<()> {
     use std::io::Write;
-    let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    let mut eng = inkling_engine::Engine::load(model, 16384)?;
     let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
     let text = std::fs::read_to_string(prompt).unwrap_or_else(|_| prompt.to_owned());
     let ids = tok.encode(&text, true)?;
-    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
-    let t0 = Instant::now();
-    let mut logits = Vec::new();
-    for (pos, &id) in ids.iter().enumerate() {
-        logits = eng.step(id, pos, None)?;
-    }
-    let pre = t0.elapsed().as_secs_f64();
     print!("{}", text);
-    let t1 = Instant::now();
-    let mut n = 0;
-    for i in 0..n_gen {
-        let next = argmax(&logits);
-        if next == tok.eos {
-            break;
+    let t0 = Instant::now();
+    let mut first: Option<f64> = None;
+    let eos = tok.eos;
+    let out = eng.generate(&ids, n_gen, |t| {
+        if first.is_none() {
+            first = Some(t0.elapsed().as_secs_f64());
         }
-        print!("{}", String::from_utf8_lossy(&tok.token_bytes(next, true)));
-        std::io::stdout().flush()?;
-        logits = eng.step(next, ids.len() + i, None)?;
-        n += 1;
-    }
-    let dec = t1.elapsed().as_secs_f64();
-    println!("\n---\nprompt {} tok in {:.2}s ({:.1} tok/s) | decode {} tok in {:.2}s ({:.1} tok/s)", ids.len(), pre, ids.len() as f64 / pre, n, dec, n as f64 / dec);
+        if t == eos {
+            return false;
+        }
+        print!("{}", String::from_utf8_lossy(&tok.token_bytes(t, true)));
+        let _ = std::io::stdout().flush();
+        true
+    })?;
+    let total = t0.elapsed().as_secs_f64();
+    let ttft = first.unwrap_or(total);
+    let n = out.len().saturating_sub(1);
+    println!("
+---
+prompt {} tok, time to first token {:.0} ms ({:.0} tok/s) | decode {} tok in {:.2}s ({:.1} tok/s)",
+        ids.len(), ttft * 1e3, ids.len() as f64 / ttft, n, total - ttft, n as f64 / (total - ttft).max(1e-9));
     Ok(())
 }
 
@@ -106,6 +144,38 @@ fn kl_top1(ours: &[f32], reference: &[f32]) -> (f64, bool) {
 }
 
 /// Replay a refdump prompt token by token; compare every layer output (l_out-<slot>) and the logits.
+/// Batched prefill of the whole dump prompt; KL / top-1 of every position's logits against the reference.
+fn validate_prefill(model: &str, dump: &str) -> Result<()> {
+    use inkling_core::npy;
+    let dir = std::path::Path::new(dump);
+    let toks = npy::read(dir.join("tokens.npy"))?;
+    let ref_logits = npy::read(dir.join("logits.npy"))?;
+    let t_n = toks.data.len();
+    let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    let nv = eng.cfg.n_vocab_unpadded;
+    let n_vocab_ref = ref_logits.shape[1];
+    let ids: Vec<u32> = toks.data.iter().map(|&v| v as u32).collect();
+    eng.prefill_logits(&ids)?; // warm-up
+    let t0 = Instant::now();
+    let logits = eng.prefill_logits(&ids)?;
+    let el = t0.elapsed().as_secs_f64();
+    let mut kls = Vec::with_capacity(t_n);
+    let mut agree = 0usize;
+    for t in 0..t_n {
+        let (kl, top1) = kl_top1(&logits[t * nv..(t + 1) * nv], &ref_logits.data[t * n_vocab_ref..t * n_vocab_ref + nv]);
+        if t < 3 || kl > 0.05 || std::env::var_os("INKLING_KL_ALL").is_some() {
+            println!("t={t:3}  KL={kl:.5}  top1={}", if top1 { "same" } else { "DIFF" });
+        }
+        kls.push(kl);
+        agree += top1 as usize;
+    }
+    let mean = kls.iter().sum::<f64>() / t_n as f64;
+    kls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!("--- prefill {t_n} tokens: mean KL {mean:.5}, median {:.6}, p99 {:.4}, top-1 agreement {agree}/{t_n} ({:.0} ms incl. logits readback)",
+        kls[t_n / 2], kls[(t_n * 99 / 100).min(t_n - 1)], el * 1e3);
+    Ok(())
+}
+
 fn validate(model: &str, dump: &str) -> Result<()> {
     use inkling_core::npy;
     let dir = std::path::Path::new(dump);

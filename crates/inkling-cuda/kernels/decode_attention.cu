@@ -22,7 +22,7 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_split(const float* __
                                                                  const float* __restrict__ gate, float* __restrict__ out,
                                                                  int8_t* __restrict__ oq, float* __restrict__ od, const int* __restrict__ step,
                                                                  int kv_cap, int window, int extent, float* __restrict__ part,
-                                                                 unsigned int* __restrict__ counters) {
+                                                                 unsigned int* __restrict__ counters, int qstride, int sstride) {
     using namespace att;
     __shared__ __align__(16) float qs[NQ][HD];
     __shared__ float rs[NQ][16];
@@ -34,7 +34,19 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_split(const float* __
 
     const int kvh = blockIdx.x, split = blockIdx.y, NS = gridDim.y;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int pos = step[1];
+    // batched prefill: query token t = grid.z at position step[1] + t (its K/V are already in the cache);
+    // q, r, gate advance by qstride per token, outputs by 24 heads, partials and counters per token
+    const int tq = blockIdx.z;
+    const int pos = step[1] + tq;
+    q += (size_t)tq * qstride;
+    r += (size_t)tq * qstride;
+    gate += (size_t)tq * qstride;
+    sink += (size_t)tq * sstride;
+    out += (size_t)tq * 24 * HD;
+    oq += (size_t)tq * 24 * HD;
+    od += (size_t)tq * 24 * (HD / 32);
+    counters += (size_t)tq * gridDim.x;
+    part += (size_t)tq * gridDim.x * NS * (NQ * (HD + 2));
     const int j0 = window ? max(0, pos - window + 1) : 0;
     const int npos = pos - j0 + 1;
     // split span: at least 4 tiles (one per warp), multiple of the tile

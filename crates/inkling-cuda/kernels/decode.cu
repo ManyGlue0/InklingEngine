@@ -1202,14 +1202,15 @@ INK_EXTERN void ink_ctrl_up_h(Ctrl4H a, int D, int R) {
     const int j = blockIdx.y;
     const int i = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (i >= D) return;
-    const float* g = a.g[j];
+    const size_t to = (size_t)blockIdx.z * D;  // batched: token = grid.z
+    const float* g = a.g[j] + (size_t)blockIdx.z * R;
     const __half2 wg = reinterpret_cast<const __half2*>(a.wg[j] + (size_t)i * R)[lane];  // R = 64: 2 per lane
     const __half2 wf = reinterpret_cast<const __half2*>(a.wf[j] + (size_t)i * R)[lane];
     const float2 g2 = make_float2(g[2 * lane], g[2 * lane + 1]);
     const float2 a2 = __half22float2(wg), f2 = __half22float2(wf);
     const float ga = warp_sum(a2.x * g2.x + a2.y * g2.y);
     const float fa = warp_sum(f2.x * g2.x + f2.y * g2.y);
-    if (lane == 0) a.out[j][i] = (1.0f - tanhf(fa)) * a.c[j][i] + tanhf(ga) * a.m[j][i];
+    if (lane == 0) a.out[j][to + i] = (1.0f - tanhf(fa)) * a.c[j][to + i] + tanhf(ga) * a.m[j][to + i];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
