@@ -32,6 +32,77 @@ pub struct DeviceInfo {
 pub struct Ptrs8(pub [u64; 8]);
 unsafe impl DeviceRepr for Ptrs8 {}
 
+/// One segment of a multi-matrix Q8 matvec (`MVSeg` in decode.cu).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvSeg {
+    pub qs: u64,
+    pub d: u64,
+    pub x: u64,
+    pub y: u64,
+    pub n: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Mv4 {
+    pub s: [MvSeg; 4],
+    pub nseg: i32,
+    pub k: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvSegB {
+    pub w: u64,
+    pub x: u64,
+    pub y: u64,
+    pub n: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvB4 {
+    pub s: [MvSegB; 4],
+    pub nseg: i32,
+    pub k: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ExpW {
+    pub qs: u64,
+    pub sc: u64,
+    pub scale: u64,
+    pub fmt: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Ctrl4 {
+    pub c: [u64; 4],
+    pub m: [u64; 4],
+    pub wd: [u64; 4],
+    pub wg: [u64; 4],
+    pub wf: [u64; 4],
+    pub g: [u64; 4],
+    pub out: [u64; 4],
+    pub n: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MixArgs {
+    pub st: [u64; 8],
+    pub q: u64,
+    pub out: u64,
+    pub outn: u64,
+    pub nw: [u64; 4],
+    pub n: i32,
+    pub nq: i32,
+    pub d: i32,
+    pub eps: f32,
+}
+unsafe impl DeviceRepr for Mv4 {}
+unsafe impl DeviceRepr for MvB4 {}
+unsafe impl DeviceRepr for ExpW {}
+unsafe impl DeviceRepr for Ctrl4 {}
+unsafe impl DeviceRepr for MixArgs {}
+
 /// One kernel argument.
 #[derive(Clone, Copy, Debug)]
 pub enum Arg {
@@ -39,6 +110,11 @@ pub enum Arg {
     I32(i32),
     F32(f32),
     Ptrs(Ptrs8),
+    Mv(Mv4),
+    MvB(MvB4),
+    Exp(ExpW),
+    Ctrl(Ctrl4),
+    Mix(MixArgs),
 }
 
 impl From<&DevBuf> for Arg {
@@ -91,7 +167,8 @@ impl Gpu {
         let module = ctx
             .load_module(Ptx::from_binary(KERNELS_FATBIN.to_vec()))
             .context("loading kernel fatbin: this build may not include your GPU architecture (see INKLING_CUDA_ARCHS)")?;
-        let stream = ctx.default_stream();
+        // a real stream: the legacy default stream cannot be captured into a CUDA graph
+        let stream = ctx.new_stream()?;
         Ok(Self { ctx, stream, module, info, funcs: Default::default() })
     }
 
@@ -157,6 +234,11 @@ impl Gpu {
                 Arg::I32(v) => l.arg(v),
                 Arg::F32(v) => l.arg(v),
                 Arg::Ptrs(v) => l.arg(v),
+                Arg::Mv(v) => l.arg(v),
+                Arg::MvB(v) => l.arg(v),
+                Arg::Exp(v) => l.arg(v),
+                Arg::Ctrl(v) => l.arg(v),
+                Arg::Mix(v) => l.arg(v),
             };
         }
         let cfg = LaunchConfig { grid_dim: (grid.0, grid.1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };

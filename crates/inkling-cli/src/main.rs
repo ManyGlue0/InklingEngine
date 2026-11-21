@@ -83,6 +83,7 @@ fn validate(model: &str, dump: &str) -> Result<()> {
     let t_n = toks.data.len();
     let t0 = Instant::now();
     let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    eng.use_graph = false;
     println!("loaded {:.2} GiB of weights in {:.1} s", eng.w.bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64());
     let d = eng.cfg.n_embd;
     let n_slots = eng.cfg.n_slots();

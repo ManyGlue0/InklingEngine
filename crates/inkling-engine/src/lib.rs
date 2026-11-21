@@ -1,10 +1,13 @@
-//! InklingEngine forward pass (M3 reference implementation: one kernel per spec stage, see docs/MODEL.md).
+//! InklingEngine forward pass. The decode step (docs/MODEL.md) is recorded once into a CUDA graph and replayed
+//! for every token; per-token inputs (token id, position) live in a device buffer written before each replay.
 
+pub mod repack;
 pub mod weights;
 
 use anyhow::{Result, ensure};
 use inkling_core::{Config, Gguf};
-use inkling_cuda::{Arg, DevBuf, Gpu, Ptrs8};
+use inkling_cuda::cudarc::driver::{CudaGraph, sys};
+use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, Gpu, MixArgs, Mv4, MvB4, MvSeg, MvSegB};
 
 pub use weights::{ExpertFmt, LayerW, Weights};
 
@@ -25,33 +28,30 @@ struct Act {
     c: DevBuf,     // control outputs [3][D]
     nrm: DevBuf,   // normalized attention inputs [3][D]
     msg: DevBuf,   // loop messages [4][D]
-    q: DevBuf,     // 3072
-    r: DevBuf,     // 384
-    gate: DevBuf,  // 3072
-    sink: DevBuf,  // 24
-    kraw: DevBuf,  // 1024
-    vraw: DevBuf,  // 1024
+    g: DevBuf,     // control bottleneck [4][R]
+    qrg: DevBuf,   // q (3072) | r (384) | gate (3072)
+    sink: DevBuf,  // 24 | dynk 32 | dynv 32
+    kraw: DevBuf,
+    vraw: DevBuf,
     k: DevBuf,
     v: DevBuf,
-    dynk: DevBuf,  // 32
-    dynv: DevBuf,
-    att: DevBuf,   // 3072
-    proj: DevBuf,  // D
+    att: DevBuf,
+    proj: DevBuf,
     attn_out: DevBuf,
     f: DevBuf,
     f2: DevBuf,
     fnorm: DevBuf,
-    sel: DevBuf,   // i32 [8]
-    wts: DevBuf,   // [8]
-    rlog: DevBuf,  // router logits [E]
-    h: DevBuf,     // [8][F]
-    y: DevBuf,     // D
+    sel: DevBuf,
+    wts: DevBuf,
+    rlog: DevBuf,
+    h: DevBuf,
+    y: DevBuf,
     ffn_out: DevBuf,
-    xp: DevBuf,    // prelude output
-    xprev: DevBuf, // previous core pass output
+    xp: DevBuf,
+    xprev: DevBuf,
     blocks: DevBuf, // block storage [16][D], indexed by push order within a token
     logits: DevBuf,
-    step: DevBuf,  // i32 [token, pos]
+    step: DevBuf,   // i32 [token, pos]
 }
 
 pub struct Engine {
@@ -61,6 +61,9 @@ pub struct Engine {
     slots: Vec<Slot>,
     act: Act,
     pub n_ctx: usize,
+    graph: Option<CudaGraph>,
+    /// disable graph replay (debug captures need per-layer host callbacks)
+    pub use_graph: bool,
 }
 
 /// Optional per-pass hook, called after each layer pass with (slot, engine); use `Engine::debug_buf` to read state.
@@ -74,12 +77,11 @@ impl Engine {
         let w = Weights::load(&gpu, &g, &cfg)?;
         let d = cfg.n_embd;
         let kvw = cfg.n_head_kv * cfg.head_dim;
-        let mut slots = Vec::with_capacity(cfg.n_slots());
-        let sched = cfg.schedule();
         let mut slot_phys = vec![0; cfg.n_slots()];
-        for p in &sched {
+        for p in cfg.schedule() {
             slot_phys[p.slot] = p.phys;
         }
+        let mut slots = Vec::with_capacity(cfg.n_slots());
         for s in 0..cfg.n_slots() {
             let cap = if cfg.is_swa[slot_phys[s]] { cfg.n_swa.min(n_ctx) } else { n_ctx };
             slots.push(Slot {
@@ -97,16 +99,13 @@ impl Engine {
             c: f(3 * d)?,
             nrm: f(3 * d)?,
             msg: f(4 * d)?,
-            q: f(qd)?,
-            r: f(cfg.n_head * cfg.n_rel)?,
-            gate: f(qd)?,
-            sink: f(cfg.n_head)?,
+            g: f(4 * cfg.gate_rank)?,
+            qrg: f(2 * qd + cfg.n_head * cfg.n_rel)?,
+            sink: f(cfg.n_head + 2 * cfg.n_head_kv * cfg.n_conv)?,
             kraw: f(kvw)?,
             vraw: f(kvw)?,
             k: f(kvw)?,
             v: f(kvw)?,
-            dynk: f(cfg.n_head_kv * cfg.n_conv)?,
-            dynv: f(cfg.n_head_kv * cfg.n_conv)?,
             att: f(qd)?,
             proj: f(d)?,
             attn_out: f(d)?,
@@ -126,7 +125,7 @@ impl Engine {
             step: f(2)?,
         };
         gpu.sync()?;
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx })
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, use_graph: true })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -139,21 +138,62 @@ impl Engine {
         Ok(())
     }
 
-    fn mix(&self, states: &[u64], q: u64, nq: usize, out: u64) -> Result<()> {
+    /// Read a scratch buffer by name (debugging / validation).
+    pub fn debug_buf(&self, name: &str) -> Result<Vec<f32>> {
+        let a = &self.act;
+        let c = &self.cfg;
+        let qd = c.n_head * c.head_dim;
+        let (ptr, n) = match name {
+            "x" => (a.x.ptr, c.n_embd),
+            "q" => (a.qrg.ptr, qd),
+            "r" => (a.qrg.at(qd * F32), c.n_head * c.n_rel),
+            "k" => (a.k.ptr, c.n_head_kv * c.head_dim),
+            "v" => (a.v.ptr, c.n_head_kv * c.head_dim),
+            "nrm" => (a.nrm.ptr, 3 * c.n_embd),
+            "att" => (a.att.ptr, qd),
+            "attn_out" => (a.attn_out.ptr, c.n_embd),
+            "fnorm" => (a.fnorm.ptr, c.n_embd),
+            "rlog" => (a.rlog.ptr, c.n_expert),
+            "wts" => (a.wts.ptr, c.n_expert_used),
+            "y" => (a.y.ptr, c.n_embd),
+            "ffn_out" => (a.ffn_out.ptr, c.n_embd),
+            "msg" => (a.msg.ptr, 4 * c.n_embd),
+            _ => anyhow::bail!("unknown debug buffer {name}"),
+        };
+        self.gpu.read_f32(ptr, n)
+    }
+
+    // ---- launch helpers ------------------------------------------------------------------------------------
+
+    fn mix(&self, states: &[u64], q: u64, nq: usize, out: u64, outn: u64, nw: [u64; 4]) -> Result<()> {
         ensure!(states.len() <= 8 && nq <= 4, "mix: too many states/queries");
-        let mut p = Ptrs8::default();
-        p.0[..states.len()].copy_from_slice(states);
-        self.gpu.launch("ink_mix", (1, 1), 256, &[
-            Arg::Ptrs(p), Arg::I32(states.len() as i32), Arg::Ptr(q), Arg::I32(nq as i32), Arg::Ptr(out), Arg::I32(self.cfg.n_embd as i32),
-        ])
+        let mut m = MixArgs { q, out, outn, nw, n: states.len() as i32, nq: nq as i32, d: self.cfg.n_embd as i32, eps: self.cfg.rms_eps, ..Default::default() };
+        m.st[..states.len()].copy_from_slice(states);
+        self.gpu.launch("ink_mix2", (1, 1), 512, &[Arg::Mix(m)])
     }
 
     fn rmsnorm(&self, x: u64, w: u64, y: u64) -> Result<()> {
         self.gpu.launch("ink_rmsnorm", (1, 1), 256, &[Arg::Ptr(x), Arg::Ptr(w), Arg::Ptr(y), Arg::I32(self.cfg.n_embd as i32), Arg::F32(self.cfg.rms_eps)])
     }
 
-    fn mv(&self, kernel: &str, w: u64, x: u64, y: u64, k: usize, n: usize) -> Result<()> {
-        self.gpu.launch(kernel, (n.div_ceil(8) as u32, 1), 256, &[Arg::Ptr(w), Arg::Ptr(x), Arg::Ptr(y), Arg::I32(k as i32), Arg::I32(n as i32)])
+    fn mv_q8(&self, segs: &[(weights::Q8M, u64, u64, usize)], k: usize) -> Result<()> {
+        let mut a = Mv4 { nseg: segs.len() as i32, k: k as i32, ..Default::default() };
+        let mut rows = 0;
+        for (i, &(w, x, y, n)) in segs.iter().enumerate() {
+            a.s[i] = MvSeg { qs: w.qs, d: w.d, x, y, n: n as i32 };
+            rows += n;
+        }
+        self.gpu.launch("ink_mv_q8", (rows.div_ceil(8) as u32, 1), 256, &[Arg::Mv(a)])
+    }
+
+    fn mv_bf16(&self, segs: &[(u64, u64, u64, usize)], k: usize) -> Result<()> {
+        let mut a = MvB4 { nseg: segs.len() as i32, k: k as i32, ..Default::default() };
+        let mut rows = 0;
+        for (i, &(w, x, y, n)) in segs.iter().enumerate() {
+            a.s[i] = MvSegB { w, x, y, n: n as i32 };
+            rows += n;
+        }
+        self.gpu.launch("ink_mv_bf16", (rows.div_ceil(8) as u32, 1), 256, &[Arg::MvB(a)])
     }
 
     fn conv(&self, x: u64, w: u64, state: u64, dynamic: u64, out: u64, ch: usize) -> Result<()> {
@@ -168,47 +208,37 @@ impl Engine {
         self.gpu.launch(kernel, (n.div_ceil(256) as u32, 1), 256, &a)
     }
 
-    fn control(&self, c: u64, m: u64, lp: &weights::LoopW, ctrl: usize, out: u64) -> Result<()> {
-        self.gpu.launch("ink_control", (1, 1), 1024, &[
-            Arg::Ptr(c), Arg::Ptr(m), Arg::Ptr(lp.down[ctrl]), Arg::Ptr(lp.gain[ctrl]), Arg::Ptr(lp.forget[ctrl]), Arg::Ptr(out),
-            Arg::I32(self.cfg.n_embd as i32), Arg::I32(self.cfg.gate_rank as i32),
-        ])
+    /// Loop controls j in `ctrls`: out_j = control(c_j, m_j) with the layer's weights for control index idx_j.
+    fn controls(&self, lp: &weights::LoopW, ctrls: &[(usize, u64, u64, u64)]) -> Result<()> {
+        let mut a = Ctrl4 { n: ctrls.len() as i32, ..Default::default() };
+        let r = self.cfg.gate_rank;
+        for (j, &(idx, c, m, out)) in ctrls.iter().enumerate() {
+            a.c[j] = c;
+            a.m[j] = m;
+            a.wd[j] = lp.down[idx];
+            a.wg[j] = lp.gain[idx];
+            a.wf[j] = lp.forget[idx];
+            a.g[j] = self.act.g.at(j * r * F32);
+            a.out[j] = out;
+        }
+        let (d, n) = (self.cfg.n_embd as i32, ctrls.len() as u32);
+        self.gpu.launch("ink_ctrl_down", ((r / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])?;
+        self.gpu.launch("ink_ctrl_up", ((self.cfg.n_embd / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])
     }
 
-    /// Read a scratch buffer by name (debugging / validation).
-    pub fn debug_buf(&self, name: &str) -> Result<Vec<f32>> {
-        let a = &self.act;
-        let c = &self.cfg;
-        let (b, n) = match name {
-            "x" => (&a.x, c.n_embd),
-            "q" => (&a.q, c.n_head * c.head_dim),
-            "k" => (&a.k, c.n_head_kv * c.head_dim),
-            "v" => (&a.v, c.n_head_kv * c.head_dim),
-            "r" => (&a.r, c.n_head * c.n_rel),
-            "nrm" => (&a.nrm, 3 * c.n_embd),
-            "a" => (&a.a, 3 * c.n_embd),
-            "att" => (&a.att, c.n_head * c.head_dim),
-            "attn_out" => (&a.attn_out, c.n_embd),
-            "f" => (&a.f, c.n_embd),
-            "fnorm" => (&a.fnorm, c.n_embd),
-            "rlog" => (&a.rlog, c.n_expert),
-            "wts" => (&a.wts, c.n_expert_used),
-            "y" => (&a.y, c.n_embd),
-            "ffn_out" => (&a.ffn_out, c.n_embd),
-            "msg" => (&a.msg, 4 * c.n_embd),
-            "sink" => (&a.sink, c.n_head),
-            _ => anyhow::bail!("unknown debug buffer {name}"),
-        };
-        self.gpu.read_f32(b.ptr, n)
-    }
+    // ---- the token step ------------------------------------------------------------------------------------
 
-    /// Run one token at position `pos`; returns the logits over the unpadded vocabulary.
-    pub fn step(&mut self, token: u32, pos: usize, mut capture: Option<Capture>) -> Result<Vec<f32>> {
-        ensure!(pos < self.n_ctx, "position {pos} exceeds context {}", self.n_ctx);
+    /// Enqueue every kernel of one decode step (no host synchronization inside: graph-capturable).
+    fn enqueue_step(&self, mut capture: Option<Capture>) -> Result<()> {
         let cfg = &self.cfg;
         let d = cfg.n_embd;
         let a = &self.act;
-        self.gpu.write(a.step.ptr, inkling_cuda::as_bytes(&[token as i32, pos as i32]))?;
+        let kvw = cfg.n_head_kv * cfg.head_dim;
+        let qd = cfg.n_head * cfg.head_dim;
+        let (q_ptr, r_ptr, gate_ptr) = (a.qrg.ptr, a.qrg.at(qd * F32), a.qrg.at((qd + cfg.n_head * cfg.n_rel) * F32));
+        let nkc = cfg.n_head_kv * cfg.n_conv;
+        let (sink_ptr, dynk_ptr, dynv_ptr) = (a.sink.ptr, a.sink.at(cfg.n_head * F32), a.sink.at((cfg.n_head + nkc) * F32));
+
         self.gpu.launch("ink_embed", (1, 1), 256, &[
             Arg::Ptr(self.w.token_embd), Arg::Ptr(a.step.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(a.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
         ])?;
@@ -217,6 +247,7 @@ impl Engine {
         let mut prelude_blocks: Vec<u64> = Vec::new();
         let mut bank: Vec<u64> = Vec::new();
         let mut n_push = 0usize;
+        let row = |j: usize| j * d * F32;
 
         for p in cfg.schedule() {
             let lw = self.w.layers[p.phys];
@@ -232,21 +263,17 @@ impl Engine {
                 }
             }
             let slot = &self.slots[p.slot];
-            let conv_k = slot.conv.ptr;
-            let kvw = cfg.n_head_kv * cfg.head_dim;
-            let conv_v = slot.conv.at(3 * kvw * F32);
-            let conv_attn = slot.conv.at(6 * kvw * F32);
-            let conv_ffn = slot.conv.at((6 * kvw + 3 * d) * F32);
-
-            // loop messages from the previous pass
+            let (conv_k, conv_v) = (slot.conv.ptr, slot.conv.at(3 * kvw * F32));
+            let (conv_attn, conv_ffn) = (slot.conv.at(6 * kvw * F32), slot.conv.at((6 * kvw + 3 * d) * F32));
             let looped = p.pass > 0;
+            let lp = lw.lp;
+
             if looped {
                 let mut st = bank.clone();
                 st.push(a.xprev.ptr);
-                self.mix(&st, lw.lp.unwrap().msg_query, 4, a.msg.ptr)?;
+                self.mix(&st, lp.unwrap().msg_query, 4, a.msg.ptr, 0, [0; 4])?;
             }
 
-            // a block boundary stores the layer input before it is overwritten
             let boundary = p.phys % cfg.attn_res_block == 0;
             let inp_copy = if boundary {
                 let dst = a.blocks.at(n_push * d * F32);
@@ -257,73 +284,61 @@ impl Engine {
                 None
             };
 
-            // attention inputs
+            // attention inputs -> normalized nq/nk/nv
+            let n = [a.nrm.ptr, a.nrm.at(row(1)), a.nrm.at(row(2))];
+            let norms = if lw.is_swa { [lw.attn_norm; 3] } else { [lw.q_norm, lw.k_norm, lw.v_norm] };
             let nq = if lw.is_swa { 1 } else { 3 };
-            let mut inp = [a.x.ptr; 3];
-            if lw.attn_res_query != 0 {
+            let (xq, xk, xv);
+            if !looped {
+                if lw.attn_res_query != 0 {
+                    let mut st = blocks.clone();
+                    st.push(a.x.ptr);
+                    let nw = if lw.is_swa { [norms[0], 0, 0, 0] } else { [norms[0], norms[1], norms[2], 0] };
+                    self.mix(&st, lw.attn_res_query, nq, a.a.ptr, a.nrm.ptr, nw)?;
+                } else {
+                    for j in 0..nq {
+                        self.rmsnorm(a.x.ptr, norms[j], n[j])?;
+                    }
+                }
+                (xq, xk, xv) = if lw.is_swa { (n[0], n[0], n[0]) } else { (n[0], n[1], n[2]) };
+            } else {
                 let mut st = blocks.clone();
                 st.push(a.x.ptr);
-                self.mix(&st, lw.attn_res_query, nq, a.a.ptr)?;
+                self.mix(&st, lw.attn_res_query, nq, a.a.ptr, 0, [0; 4])?;
+                let inp = |j: usize| if lw.is_swa { a.a.ptr } else { a.a.at(row(j)) };
+                let ctl: Vec<(usize, u64, u64, u64)> = (0..3).map(|j| (j, inp(j), a.msg.at(row(j)), a.c.at(row(j)))).collect();
+                self.controls(&lp.unwrap(), &ctl)?;
                 for j in 0..3 {
-                    inp[j] = a.a.at(if lw.is_swa { 0 } else { j * d * F32 });
+                    self.rmsnorm(a.c.at(row(j)), norms[j], n[j])?;
                 }
-            }
-            if looped {
-                let lp = lw.lp.unwrap();
-                for j in 0..3 {
-                    self.control(inp[j], a.msg.at(j * d * F32), &lp, j, a.c.at(j * d * F32))?;
-                    inp[j] = a.c.at(j * d * F32);
-                }
-            }
-            let n = [a.nrm.ptr, a.nrm.at(d * F32), a.nrm.at(2 * d * F32)];
-            let (nq_, nk, nv);
-            if lw.is_swa && !looped {
-                self.rmsnorm(inp[0], lw.attn_norm, n[0])?;
-                (nq_, nk, nv) = (n[0], n[0], n[0]);
-            } else if lw.is_swa {
-                for j in 0..3 {
-                    self.rmsnorm(inp[j], lw.attn_norm, n[j])?;
-                }
-                (nq_, nk, nv) = (n[0], n[1], n[2]);
-            } else {
-                self.rmsnorm(inp[0], lw.q_norm, n[0])?;
-                self.rmsnorm(inp[1], lw.k_norm, n[1])?;
-                self.rmsnorm(inp[2], lw.v_norm, n[2])?;
-                (nq_, nk, nv) = (n[0], n[1], n[2]);
+                (xq, xk, xv) = (n[0], n[1], n[2]);
             }
 
-            // projections
-            let qd = cfg.n_head * cfg.head_dim;
-            self.mv("ink_matvec_q8", lw.wq, nq_, a.q.ptr, d, qd)?;
-            self.mv("ink_matvec_q8", lw.wrel, nq_, a.r.ptr, d, cfg.n_head * cfg.n_rel)?;
-            self.mv("ink_matvec_q8", lw.wgate, nq_, a.gate.ptr, d, qd)?;
-            self.mv("ink_matvec_bf16", lw.wsink, nq_, a.sink.ptr, d, cfg.n_head)?;
-            self.mv("ink_matvec_q8", lw.wk, nk, a.kraw.ptr, d, kvw)?;
-            self.mv("ink_matvec_q8", lw.wv, nv, a.vraw.ptr, d, kvw)?;
+            // projections: q|r|gate, k, v in one launch; sink (+ dynamic conv taps) in another
+            self.mv_q8(&[(lw.wqrg, xq, a.qrg.ptr, 2 * qd + cfg.n_head * cfg.n_rel), (lw.wk, xk, a.kraw.ptr, kvw), (lw.wv, xv, a.vraw.ptr, kvw)], d)?;
             let (dk, dv) = if lw.is_swa {
+                self.mv_bf16(&[(lw.wsink, xq, sink_ptr, cfg.n_head)], d)?;
                 (0, 0)
             } else {
-                self.mv("ink_matvec_bf16", lw.kconv_proj, nk, a.dynk.ptr, d, cfg.n_head_kv * cfg.n_conv)?;
-                self.mv("ink_matvec_bf16", lw.vconv_proj, nv, a.dynv.ptr, d, cfg.n_head_kv * cfg.n_conv)?;
-                (a.dynk.ptr, a.dynv.ptr)
+                self.mv_bf16(&[(lw.wsink, xq, sink_ptr, cfg.n_head), (lw.kconv_proj, xk, dynk_ptr, nkc), (lw.vconv_proj, xv, dynv_ptr, nkc)], d)?;
+                (dynk_ptr, dynv_ptr)
             };
             self.conv(a.kraw.ptr, lw.k_conv, conv_k, dk, a.k.ptr, kvw)?;
             self.conv(a.vraw.ptr, lw.v_conv, conv_v, dv, a.v.ptr, kvw)?;
             self.gpu.launch("ink_attn_prep", (64, 1), 32, &[
-                Arg::Ptr(a.q.ptr), Arg::Ptr(a.k.ptr), Arg::Ptr(a.v.ptr), Arg::Ptr(a.r.ptr), Arg::Ptr(lw.q_clip), Arg::Ptr(lw.rel_clip),
+                Arg::Ptr(q_ptr), Arg::Ptr(a.k.ptr), Arg::Ptr(a.v.ptr), Arg::Ptr(r_ptr), Arg::Ptr(lw.q_clip), Arg::Ptr(lw.rel_clip),
                 Arg::Ptr(a.step.ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(!lw.is_swa as i32),
                 Arg::F32(cfg.qk_clip), Arg::F32(cfg.rel_clip), Arg::F32(cfg.log_scale_floor), Arg::F32(cfg.log_scale_alpha), Arg::F32(cfg.rms_eps),
             ])?;
             let window = if lw.is_swa { cfg.n_swa as i32 } else { 0 };
             self.gpu.launch("ink_attn_decode", (cfg.n_head as u32, 1), 128, &[
-                Arg::Ptr(a.q.ptr), Arg::Ptr(a.r.ptr), Arg::Ptr(a.sink.ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
+                Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
                 Arg::Ptr(a.att.ptr), Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
             ])?;
-            self.ew("ink_gate_sigmoid", &[Arg::Ptr(a.att.ptr), Arg::Ptr(a.gate.ptr)], qd)?;
-            self.mv("ink_matvec_q8", lw.wo, a.att.ptr, a.proj.ptr, qd, d)?;
+            self.ew("ink_gate_sigmoid", &[Arg::Ptr(a.att.ptr), Arg::Ptr(gate_ptr)], qd)?;
+            self.mv_q8(&[(lw.wo, a.att.ptr, a.proj.ptr, d)], qd)?;
             self.conv(a.proj.ptr, lw.attn_post_conv, conv_attn, 0, a.attn_out.ptr, d)?;
 
-            // residual stream / block bookkeeping
             if let Some(dst) = inp_copy {
                 blocks.push(dst);
                 self.ew("ink_copy", &[Arg::Ptr(a.attn_out.ptr), Arg::Ptr(a.x.ptr)], d)?;
@@ -331,29 +346,32 @@ impl Engine {
                 self.ew("ink_add", &[Arg::Ptr(a.x.ptr), Arg::Ptr(a.attn_out.ptr), Arg::Ptr(a.x.ptr)], d)?;
             }
 
-            // FFN input: depth attention (+ loop control), norm
+            // FFN input
             let mut st = blocks.clone();
             st.push(a.x.ptr);
-            self.mix(&st, lw.ffn_res_query, 1, a.f.ptr)?;
-            let mut fin = a.f.ptr;
             if looped {
-                self.control(a.f.ptr, a.msg.at(3 * d * F32), &lw.lp.unwrap(), 3, a.f2.ptr)?;
-                fin = a.f2.ptr;
+                self.mix(&st, lw.ffn_res_query, 1, a.f.ptr, 0, [0; 4])?;
+                self.controls(&lp.unwrap(), &[(3, a.f.ptr, a.msg.at(row(3)), a.f2.ptr)])?;
+                self.rmsnorm(a.f2.ptr, lw.ffn_norm, a.fnorm.ptr)?;
+            } else {
+                self.mix(&st, lw.ffn_res_query, 1, a.f.ptr, a.fnorm.ptr, [lw.ffn_norm, 0, 0, 0])?;
             }
-            self.rmsnorm(fin, lw.ffn_norm, a.fnorm.ptr)?;
 
             // MoE
-            self.gpu.launch("ink_router", (1, 1), 1024, &[
-                Arg::Ptr(a.fnorm.ptr), Arg::Ptr(lw.router), Arg::Ptr(lw.probs_bias), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(a.rlog.ptr),
-                Arg::I32(d as i32), Arg::I32(cfg.n_expert as i32), Arg::I32(cfg.n_expert_used as i32), Arg::F32(cfg.expert_weights_scale),
+            self.gpu.launch("ink_matvec_f32", ((cfg.n_expert / 8) as u32, 1), 256, &[
+                Arg::Ptr(lw.router), Arg::Ptr(a.fnorm.ptr), Arg::Ptr(a.rlog.ptr), Arg::I32(d as i32), Arg::I32(cfg.n_expert as i32),
             ])?;
-            let fmt = lw.expert_fmt as i32;
-            self.gpu.launch("ink_moe_gate_up", ((cfg.n_ff_exp / 8) as u32, cfg.n_expert_used as u32), 256, &[
-                Arg::Ptr(lw.gate_up), Arg::I32(fmt), Arg::Ptr(lw.gate_up_scale), Arg::Ptr(a.fnorm.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.h.ptr),
+            self.gpu.launch("ink_topk", (1, 1), 32, &[
+                Arg::Ptr(a.rlog.ptr), Arg::Ptr(lw.probs_bias), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
+                Arg::I32(cfg.n_expert as i32), Arg::I32(cfg.n_expert_used as i32), Arg::F32(cfg.expert_weights_scale),
+            ])?;
+            let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32 };
+            self.gpu.launch("ink_moe_gate_up2", ((cfg.n_ff_exp / 8) as u32, cfg.n_expert_used as u32), 256, &[
+                Arg::Exp(ew(lw.gate_up)), Arg::Ptr(a.fnorm.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.h.ptr),
                 Arg::I32(d as i32), Arg::I32(cfg.n_ff_exp as i32), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
             ])?;
-            self.gpu.launch("ink_moe_down", ((d / 8) as u32, 1), 256, &[
-                Arg::Ptr(lw.down), Arg::I32(fmt), Arg::Ptr(lw.down_scale), Arg::Ptr(a.h.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(a.y.ptr),
+            self.gpu.launch("ink_moe_down2", ((d / 8) as u32, 1), 256, &[
+                Arg::Exp(ew(lw.down)), Arg::Ptr(a.h.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(a.y.ptr),
                 Arg::I32(cfg.n_ff_exp as i32), Arg::I32(d as i32), Arg::I32(cfg.n_expert_used as i32),
             ])?;
             self.conv(a.y.ptr, lw.ffn_post_conv, conv_ffn, 0, a.ffn_out.ptr, d)?;
@@ -367,11 +385,29 @@ impl Engine {
         // output head
         let mut st = blocks.clone();
         st.push(a.x.ptr);
-        self.mix(&st, self.w.output_res_query, 1, a.f.ptr)?;
-        self.rmsnorm(a.f.ptr, self.w.output_norm, a.fnorm.ptr)?;
-        self.mv("ink_matvec_q8", self.w.output, a.fnorm.ptr, a.logits.ptr, d, cfg.n_vocab)?;
+        self.mix(&st, self.w.output_res_query, 1, a.f.ptr, a.fnorm.ptr, [self.w.output_norm, 0, 0, 0])?;
+        self.mv_q8(&[(self.w.output, a.fnorm.ptr, a.logits.ptr, cfg.n_vocab)], d)?;
         let nv = cfg.n_vocab_unpadded;
-        self.gpu.launch("ink_softcap", (nv.div_ceil(256) as u32, 1), 256, &[Arg::Ptr(a.logits.ptr), Arg::I32(nv as i32), Arg::F32(cfg.final_softcap)])?;
-        self.gpu.read_f32(a.logits.ptr, nv)
+        self.gpu.launch("ink_softcap", (nv.div_ceil(256) as u32, 1), 256, &[Arg::Ptr(a.logits.ptr), Arg::I32(nv as i32), Arg::F32(cfg.final_softcap)])
+    }
+
+    /// Run one token at position `pos`; returns the logits over the unpadded vocabulary.
+    pub fn step(&mut self, token: u32, pos: usize, capture: Option<Capture>) -> Result<Vec<f32>> {
+        ensure!(pos < self.n_ctx, "position {pos} exceeds context {}", self.n_ctx);
+        self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[token as i32, pos as i32]))?;
+        if capture.is_some() || !self.use_graph {
+            self.enqueue_step(capture)?;
+        } else {
+            if self.graph.is_none() {
+                self.gpu.sync()?;
+                self.gpu.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                let r = self.enqueue_step(None);
+                let g = self.gpu.stream.end_capture(sys::CUgraphInstantiate_flags(0))?;
+                r?;
+                self.graph = g;
+            }
+            self.graph.as_ref().expect("graph").launch()?;
+        }
+        self.gpu.read_f32(self.act.logits.ptr, self.cfg.n_vocab_unpadded)
     }
 }

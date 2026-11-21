@@ -1,4 +1,4 @@
-//! Upload GGUF tensors to the GPU and resolve them into per-layer pointer tables.
+//! Upload GGUF tensors to the GPU (large matrices repacked, see repack.rs) and resolve per-layer pointer tables.
 
 use std::collections::HashMap;
 
@@ -6,11 +6,29 @@ use anyhow::{Context, Result, bail, ensure};
 use inkling_core::{Config, GgmlType, Gguf};
 use inkling_cuda::{DevBuf, Gpu};
 
+use crate::repack::{self, Soa};
+
 /// Expert weight format code passed to kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertFmt {
     Q8_0 = 0,
     Nvfp4 = 1,
+}
+
+/// Repacked Q8 matrix (qs int8 [rows][K], d f16 [rows][K/32]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Q8M {
+    pub qs: u64,
+    pub d: u64,
+}
+
+/// Repacked expert tensor [E][rows][K].
+#[derive(Debug, Clone, Copy)]
+pub struct ExpM {
+    pub qs: u64,
+    pub sc: u64,
+    pub scale: u64,
+    pub fmt: ExpertFmt,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,12 +48,11 @@ pub struct LayerW {
     pub q_norm: u64,
     pub k_norm: u64,
     pub v_norm: u64,
-    pub wq: u64,
-    pub wk: u64,
-    pub wv: u64,
-    pub wo: u64,
-    pub wgate: u64,
-    pub wrel: u64,
+    /// q (H*dh rows) | rel (H*R rows) | gate (H*dh rows), one matrix
+    pub wqrg: Q8M,
+    pub wk: Q8M,
+    pub wv: Q8M,
+    pub wo: Q8M,
     pub wsink: u64,
     pub kconv_proj: u64,
     pub vconv_proj: u64,
@@ -52,11 +69,8 @@ pub struct LayerW {
     pub ffn_norm: u64,
     pub router: u64,
     pub probs_bias: u64,
-    pub gate_up: u64,
-    pub gate_up_scale: u64,
-    pub down: u64,
-    pub down_scale: u64,
-    pub expert_fmt: ExpertFmt,
+    pub gate_up: ExpM,
+    pub down: ExpM,
     pub lp: Option<LoopW>,
 }
 
@@ -64,114 +78,139 @@ pub struct Weights {
     pub bufs: HashMap<String, DevBuf>,
     pub token_embd: u64,
     pub token_embd_norm: u64,
-    pub output: u64,
+    pub output: Q8M,
     pub output_norm: u64,
     pub output_res_query: u64,
     pub layers: Vec<LayerW>,
     pub bytes: usize,
 }
 
+struct Loader<'a> {
+    gpu: &'a Gpu,
+    g: &'a Gguf,
+    bufs: HashMap<String, DevBuf>,
+    bytes: usize,
+}
+
+impl Loader<'_> {
+    fn put(&mut self, key: String, data: &[u8]) -> Result<u64> {
+        let b = self.gpu.upload(data).with_context(|| format!("uploading {key}"))?;
+        let p = b.ptr;
+        self.bytes += b.bytes;
+        self.bufs.insert(key, b);
+        Ok(p)
+    }
+
+    /// Small tensors (F32/BF16) uploaded as-is.
+    fn raw(&mut self, name: &str) -> Result<u64> {
+        let t = self.g.require(name)?;
+        ensure!(matches!(t.ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::Q8_0), "{name}: unexpected type {:?}", t.ty);
+        let data = self.g.data(t).to_vec();
+        self.put(name.to_owned(), &data)
+    }
+
+    fn raw_opt(&mut self, name: &str) -> Result<u64> {
+        if self.g.tensor(name).is_some() { self.raw(name) } else { Ok(0) }
+    }
+
+    /// One or more Q8_0 2-D tensors with the same K, row-concatenated and repacked.
+    fn q8(&mut self, names: &[String]) -> Result<Q8M> {
+        let mut soa = Soa { qs: Vec::new(), sc: Vec::new() };
+        let mut k0 = 0;
+        for n in names {
+            let t = self.g.require(n)?;
+            ensure!(t.ty == GgmlType::Q8_0 && t.dims.len() == 2, "{n}: expected 2-D Q8_0");
+            let (k, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+            ensure!(k0 == 0 || k0 == k, "{n}: K mismatch in concatenation");
+            k0 = k;
+            let s = repack::q8_soa(self.g.data(t), rows, k)?;
+            soa.qs.extend_from_slice(&s.qs);
+            soa.sc.extend_from_slice(&s.sc);
+        }
+        let key = names.join("+");
+        Ok(Q8M { qs: self.put(format!("{key}#qs"), &soa.qs)?, d: self.put(format!("{key}#d"), &soa.sc)? })
+    }
+
+    fn experts(&mut self, name: &str, scale: &str) -> Result<ExpM> {
+        let t = self.g.require(name)?;
+        ensure!(t.dims.len() == 3, "{name}: expected 3-D expert tensor");
+        let (k, rows, e) = (t.dims[0] as usize, t.dims[1] as usize, t.dims[2] as usize);
+        let (soa, fmt) = match t.ty {
+            GgmlType::NVFP4 => (repack::nvfp4_soa(self.g.data(t), rows * e, k)?, ExpertFmt::Nvfp4),
+            GgmlType::Q8_0 => (repack::q8_soa(self.g.data(t), rows * e, k)?, ExpertFmt::Q8_0),
+            ty => bail!("{name}: unsupported expert type {ty:?}"),
+        };
+        let qs = self.put(format!("{name}#qs"), &soa.qs)?;
+        let sc = self.put(format!("{name}#sc"), &soa.sc)?;
+        let scale = self.raw_opt(scale)?;
+        Ok(ExpM { qs, sc, scale, fmt })
+    }
+}
+
 impl Weights {
     pub fn load(gpu: &Gpu, g: &Gguf, cfg: &Config) -> Result<Self> {
-        let mut bufs = HashMap::with_capacity(g.tensors.len());
-        let mut bytes = 0;
-        for t in &g.tensors {
-            match t.ty {
-                GgmlType::F32 | GgmlType::BF16 | GgmlType::Q8_0 | GgmlType::NVFP4 => {}
-                other => bail!("tensor {} has unsupported type {other:?}", t.name),
-            }
-            let b = gpu.upload(g.data(t)).with_context(|| format!("uploading {}", t.name))?;
-            bytes += b.bytes;
-            bufs.insert(t.name.clone(), b);
-        }
-        let p = |name: &str| -> Result<u64> { bufs.get(name).map(|b| b.ptr).with_context(|| format!("missing tensor {name}")) };
-        let opt = |name: &str| -> u64 { bufs.get(name).map(|b| b.ptr).unwrap_or(0) };
-
+        let mut l = Loader { gpu, g, bufs: HashMap::new(), bytes: 0 };
         let d = cfg.n_embd;
+        let res = f32_rows(g, "loop_res_query.weight")?;
+        let kv = f32_rows(g, "loop_kv_res_query.weight")?;
+
         let mut layers = Vec::with_capacity(cfg.n_phys);
-        let mut extra = Vec::new();
         for i in 0..cfg.n_phys {
             let n = |s: &str| format!("blk.{i}.{s}");
-            let gu = g.require(&n("ffn_gate_up_exps.weight"))?;
-            let expert_fmt = match gu.ty {
-                GgmlType::NVFP4 => ExpertFmt::Nvfp4,
-                GgmlType::Q8_0 => ExpertFmt::Q8_0,
-                t => bail!("layer {i}: unsupported expert type {t:?}"),
-            };
-            ensure!(g.require(&n("ffn_down_exps.weight"))?.ty == gu.ty, "layer {i}: gate_up/down types differ");
             let lp = if (cfg.core_start..cfg.core_end).contains(&i) {
-                let names = ["attn", "k", "v", "mlp"];
                 let mut lw = LoopW { down: [0; 4], gain: [0; 4], forget: [0; 4], msg_query: 0 };
-                for (c, nm) in names.iter().enumerate() {
-                    lw.down[c] = p(&n(&format!("loop_{nm}_down.weight")))?;
-                    lw.gain[c] = p(&n(&format!("loop_{nm}_gain.weight")))?;
-                    lw.forget[c] = p(&n(&format!("loop_{nm}_forget.weight")))?;
+                for (c, nm) in ["attn", "k", "v", "mlp"].iter().enumerate() {
+                    lw.down[c] = l.raw(&n(&format!("loop_{nm}_down.weight")))?;
+                    lw.gain[c] = l.raw(&n(&format!("loop_{nm}_gain.weight")))?;
+                    lw.forget[c] = l.raw(&n(&format!("loop_{nm}_forget.weight")))?;
                 }
-                // message queries of core layer ci: rows [res[2ci], kv[2ci], kv[2ci+1], res[2ci+1]]
+                // message queries of core layer ci: rows [res[2ci], kv[2ci], kv[2ci+1], res[2ci+1]] (q, k, v, ffn)
                 let ci = i - cfg.core_start;
-                let res = f32_rows(g, "loop_res_query.weight")?;
-                let kv = f32_rows(g, "loop_kv_res_query.weight")?;
                 let mut q = Vec::with_capacity(4 * d);
                 q.extend_from_slice(&res[2 * ci * d..(2 * ci + 1) * d]);
                 q.extend_from_slice(&kv[2 * ci * d..(2 * ci + 2) * d]);
                 q.extend_from_slice(&res[(2 * ci + 1) * d..(2 * ci + 2) * d]);
-                let b = gpu.upload_f32(&q)?;
-                lw.msg_query = b.ptr;
-                extra.push((format!("blk.{i}.msg_query"), b));
+                lw.msg_query = l.put(n("msg_query"), inkling_cuda::as_bytes(&q))?;
                 Some(lw)
             } else {
                 None
             };
             layers.push(LayerW {
                 is_swa: cfg.is_swa[i],
-                attn_norm: opt(&n("attn_norm.weight")),
-                q_norm: opt(&n("attn_q_inp_norm.weight")),
-                k_norm: opt(&n("attn_k_inp_norm.weight")),
-                v_norm: opt(&n("attn_v_inp_norm.weight")),
-                wq: p(&n("attn_q.weight"))?,
-                wk: p(&n("attn_k.weight"))?,
-                wv: p(&n("attn_v.weight"))?,
-                wo: p(&n("attn_output.weight"))?,
-                wgate: p(&n("attn_gate.weight"))?,
-                wrel: p(&n("attn_rel.weight"))?,
-                wsink: p(&n("attn_sink_proj.weight"))?,
-                kconv_proj: opt(&n("attn_k_conv_proj.weight")),
-                vconv_proj: opt(&n("attn_v_conv_proj.weight")),
-                q_clip: p(&n("attn_q_clip.weight"))?,
-                rel_clip: p(&n("attn_rel_clip.weight"))?,
-                rel_bias: p(&n("attn_rel_bias.weight"))?,
-                k_conv: p(&n("attn_k_conv.weight"))?,
-                v_conv: p(&n("attn_v_conv.weight"))?,
-                attn_post_conv: p(&n("attn_post_conv.weight"))?,
-                ffn_post_conv: p(&n("ffn_post_conv.weight"))?,
-                attn_res_query: opt(&n("attn_res_query.weight")),
-                ffn_res_query: p(&n("ffn_res_query.weight"))?,
-                ffn_norm: p(&n("ffn_norm.weight"))?,
-                router: p(&n("ffn_gate_inp.weight"))?,
-                probs_bias: opt(&n("exp_probs_b.bias")),
-                gate_up: p(&n("ffn_gate_up_exps.weight"))?,
-                gate_up_scale: opt(&n("ffn_gate_up_exps.scale")),
-                down: p(&n("ffn_down_exps.weight"))?,
-                down_scale: opt(&n("ffn_down_exps.scale")),
-                expert_fmt,
+                attn_norm: l.raw_opt(&n("attn_norm.weight"))?,
+                q_norm: l.raw_opt(&n("attn_q_inp_norm.weight"))?,
+                k_norm: l.raw_opt(&n("attn_k_inp_norm.weight"))?,
+                v_norm: l.raw_opt(&n("attn_v_inp_norm.weight"))?,
+                wqrg: l.q8(&[n("attn_q.weight"), n("attn_rel.weight"), n("attn_gate.weight")])?,
+                wk: l.q8(&[n("attn_k.weight")])?,
+                wv: l.q8(&[n("attn_v.weight")])?,
+                wo: l.q8(&[n("attn_output.weight")])?,
+                wsink: l.raw(&n("attn_sink_proj.weight"))?,
+                kconv_proj: l.raw_opt(&n("attn_k_conv_proj.weight"))?,
+                vconv_proj: l.raw_opt(&n("attn_v_conv_proj.weight"))?,
+                q_clip: l.raw(&n("attn_q_clip.weight"))?,
+                rel_clip: l.raw(&n("attn_rel_clip.weight"))?,
+                rel_bias: l.raw(&n("attn_rel_bias.weight"))?,
+                k_conv: l.raw(&n("attn_k_conv.weight"))?,
+                v_conv: l.raw(&n("attn_v_conv.weight"))?,
+                attn_post_conv: l.raw(&n("attn_post_conv.weight"))?,
+                ffn_post_conv: l.raw(&n("ffn_post_conv.weight"))?,
+                attn_res_query: l.raw_opt(&n("attn_res_query.weight"))?,
+                ffn_res_query: l.raw(&n("ffn_res_query.weight"))?,
+                ffn_norm: l.raw(&n("ffn_norm.weight"))?,
+                router: l.raw(&n("ffn_gate_inp.weight"))?,
+                probs_bias: l.raw_opt(&n("exp_probs_b.bias"))?,
+                gate_up: l.experts(&n("ffn_gate_up_exps.weight"), &n("ffn_gate_up_exps.scale"))?,
+                down: l.experts(&n("ffn_down_exps.weight"), &n("ffn_down_exps.scale"))?,
                 lp,
             });
         }
-        let mut me = Self {
-            token_embd: p("token_embd.weight")?,
-            token_embd_norm: p("token_embd_norm.weight")?,
-            output: p("output.weight")?,
-            output_norm: p("output_norm.weight")?,
-            output_res_query: p("output_res_query.weight")?,
-            layers,
-            bytes,
-            bufs,
-        };
-        for (k, b) in extra {
-            me.bytes += b.bytes;
-            me.bufs.insert(k, b);
-        }
-        Ok(me)
+        let token_embd = l.raw("token_embd.weight")?;
+        let token_embd_norm = l.raw("token_embd_norm.weight")?;
+        let output = l.q8(&["output.weight".to_owned()])?;
+        let output_norm = l.raw("output_norm.weight")?;
+        let output_res_query = l.raw("output_res_query.weight")?;
+        Ok(Self { token_embd, token_embd_norm, output, output_norm, output_res_query, layers, bytes: l.bytes, bufs: l.bufs })
     }
 }
 
