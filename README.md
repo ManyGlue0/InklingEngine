@@ -54,6 +54,9 @@ in [docs/MODEL.md](docs/MODEL.md).
   | + vision (`--mmproj`) | +0.7 GiB (+ up to 0.4 GiB while encoding a large image) |
 
   A 24 GB card runs the full 256k context; a 20 GB card should fit about 64k (untested). There is no CPU offload.
+  At startup `inkling` checks the free VRAM (device-wide, as `nvidia-smi` reports it) and refuses to load, with a
+  message, when the model and context do not fit, for example while another instance is running. Otherwise
+  Windows would page the overflow into system RAM and stall the machine.
 - **Driver:** a recent NVIDIA driver with CUDA 12.8+ support. Only the driver is needed to run; the toolkit is
   needed only to build.
 - **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): `Inkling-2-Mini-UD-Q4_K_XL.gguf`
@@ -69,7 +72,7 @@ InklingEngine is one program, `inkling`. Get it in one of two ways.
 
 ### Windows: download
 
-1. Download `inkling-0.1.0-windows-x64.zip` from the
+1. Download `inkling-<version>-windows-x64.zip` from the
    [latest release](https://github.com/ManyGlue0/InklingEngine/releases/latest) and unzip it anywhere.
 2. The only prerequisite is an NVIDIA driver; nothing else needs installing.
 3. The zip contains `inkling.exe`, which holds the GPU code for every supported NVIDIA generation, plus this README,
@@ -185,11 +188,13 @@ Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python t
 | `INKLING_KV=f16` | f16 KV cache on the full-attention passes instead of 6-bit (~2.5× the KV memory) |
 | `INKLING_TEMP`, `INKLING_TOP_P`, `INKLING_TOP_K`, `INKLING_MIN_P`, `INKLING_SEED` | sampling for `inkling generate` |
 | `INKLING_REPEAT_PENALTY`, `INKLING_PRESENCE_PENALTY`, `INKLING_FREQUENCY_PENALTY`, `INKLING_REPEAT_LAST_N` | penalties for `inkling generate` |
+| `INKLING_SKIP_VRAM_CHECK=1` | start even when the free-VRAM check fails (not recommended) |
 | `INKLING_CUDA_ARCHS` | build time: target architectures (default `native`) |
 
 Developer commands:
 - **Benchmarks:** `bench`, `benchpp`, `benchctx`.
 - **Correctness:** `validate` against reference dumps, `kvstudy`, `cachetest`, `rendertest`, `gemmtest`, `visiontest`.
+- **Diagnostics:** `vraminfo` prints total and usable VRAM.
 
 ## How it works
 

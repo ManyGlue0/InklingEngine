@@ -11,3 +11,4 @@ cc = "1"
 [dependencies]
 anyhow.workspace = true
 cudarc.workspace = true
+libloading = "0.8"

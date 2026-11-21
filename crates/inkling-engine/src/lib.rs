@@ -23,6 +23,29 @@ pub const EMBED_TOKEN_BASE: u32 = 0x8000_0000;
 
 const F32: usize = 4;
 
+/// VRAM the engine needs beyond weights and KV cache (activations, prefill and MoE buffers, CUDA module); measured
+/// on an RTX 3090 with INKLING_VRAM_DEBUG.
+const VRAM_FIXED: usize = 1408 << 20;
+/// Headroom left free for the driver and other applications.
+const VRAM_MARGIN: usize = 256 << 20;
+
+/// Fail with a clear message when `need` bytes do not fit in `free` VRAM (INKLING_SKIP_VRAM_CHECK=1 skips it).
+pub(crate) fn check_vram(free: usize, need: usize, what: &str) -> Result<()> {
+    if std::env::var_os("INKLING_SKIP_VRAM_CHECK").is_some() {
+        return Ok(());
+    }
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    ensure!(
+        free >= need + VRAM_MARGIN,
+        "not enough free GPU memory: {:.1} GiB free, about {:.1} GiB needed for {what}. Is another InklingEngine \
+         instance (or another GPU-heavy app) running? Close it, or use a smaller --ctx. (INKLING_SKIP_VRAM_CHECK=1 \
+         skips this check.)",
+        gib(free),
+        gib(need + VRAM_MARGIN)
+    );
+    Ok(())
+}
+
 /// Per-slot recurrent state: KV cache + short-conv histories.
 struct Slot {
     k: DevBuf,
@@ -182,7 +205,6 @@ impl Engine {
             "unsupported model dimensions"
         );
         let gpu = Gpu::new(0)?;
-        let w = Weights::load(&gpu, &g, &cfg)?;
         let d = cfg.n_embd;
         let kvw = cfg.n_head_kv * cfg.head_dim;
         let mut slot_phys = vec![0; cfg.n_slots()];
@@ -194,6 +216,20 @@ impl Engine {
             Ok("q6") | Err(_) => true,
             Ok(other) => anyhow::bail!("INKLING_KV={other}: expected f16 or q6"),
         };
+        // refuse to start when the model does not fit in free VRAM: on Windows the driver would otherwise page the
+        // overflow (and other applications' GPU memory) into system RAM until the machine stalls
+        let kv_bytes: usize = (0..cfg.n_slots())
+            .map(|s| {
+                let swa = cfg.is_swa[slot_phys[s]];
+                let cap = if swa { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
+                2 * cap * if !swa && kv_q6 { 8 * 104 } else { kvw * 2 }
+            })
+            .sum();
+        let weight_bytes: usize = g.tensors.iter().map(|t| t.n_bytes).sum();
+        let need = weight_bytes + kv_bytes + VRAM_FIXED;
+        let free_at_start = gpu.free_vram()?;
+        check_vram(free_at_start, need, &format!("this model at context {n_ctx}"))?;
+        let w = Weights::load(&gpu, &g, &cfg)?;
         let mut slots = Vec::with_capacity(cfg.n_slots());
         for s in 0..cfg.n_slots() {
             // sliding-window ring: a prefill chunk writes its K/V before attending, so window + chunk - 1 must fit
@@ -278,6 +314,10 @@ impl Engine {
         };
         let pre = Some(prefill::PrefillBufs::new(&gpu, &cfg)?);
         let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
+        if std::env::var_os("INKLING_VRAM_DEBUG").is_some() {
+            let free_now = gpu.free_vram()?;
+            eprintln!("vram: estimated {need} B (fixed part {VRAM_FIXED}), used by load {} B", free_at_start.saturating_sub(free_now));
+        }
         Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default(), vision: None, embeds: Vec::new() })
     }
 

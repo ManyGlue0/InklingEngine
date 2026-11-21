@@ -8,6 +8,12 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("smoke") => smoke(),
+        Some("vraminfo") => {
+            let gpu = Gpu::new(0)?;
+            let (free, total) = inkling_cuda::cudarc::driver::result::mem_get_info()?;
+            println!("{}: {} MiB total, CUDA reports {} MiB free, usable (with NVML) {} MiB", gpu.info.name, total >> 20, free >> 20, gpu.free_vram()? >> 20);
+            Ok(())
+        }
         Some("inspect") if args.len() > 1 => inspect(&args[1]),
         Some("tokenize") if args.len() > 2 => tokenize(&args[1], &args[2], args.iter().any(|a| a == "--special")),
         Some("validate") if args.len() > 2 && args.iter().any(|a| a == "--prefill") => validate_prefill(&args[1], &args[2]),
@@ -33,7 +39,7 @@ fn main() -> Result<()> {
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
              \x20 inkling bench <model.gguf> [n] | benchpp <model.gguf> [n] | benchctx <model.gguf> <n>\n\
-             \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | smoke | --version\n\n\
+             \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | vraminfo | smoke | --version\n\n\
              developer checks: validate, kvstudy, cachetest, rendertest, gemmtest, visiontest (see README)",
             env!("CARGO_PKG_VERSION")
         ),

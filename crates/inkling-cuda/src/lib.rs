@@ -3,6 +3,8 @@
 //! The engine runs everything on one stream and later captures the token step into a CUDA graph, so buffers are
 //! addressed by raw device pointers and cudarc's per-buffer event tracking is disabled.
 
+mod nvml;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -234,6 +236,17 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// Free VRAM that can really be used: the smaller of CUDA's figure and NVML's device-wide one (on Windows CUDA
+    /// counts other processes' memory as available because the driver can page it out to system RAM).
+    pub fn free_vram(&self) -> Result<usize> {
+        let (cu_free, _) = cudarc::driver::result::mem_get_info()?;
+        let mut buf = [0 as std::ffi::c_char; 32];
+        let r = unsafe { cudarc::driver::sys::cuDeviceGetPCIBusId(buf.as_mut_ptr(), buf.len() as i32, self.ctx.cu_device()) };
+        let pci = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        let nv_free = if r == cudarc::driver::sys::CUresult::CUDA_SUCCESS { nvml::free_bytes(&pci) } else { None };
+        Ok(nv_free.map_or(cu_free, |n| cu_free.min(n as usize)))
+    }
+
     pub fn new(ordinal: usize) -> Result<Self> {
         let ctx = CudaContext::new(ordinal).context("creating CUDA context (is an NVIDIA driver installed?)")?;
         // single stream + graph capture: cudarc's cross-stream event bookkeeping is unnecessary overhead

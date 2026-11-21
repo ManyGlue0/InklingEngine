@@ -248,6 +248,10 @@ fn resize(img: &Image, w: usize, h: usize) -> Vec<u8> {
 impl Engine {
     /// Load the vision encoder (mmproj GGUF) next to the LM.
     pub fn load_vision(&mut self, mmproj: &str) -> Result<()> {
+        // f16 weights (half the F32 file) + scratch for the largest image (~410 MiB at the 4,096-token cap)
+        let need = std::fs::metadata(mmproj).with_context(|| format!("opening {mmproj}"))?.len() as usize / 2 + (480 << 20);
+        let free = self.gpu.free_vram()?;
+        crate::check_vram(free, need, "the vision encoder")?;
         let v = Vision::load(&self.gpu, mmproj)?;
         ensure!(v.n_out == self.cfg.n_embd, "mmproj projects to {} but the LM width is {}", v.n_out, self.cfg.n_embd);
         self.vision = Some(v);
