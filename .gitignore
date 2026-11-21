@@ -1,0 +1,6 @@
+/target/
+/reference/
+*.nsys-rep
+*.sqlite
+/logs/
+
