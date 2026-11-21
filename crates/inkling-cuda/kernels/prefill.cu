@@ -23,11 +23,22 @@ struct GemmArgs {
 namespace gq8 {
 constexpr int BT = 64, BN = 64, KC = 128, RS = 144;  // RS: shared row stride (bytes)
 
+// Turing (sm_75) fallback: int8 m8n8k16, the m16 tile as two row halves
+__device__ __forceinline__ void mma_s8_m8n8k16(int& c0, int& c1, uint32_t a, uint32_t b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" : "+r"(c0), "+r"(c1) : "r"(a), "r"(b));
+}
+
 __device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
 #if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    // a0/a1: rows g / g+8 at k 0..15, a2/a3: the same rows at k 16..31; b0 / b1: k 0..15 / 16..31
+    mma_s8_m8n8k16(c[0], c[1], a[0], b[0]);
+    mma_s8_m8n8k16(c[0], c[1], a[2], b[1]);
+    mma_s8_m8n8k16(c[2], c[3], a[1], b[0]);
+    mma_s8_m8n8k16(c[2], c[3], a[3], b[1]);
 #endif
 }
 }  // namespace gq8

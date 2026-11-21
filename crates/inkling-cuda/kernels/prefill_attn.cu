@@ -1,4 +1,4 @@
-// Prefill attention on tensor cores (flash-attention style, mma.sync m16n8k16 f16 -> f32, sm_80+).
+// Prefill attention on tensor cores (flash-attention style, mma.sync m16n8k16 f16 -> f32; two m16n8k8 on sm_75).
 //
 // Grid (ceil(T / 64), 24 q heads), 128 threads; warp w owns query tokens q0 + 16w .. +15 of the chunk (position
 // step[1] + token). Q (already clipped and tau-scaled) lives in registers as A fragments; K/V tiles of 64 keys are
@@ -19,6 +19,14 @@ __device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], u
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    // Turing: k 0..7 (a0, a1, b0) then k 8..15 (a2, a3, b1)
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b1));
 #endif
 }
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {

@@ -208,6 +208,10 @@ __device__ __forceinline__ void mma_s8_k16(int (&c)[4], uint32_t a0, uint32_t a1
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a0), "r"(a1), "r"(b0));
+#else
+    // Turing: two int8 m8n8k16 (rows g and g+8)
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" : "+r"(c[0]), "+r"(c[1]) : "r"(a0), "r"(b0));
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};" : "+r"(c[2]), "+r"(c[3]) : "r"(a1), "r"(b0));
 #endif
 }
 }  // namespace moeg

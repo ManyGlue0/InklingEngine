@@ -79,3 +79,23 @@ tests/             numerical-match tests against reference dumps
 - **M6** OpenAI server, chat template, reasoning split, tool calling.
 - **M7** Vision (mmproj).
 - **M8** Portability pass (sm_75–sm_120), docs, release.
+
+## Status (2026-11-21)
+M0–M7 are done, and M8 is done except for publishing the release.
+
+| Area | Result (RTX 3090) |
+|---|---|
+| Decode | 113–117 tok/s (llama.cpp: 48) |
+| Prefill | pp512 3109, pp2048 4348 tok/s (llama.cpp: 1350) |
+| Context | 256k in 24 GB with 6-bit KV |
+| Accuracy vs reference | median KL 6e-5 |
+| Server | OpenAI API: tools, reasoning, images, prompt cache, penalties |
+| Vision | native ViT matching llama-mtmd-debug |
+| Portability | Turing fallbacks: int8 m8n8k16, f16 m16n8k8, synchronous copies instead of cp.async; validated through compute_75 PTX on the 3090 |
+| Release build | `INKLING_CUDA_ARCHS=75,80,86,89,90,100,120` |
+
+Open follow-ups:
+- Faster q6 dequant in decode attention at very long context.
+- Vision GEMM tuning (~35% of f16 peak).
+- Native FP4 MMA on sm_120.
+- A Linux build test.

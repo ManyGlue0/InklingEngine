@@ -250,6 +250,12 @@ impl Gpu {
             sm_count: attr(Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
             l2_bytes: attr(Attr::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
         };
+        let (major, minor) = info.compute_capability;
+        anyhow::ensure!(
+            (major, minor) >= (7, 5),
+            "{} has compute capability {major}.{minor}; InklingEngine needs 7.5 or newer (Turing / RTX 20xx and later)",
+            info.name
+        );
         let module = ctx
             .load_module(Ptx::from_binary(KERNELS_FATBIN.to_vec()))
             .context("loading kernel fatbin: this build may not include your GPU architecture (see INKLING_CUDA_ARCHS)")?;

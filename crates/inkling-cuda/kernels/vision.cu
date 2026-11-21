@@ -3,19 +3,31 @@
 //
 // Layout: the residual stream is f32 [N][D] (row 0 = CLS, rows 1.. = patches in row-major order); GEMM inputs are
 // f16 row-major, weights f16 [N_out][K] (y = x W^T), K a multiple of 32. Uses mma.sync m16n8k16 (sm_80+) through
-// the fa:: helpers of prefill_attn.cu.
+// the fa:: helpers of prefill_attn.cu (Turing fallbacks there); cp.async on sm_80+, plain copies on sm_75.
 
 namespace vit {
 constexpr int BM = 128, BN = 128, BK = 32, SS = 40;  // SS: shared row stride in halves (80 B, ldmatrix conflict-free)
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred) {
+#if __CUDA_ARCH__ >= 800
     const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
     const int n = pred ? 16 : 0;
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s), "l"(gmem), "r"(n));
+#else
+    *reinterpret_cast<uint4*>(smem) = pred ? *reinterpret_cast<const uint4*>(gmem) : make_uint4(0, 0, 0, 0);
+#endif
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;");
+#endif
+}
 template <int N>
-__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+__device__ __forceinline__ void cp_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+#endif
+}
 
 __device__ __forceinline__ float gelu_erf(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f)); }
 }  // namespace vit
