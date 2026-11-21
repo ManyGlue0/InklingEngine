@@ -6,6 +6,7 @@ import time
 import urllib.request
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 def chat(body):
