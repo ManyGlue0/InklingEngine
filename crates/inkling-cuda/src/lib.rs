@@ -97,6 +97,42 @@ pub struct MixArgs {
     pub d: i32,
     pub eps: f32,
 }
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvSegQ {
+    pub qs: u64,
+    pub d: u64,
+    pub xq: u64,
+    pub xd: u64,
+    pub y: u64,
+    pub n: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvQ4 {
+    pub s: [MvSegQ; 4],
+    pub nseg: i32,
+    pub k: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MixArgsQ {
+    pub m: MixArgs,
+    pub xq: u64,
+    pub xd: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct NormQ4 {
+    pub x: [u64; 4],
+    pub w: [u64; 4],
+    pub y: [u64; 4],
+    pub xq: [u64; 4],
+    pub xd: [u64; 4],
+}
+unsafe impl DeviceRepr for MvQ4 {}
+unsafe impl DeviceRepr for MixArgsQ {}
+unsafe impl DeviceRepr for NormQ4 {}
 unsafe impl DeviceRepr for Mv4 {}
 unsafe impl DeviceRepr for MvB4 {}
 unsafe impl DeviceRepr for ExpW {}
@@ -115,6 +151,9 @@ pub enum Arg {
     Exp(ExpW),
     Ctrl(Ctrl4),
     Mix(MixArgs),
+    MvQ(MvQ4),
+    MixQ(MixArgsQ),
+    NormQ(NormQ4),
 }
 
 impl From<&DevBuf> for Arg {
@@ -239,6 +278,9 @@ impl Gpu {
                 Arg::Exp(v) => l.arg(v),
                 Arg::Ctrl(v) => l.arg(v),
                 Arg::Mix(v) => l.arg(v),
+                Arg::MvQ(v) => l.arg(v),
+                Arg::MixQ(v) => l.arg(v),
+                Arg::NormQ(v) => l.arg(v),
             };
         }
         let cfg = LaunchConfig { grid_dim: (grid.0, grid.1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };

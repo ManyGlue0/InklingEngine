@@ -11,9 +11,30 @@ fn main() -> Result<()> {
         Some("inspect") if args.len() > 1 => inspect(&args[1]),
         Some("tokenize") if args.len() > 2 => tokenize(&args[1], &args[2], args.iter().any(|a| a == "--special")),
         Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
+        Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
         _ => bail!("usage: inkling smoke | inkling inspect <model.gguf> | inkling tokenize <model.gguf> <file> [--special]"),
     }
+}
+
+/// Decode throughput: greedy generation of `n` tokens after a short prompt, no printing.
+fn bench(model: &str, n: usize) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let ids = tok.encode("<|message_user|><|content_text|>Write a long story about a lighthouse keeper.<|end_message|><|message_model|><|content_text|>", true)?;
+    let t0 = Instant::now();
+    let mut next = 0;
+    for (pos, &id) in ids.iter().enumerate() {
+        next = eng.step_greedy(id, pos)?;
+    }
+    let pre = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    for i in 0..n {
+        next = eng.step_greedy(next, ids.len() + i)?;
+    }
+    let dec = t1.elapsed().as_secs_f64();
+    println!("prompt {} tok: {:.1} tok/s | decode {n} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, n as f64 / dec, dec * 1e3 / n as f64);
+    Ok(())
 }
 
 /// Greedy generation from a raw prompt (special tokens parsed); reports prefill and decode speed.
@@ -125,6 +146,10 @@ fn validate(model: &str, dump: &str) -> Result<()> {
         let (kl, top1) = kl_top1(&logits, rl);
         kl_sum += kl;
         agree += top1 as usize;
+        if t == 0 && std::env::var_os("INKLING_VERBOSE").is_some() {
+            let l: Vec<String> = order.iter().map(|&s| format!("{s}:{:.4}", errs[s])).collect();
+            println!("t=0 per-slot rel.err: {}", l.join(" "));
+        }
         if t < 3 || t + 1 == t_n {
             let first_bad = order.iter().find(|&&s| errs[s] > 0.05);
             println!("t={t:3}  KL={kl:.5}  top1={}  max layer rel.err={:.4}{}", if top1 { "same" } else { "DIFF" },

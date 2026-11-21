@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-env-changed=INKLING_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=INKLING_PTXAS_VERBOSE");
 
     let mut sources: Vec<PathBuf> = std::fs::read_dir(kernel_dir)
         .expect("kernels/ directory")
