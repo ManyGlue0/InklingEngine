@@ -65,7 +65,19 @@ yet. The sm_75 code paths were validated by running the compute_75 PTX on the 30
 
 ## Quick start
 
-InklingEngine is one program, `inkling`. You build it from source with Cargo; there are no prebuilt downloads yet.
+InklingEngine is one program, `inkling`. Get it in one of two ways.
+
+### Windows: download
+
+1. Download `inkling-0.1.0-windows-x64.zip` from the
+   [latest release](https://github.com/ManyGlue0/InklingEngine/releases/latest) and unzip it anywhere.
+2. The only prerequisite is an NVIDIA driver; nothing else needs installing.
+3. The zip contains `inkling.exe`, which holds the GPU code for every supported NVIDIA generation, plus this README,
+   the license files and `tools/chat.py`.
+4. `inkling.exe` is a command-line program: open a terminal in that folder (in Explorer, right-click > Open in
+   Terminal) and run it as `.\inkling.exe`. Double-clicking it only flashes a window.
+
+### Any OS: build from source
 
 **1. Install the prerequisites** (see [Requirements](#requirements)):
 - an NVIDIA driver;
@@ -91,10 +103,12 @@ inkling --version
 If you would rather not install it, run `cargo build --release` instead and call the binary by its path,
 `target/release/inkling`.
 
-**3. Download the model** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth):
+### Then
+
+**Download the model** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth):
 `Inkling-2-Mini-UD-Q4_K_XL.gguf`, plus `mmproj-F32.gguf` if you want image input.
 
-**4. Run it:**
+**Run it** (with the zip, type `.\inkling.exe` instead of `inkling`):
 
 ```sh
 # OpenAI-compatible server at http://127.0.0.1:8080/v1 (point any OpenAI client or chat UI at it)
