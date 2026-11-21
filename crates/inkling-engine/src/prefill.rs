@@ -356,6 +356,7 @@ impl Engine {
                 Arg::Ptr(p.sink.at(cfg.n_head * F32)), Arg::I32(ss as i32), Arg::I32(!lw.is_swa as i32), Arg::Ptr(p.step.ptr),
                 Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(!lw.is_swa as i32),
                 Arg::F32(cfg.qk_clip), Arg::F32(cfg.rel_clip), Arg::F32(cfg.log_scale_floor), Arg::F32(cfg.log_scale_alpha), Arg::F32(cfg.rms_eps),
+                Arg::I32(self.kv_bits(lw.is_swa).0), Arg::I32(self.kv_bits(lw.is_swa).1), Arg::I32(slot.kv_fmt),
             ])?;
             self.conv_state(p.kraw.ptr, conv_k, kvw, t)?;
             self.conv_state(p.vraw.ptr, conv_v, kvw, t)?;
@@ -366,14 +367,14 @@ if std::env::var("INKLING_PRE_ATTN").as_deref() == Ok("split") {
                 Arg::Ptr(p.qrg.ptr), Arg::Ptr(p.qrg.at(qd * F32)), Arg::Ptr(p.sink.ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr),
                 Arg::Ptr(lw.rel_bias), Arg::Ptr(p.qrg.at((qd + cfg.n_head * cfg.n_rel) * F32)), Arg::Ptr(p.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                 Arg::Ptr(p.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
-                Arg::Ptr(p.part.ptr), Arg::Ptr(p.cnt.ptr), Arg::I32(qs as i32), Arg::I32(ss as i32),
+                Arg::Ptr(p.part.ptr), Arg::Ptr(p.cnt.ptr), Arg::I32(qs as i32), Arg::I32(ss as i32), Arg::I32(slot.kv_fmt),
             ])?;
             } else {
                 self.gpu.launch("ink_attn_prefill", (t.div_ceil(64) as u32, cfg.n_head as u32), 128, &[
                     Arg::Ptr(p.qrg.ptr), Arg::I32(qs as i32), Arg::I32(qd as i32), Arg::I32((qd + cfg.n_head * cfg.n_rel) as i32),
                     Arg::Ptr(p.sink.ptr), Arg::I32(ss as i32), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::I32(slot.kv_cap as i32),
                     Arg::I32(window), Arg::I32(cfg.rel_extent as i32), Arg::Ptr(lw.rel_bias), Arg::Ptr(p.step.ptr), Arg::I32(t as i32),
-                    Arg::Ptr(p.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
+                    Arg::Ptr(p.att.ptr), Arg::Ptr(oq), Arg::Ptr(od), Arg::I32(slot.kv_fmt),
                 ])?;
             }
             self.pre_gemm(&[(lw.wo, (oq, od), p.proj.ptr, d, d)], qd, t)?;

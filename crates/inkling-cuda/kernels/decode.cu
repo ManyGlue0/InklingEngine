@@ -841,6 +841,63 @@ INK_EXTERN void ink_rmsnorm_q(NormQ4 a, int D, float eps) {
     }
 }
 
+// KV format study: quantize-dequantize v (one per lane) to `bits` (symmetric, f16 scale per 32 lanes); 0 = f16.
+__device__ __forceinline__ float kv_fakequant(float v, int bits) {
+    if (bits == 0) return v;
+    const float amax = warp_max(fabsf(v));
+    const float qmax = (float)((1 << (bits - 1)) - 1);
+    const float s = __half2float(__float2half(amax / qmax));
+    if (s == 0.0f) return 0.0f;
+    return fminf(fmaxf(rintf(v / s), -qmax), qmax) * s;
+}
+
+// KV cache formats. fmt 0: f16 [row][8 heads x 128]. fmt 1 (q6): per row and kv head 104 bytes =
+// ql[64] (low 4 bits, channel c in byte c/2, nibble c&1) | qh[32] (high 2 bits, byte c/4, bits 2(c&3)) |
+// 4 f16 scales (one per 32 channels); values are q - 32 with q in 1..63 (symmetric 6-bit).
+constexpr int KVQ6_HEAD = 104, KVQ6_ROW = 8 * KVQ6_HEAD;
+
+// Store channel c (= 32 * warp + lane, one quant group per warp) of kv head h at cache row `row`.
+__device__ __forceinline__ void kv_store(void* cache, int fmt, size_t row, int h, int c, float v) {
+    if (fmt == 0) {
+        reinterpret_cast<__half*>(cache)[row * 1024 + h * 128 + c] = __float2half(v);
+        return;
+    }
+    uint8_t* b = reinterpret_cast<uint8_t*>(cache) + row * KVQ6_ROW + h * KVQ6_HEAD;
+    const float amax = warp_max(fabsf(v));
+    const __half sh = __float2half(amax / 31.0f);
+    const float s = __half2float(sh);
+    const int q = (s == 0.0f ? 0 : (int)fminf(fmaxf(rintf(v / s), -31.0f), 31.0f)) + 32;
+    const int q1 = __shfl_down_sync(0xffffffffu, q, 1), q2 = __shfl_down_sync(0xffffffffu, q, 2), q3 = __shfl_down_sync(0xffffffffu, q, 3);
+    const int lane = threadIdx.x & 31;
+    if ((c & 1) == 0) b[c >> 1] = (uint8_t)((q & 15) | ((q1 & 15) << 4));
+    if ((c & 3) == 0) b[64 + (c >> 2)] = (uint8_t)((q >> 4) | ((q1 >> 4) << 2) | ((q2 >> 4) << 4) | ((q3 >> 4) << 6));
+    if (lane == 0) reinterpret_cast<__half*>(b + 96)[c >> 5] = sh;
+}
+
+// Dequantize channels 16p .. 16p+15 of kv head h at cache row `row` into dst (16 halves, 16-byte aligned).
+__device__ __forceinline__ void kv_load16(const void* cache, int fmt, size_t row, int h, int p, __half* dst) {
+    if (fmt == 0) {
+        const uint4* s = reinterpret_cast<const uint4*>(reinterpret_cast<const __half*>(cache) + row * 1024 + h * 128 + 16 * p);
+        reinterpret_cast<uint4*>(dst)[0] = s[0];
+        reinterpret_cast<uint4*>(dst)[1] = s[1];
+        return;
+    }
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(cache) + row * KVQ6_ROW + h * KVQ6_HEAD;
+    const uint2 lo = *reinterpret_cast<const uint2*>(b + 8 * p);
+    const uint32_t hi = *reinterpret_cast<const uint32_t*>(b + 64 + 4 * p);
+    const float s = __half2float(reinterpret_cast<const __half*>(b + 96)[p >> 1]);
+    __align__(16) __half out[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t lw = i < 8 ? lo.x : lo.y;
+        const int low = (lw >> (4 * (i & 7))) & 15;
+        const int high = (hi >> (2 * i)) & 3;
+        out[i] = __float2half((float)((low | (high << 4)) - 32) * s);
+    }
+    reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(out)[0];
+    reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(out)[1];
+}
+
 // Attention prep with the K/V short convs fused. Grid 64 blocks x 128 threads:
 //   0..23 q heads (clip, tau), 24..31 k heads (conv [+dyn] -> clip -> cache), 32..39 v heads (conv -> rms -> cache),
 //   40..63 r heads (clip, tau).
@@ -857,8 +914,8 @@ INK_EXTERN void ink_attn_prep2(float* __restrict__ q, const float* __restrict__ 
                                const float* __restrict__ qclip, const float* __restrict__ rclip,
                                const float* __restrict__ kconv, const float* __restrict__ vconv, float* __restrict__ kstate, float* __restrict__ vstate,
                                const float* __restrict__ dynk, const float* __restrict__ dynv, const int* __restrict__ step,
-                               __half* __restrict__ Kc, __half* __restrict__ Vc, int kv_cap, int is_full,
-                               float qk_clip, float rel_clip, float log_floor, float log_alpha, float eps) {
+                               void* __restrict__ Kc, void* __restrict__ Vc, int kv_cap, int is_full,
+                               float qk_clip, float rel_clip, float log_floor, float log_alpha, float eps, int kbits, int vbits, int kvfmt) {
     const int task = blockIdx.x, tid = threadIdx.x;
     const int pos = step[1];
     const float tau = is_full ? 1.0f + log_alpha * logf(fmaxf(1.0f, (float)(pos + 1) / log_floor)) : 1.0f;
@@ -889,7 +946,7 @@ INK_EXTERN void ink_attn_prep2(float* __restrict__ q, const float* __restrict__ 
         float f;
         if (isk) f = fminf(1.0f, qk_clip / (sqrtf(sum128(o * o)) + 1e-6f));
         else f = rsqrtf(sum128(o * o) / 128.0f + eps);
-        (isk ? Kc : Vc)[(size_t)row * 1024 + c] = __float2half(o * f);
+        kv_store(isk ? Kc : Vc, kvfmt, row, h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
     } else {
         const int h = task - 40;
         const float y = tid < 16 ? r[h * 16 + tid] * rclip[h * 16 + tid] : 0.0f;

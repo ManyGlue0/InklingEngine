@@ -17,12 +17,12 @@ constexpr int HD = 128, NQ = 3, KVW = 1024, TILE = 16, KSTRIDE = 144;  // KSTRID
 }
 
 extern "C" __global__ void __launch_bounds__(128) ink_attn_split(const float* __restrict__ q, const float* __restrict__ r,
-                                                                 const float* __restrict__ sink, const __half* __restrict__ Kc,
-                                                                 const __half* __restrict__ Vc, const float* __restrict__ relbias,
+                                                                 const float* __restrict__ sink, const void* __restrict__ Kc,
+                                                                 const void* __restrict__ Vc, const float* __restrict__ relbias,
                                                                  const float* __restrict__ gate, float* __restrict__ out,
                                                                  int8_t* __restrict__ oq, float* __restrict__ od, const int* __restrict__ step,
                                                                  int kv_cap, int window, int extent, float* __restrict__ part,
-                                                                 unsigned int* __restrict__ counters, int qstride, int sstride) {
+                                                                 unsigned int* __restrict__ counters, int qstride, int sstride, int kvfmt) {
     using namespace att;
     __shared__ __align__(16) float qs[NQ][HD];
     __shared__ float rs[NQ][16];
@@ -72,19 +72,21 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_split(const float* __
     const float scale = rsqrtf((float)HD);
 
     for (int t0 = s0 + warp * TILE; t0 < s1; t0 += 4 * TILE) {
-        // stage the tile: 16 rows x 256 B of K and of V, 8 uint4 per lane each
+        // stage the tile (dequantized to f16): 16 rows x 8 parts of 16 channels for K and V, 4 parts per lane
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int idx = lane + 32 * i, rr = idx >> 4, cc = idx & 15;
+        for (int i = 0; i < 4; ++i) {
+            const int idx = lane + 32 * i, rr = idx >> 3, pp = idx & 7;
             const int j = t0 + rr;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
             if (j < s1) {
-                const size_t off = (size_t)(j % kv_cap) * KVW + kvh * HD;
-                kv = *reinterpret_cast<const uint4*>(Kc + off + cc * 8);
-                vv = *reinterpret_cast<const uint4*>(Vc + off + cc * 8);
+                kv_load16(Kc, kvfmt, (size_t)(j % kv_cap), kvh, pp, kt + rr * KSTRIDE + pp * 16);
+                kv_load16(Vc, kvfmt, (size_t)(j % kv_cap), kvh, pp, vt + rr * HD + pp * 16);
+            } else {
+                const uint4 z = make_uint4(0, 0, 0, 0);
+                reinterpret_cast<uint4*>(kt + rr * KSTRIDE + pp * 16)[0] = z;
+                reinterpret_cast<uint4*>(kt + rr * KSTRIDE + pp * 16)[1] = z;
+                reinterpret_cast<uint4*>(vt + rr * HD + pp * 16)[0] = z;
+                reinterpret_cast<uint4*>(vt + rr * HD + pp * 16)[1] = z;
             }
-            *reinterpret_cast<uint4*>(kt + rr * KSTRIDE + cc * 8) = kv;
-            *reinterpret_cast<uint4*>(vt + rr * HD + cc * 8) = vv;
         }
         // relative-position bias row of this lane's position, in flight with the tile
         const int pi = lane >> 1, par = lane & 1;

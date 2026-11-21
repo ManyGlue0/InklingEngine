@@ -13,6 +13,8 @@ fn main() -> Result<()> {
         Some("validate") if args.len() > 2 && args.iter().any(|a| a == "--prefill") => validate_prefill(&args[1], &args[2]),
         Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
         Some("gemmtest") if args.len() > 1 => gemmtest(&args[1]),
+        Some("kvstudy") if args.len() > 1 => kvstudy(&args[1]),
+        Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
         Some("benchpp") if args.len() > 1 => benchpp(&args[1], args.get(2).and_then(|s| s.parse().ok())),
         Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
@@ -28,6 +30,89 @@ fn gemmtest(model: &str) -> Result<()> {
         let flops = 2.0 * t as f64 * 2304.0 * (6528.0 + 2048.0);
         println!("T={t:4}: max |gemm - matvec| = {err:.3e} (max |y| {mag:.2}) | {ms:.3} ms = {:.1} TOPS", flops / ms / 1e9);
     }
+    Ok(())
+}
+
+/// KV-cache format study: KL / top-1 of fake-quantized K/V caches against the f16 cache, on the long chat
+/// dump prompt and on ~8k tokens of repository text (docs + sources).
+fn kvstudy(model: &str) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 16384)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let nv = eng.cfg.n_vocab_unpadded;
+    let mut texts: Vec<(&str, Vec<u32>)> = Vec::new();
+    texts.push(("chat 807", tok.encode(&std::fs::read_to_string("tests/data/prompt_long.txt")?, true)?));
+    let mut src = String::new();
+    for f in ["docs/MODEL.md", "docs/PLAN.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-cuda/kernels/prefill_attn.cu", "crates/inkling-core/src/config.rs"] {
+        src.push_str(&std::fs::read_to_string(f).unwrap_or_default());
+        src.push_str("
+
+");
+    }
+    let mut ids = tok.encode(&src, false)?;
+    ids.truncate(8192);
+    texts.push(("repo 8k", ids));
+    let configs: &[(&str, &str, &str, bool)] = &[
+        ("K8 V8", "8", "8", false), ("K6 V6", "6", "6", false), ("K5 V5", "5", "5", false), ("K4 V4", "4", "4", false),
+        ("K8 V4", "8", "4", false), ("K4 V8", "4", "8", false), ("K6 V4", "6", "4", false),
+        ("K8 V8 all", "8", "8", true), ("K6 V6 all", "6", "6", true), ("K4 V4 all", "4", "4", true),
+    ];
+    let set = |k: &str, v: &str, all: bool| unsafe {
+        std::env::set_var("INKLING_KQ", k);
+        std::env::set_var("INKLING_VQ", v);
+        if all { std::env::set_var("INKLING_KV_ALL", "1") } else { std::env::remove_var("INKLING_KV_ALL") }
+    };
+    for (name, ids) in &texts {
+        set("0", "0", false);
+        let base = eng.prefill_logits(ids)?;
+        let n = ids.len();
+        println!("== {name} ({n} tokens), against the f16 cache (sliding-window layers f16 unless 'all')");
+        for &(cname, k, v, all) in configs {
+            set(k, v, all);
+            let lg = eng.prefill_logits(ids)?;
+            let mut kls: Vec<f64> = Vec::with_capacity(n);
+            let mut agree = 0;
+            for t in 0..n {
+                let (kl, top1) = kl_top1(&lg[t * nv..(t + 1) * nv], &base[t * nv..(t + 1) * nv]);
+                kls.push(kl);
+                agree += top1 as usize;
+            }
+            let mean = kls.iter().sum::<f64>() / n as f64;
+            let late = kls[n / 2..].iter().sum::<f64>() / (n - n / 2) as f64;
+            kls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("  {cname:<10} mean KL {mean:.5} (2nd half {late:.5})  median {:.6}  p99 {:.4}  top-1 {:.2}%",
+                kls[n / 2], kls[n * 99 / 100], 100.0 * agree as f64 / n as f64);
+        }
+    }
+    set("0", "0", false);
+    Ok(())
+}
+
+/// Long context: load with a 256k context, prefill `n` tokens of repository text, then decode 64 tokens at that
+/// depth. Reports VRAM in use, prompt and decode throughput.
+fn benchctx(model: &str, n: usize) -> Result<()> {
+    let ctx: usize = std::env::var("INKLING_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(262144);
+    let mut eng = inkling_engine::Engine::load(model, ctx)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let (free, total) = inkling_cuda::cudarc::driver::result::mem_get_info()?;
+    println!("context {ctx}: VRAM in use {:.2} / {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
+    let mut src = String::new();
+    for f in ["docs/MODEL.md", "docs/PLAN.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-engine/src/lib.rs", "crates/inkling-cuda/kernels/decode.cu"] {
+        src.push_str(&std::fs::read_to_string(f).unwrap_or_default());
+    }
+    let base = tok.encode(&src, false)?;
+    let ids: Vec<u32> = base.iter().cycle().take(n).copied().collect();
+    let t0 = Instant::now();
+    let mut first = None;
+    let out = eng.generate(&ids, 65, |_| {
+        if first.is_none() {
+            first = Some(t0.elapsed().as_secs_f64());
+        }
+        true
+    })?;
+    let total_s = t0.elapsed().as_secs_f64();
+    let ttft = first.unwrap();
+    let m = out.len() - 1;
+    println!("prompt {n} tok: {:.0} tok/s ({:.2} s) | decode {m} tok at depth {n}: {:.1} tok/s", n as f64 / ttft, ttft, m as f64 / (total_s - ttft));
     Ok(())
 }
 

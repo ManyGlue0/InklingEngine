@@ -47,8 +47,8 @@ INK_EXTERN void ink_attn_prep_b(float* __restrict__ qrg, int qs, int roff, const
                                 const float* __restrict__ qclip, const float* __restrict__ rclip, const float* __restrict__ kconv,
                                 const float* __restrict__ vconv, const float* __restrict__ kstate, const float* __restrict__ vstate,
                                 const float* __restrict__ dyn, int dyns, int has_dyn, const int* __restrict__ step,
-                                __half* __restrict__ Kc, __half* __restrict__ Vc, int kv_cap, int is_full, float qk_clip,
-                                float rel_clip, float log_floor, float log_alpha, float eps) {
+                                void* __restrict__ Kc, void* __restrict__ Vc, int kv_cap, int is_full, float qk_clip,
+                                float rel_clip, float log_floor, float log_alpha, float eps, int kbits, int vbits, int kvfmt) {
     const int task = blockIdx.x, tid = threadIdx.x, t = blockIdx.y;
     const int pos = step[1] + t;
     const float tau = is_full ? 1.0f + log_alpha * logf(fmaxf(1.0f, (float)(pos + 1) / log_floor)) : 1.0f;
@@ -77,7 +77,7 @@ INK_EXTERN void ink_attn_prep_b(float* __restrict__ qrg, int qs, int roff, const
         float f;
         if (isk) f = fminf(1.0f, qk_clip / (sqrtf(sum128(o * o)) + 1e-6f));
         else f = rsqrtf(sum128(o * o) / 128.0f + eps);
-        (isk ? Kc : Vc)[(size_t)(pos % kv_cap) * 1024 + c] = __float2half(o * f);
+        kv_store(isk ? Kc : Vc, kvfmt, (size_t)(pos % kv_cap), h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
     } else {
         const int h = task - 40;
         const float y = tid < 16 ? r[h * 16 + tid] * rclip[h * 16 + tid] : 0.0f;

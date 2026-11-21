@@ -22,6 +22,8 @@ struct Slot {
     k: DevBuf,
     v: DevBuf,
     kv_cap: usize,
+    /// cache format: 0 = f16, 1 = q6 (6-bit + f16 scale per 32 channels)
+    kv_fmt: i32,
     conv: DevBuf, // [k: 3x1024][v: 3x1024][attn: 3xD][ffn: 3xD] floats
 }
 
@@ -138,14 +140,25 @@ impl Engine {
         for p in cfg.schedule() {
             slot_phys[p.slot] = p.phys;
         }
+        let kv_q6 = match std::env::var("INKLING_KV").as_deref() {
+            Ok("f16") => false,
+            Ok("q6") | Err(_) => true,
+            Ok(other) => anyhow::bail!("INKLING_KV={other}: expected f16 or q6"),
+        };
         let mut slots = Vec::with_capacity(cfg.n_slots());
         for s in 0..cfg.n_slots() {
             // sliding-window ring: a prefill chunk writes its K/V before attending, so window + chunk - 1 must fit
-            let cap = if cfg.is_swa[slot_phys[s]] { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
+            let swa = cfg.is_swa[slot_phys[s]];
+            let cap = if swa { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
+            // full-attention slots grow with the context: 6-bit cache (KV study: ~q8 quality); sliding-window
+            // rings stay f16 (fixed size)
+            let kv_fmt = if !swa && kv_q6 { 1 } else { 0 };
+            let row_bytes = if kv_fmt == 1 { 8 * 104 } else { kvw * 2 };
             slots.push(Slot {
-                k: gpu.alloc(cap * kvw * 2)?,
-                v: gpu.alloc(cap * kvw * 2)?,
+                k: gpu.alloc(cap * row_bytes)?,
+                v: gpu.alloc(cap * row_bytes)?,
                 kv_cap: cap,
+                kv_fmt,
                 conv: gpu.alloc(3 * (2 * kvw + 2 * d) * F32)?,
             });
         }
@@ -204,6 +217,7 @@ impl Engine {
         };
         ensure!(std::env::var("INKLING_MOE").as_deref() == Ok("7") || moe_blocks > 0, "persistent MoE kernel does not fit on this GPU");
         let attn_splits = if std::env::var("INKLING_ATTN").as_deref() == Ok("old") {
+            ensure!(!kv_q6, "INKLING_ATTN=old needs INKLING_KV=f16");
             0
         } else if n_ctx <= 32768 {
             32
@@ -285,6 +299,16 @@ impl Engine {
             }
         }
         Ok((err, mag, ms))
+    }
+
+    /// KV format study (INKLING_KQ / INKLING_VQ = bits, INKLING_KV_ALL = also sliding-window layers): bits the
+    /// cache write fake-quantizes K and V to (0 = f16).
+    pub(crate) fn kv_bits(&self, is_swa: bool) -> (i32, i32) {
+        if is_swa && std::env::var_os("INKLING_KV_ALL").is_none() {
+            return (0, 0);
+        }
+        let b = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (b("INKLING_KQ"), b("INKLING_VQ"))
     }
 
     /// Read a scratch buffer by name (debugging / validation).
@@ -498,6 +522,7 @@ impl Engine {
                 Arg::Ptr(lw.k_conv), Arg::Ptr(lw.v_conv), Arg::Ptr(conv_k), Arg::Ptr(conv_v), Arg::Ptr(dk), Arg::Ptr(dv),
                 Arg::Ptr(a.step.ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(!lw.is_swa as i32),
                 Arg::F32(cfg.qk_clip), Arg::F32(cfg.rel_clip), Arg::F32(cfg.log_scale_floor), Arg::F32(cfg.log_scale_alpha), Arg::F32(cfg.rms_eps),
+                Arg::I32(self.kv_bits(lw.is_swa).0), Arg::I32(self.kv_bits(lw.is_swa).1), Arg::I32(slot.kv_fmt),
             ])?;
             let window = if lw.is_swa { cfg.n_swa as i32 } else { 0 };
             let (oq, od) = a.attq.at(0, qd);
@@ -506,7 +531,7 @@ if self.attn_splits > 0 {
                     Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
                     Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                     Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
-                    Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr), Arg::I32((2 * qd + cfg.n_head * cfg.n_rel) as i32), Arg::I32(0),
+                    Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr), Arg::I32((2 * qd + cfg.n_head * cfg.n_rel) as i32), Arg::I32(0), Arg::I32(slot.kv_fmt),
                 ])?;
             } else {
                             self.gpu.launch("ink_attn_decode2", (cfg.n_head as u32, 1), 128, &[

@@ -36,10 +36,10 @@ __device__ __forceinline__ uint32_t pack2(float a, float b) {
 }  // namespace fa
 
 extern "C" __global__ void __launch_bounds__(128) ink_attn_prefill(const float* __restrict__ qrg, int qs, int roff, int goff,
-                                                                   const float* __restrict__ sink, int ss, const __half* __restrict__ Kc,
-                                                                   const __half* __restrict__ Vc, int kv_cap, int window, int extent,
+                                                                   const float* __restrict__ sink, int ss, const void* __restrict__ Kc,
+                                                                   const void* __restrict__ Vc, int kv_cap, int window, int extent,
                                                                    const float* __restrict__ relbias, const int* __restrict__ step, int T,
-                                                                   float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od) {
+                                                                   float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, int kvfmt) {
     using namespace fa;
     __shared__ __align__(16) __half ks[BK * KS];
     __shared__ __align__(16) __half vs[BK * KS];
@@ -90,20 +90,22 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_prefill(const float* 
     __half* bw = bs[warp];
 
     for (int k0 = jlo; k0 <= jhi; k0 += BK) {
-        // stage K, V: 64 rows x 16 uint4 each, 8 + 8 per thread
+        // stage K, V (dequantized to f16): 64 rows x 8 parts of 16 channels, 4 + 4 per thread
         __syncthreads();
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int idx = threadIdx.x + 128 * i, rr = idx >> 4, cc = idx & 15;
+        for (int i = 0; i < 4; ++i) {
+            const int idx = threadIdx.x + 128 * i, rr = idx >> 3, pp = idx & 7;
             const int j = k0 + rr;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
             if (j <= jhi) {
-                const size_t off = (size_t)(j % kv_cap) * 1024 + kvh * HD + cc * 8;
-                kv = *reinterpret_cast<const uint4*>(Kc + off);
-                vv = *reinterpret_cast<const uint4*>(Vc + off);
+                kv_load16(Kc, kvfmt, (size_t)(j % kv_cap), kvh, pp, ks + rr * KS + pp * 16);
+                kv_load16(Vc, kvfmt, (size_t)(j % kv_cap), kvh, pp, vs + rr * KS + pp * 16);
+            } else {
+                const uint4 z = make_uint4(0, 0, 0, 0);
+                reinterpret_cast<uint4*>(ks + rr * KS + pp * 16)[0] = z;
+                reinterpret_cast<uint4*>(ks + rr * KS + pp * 16)[1] = z;
+                reinterpret_cast<uint4*>(vs + rr * KS + pp * 16)[0] = z;
+                reinterpret_cast<uint4*>(vs + rr * KS + pp * 16)[1] = z;
             }
-            *reinterpret_cast<uint4*>(ks + rr * KS + cc * 8) = kv;
-            *reinterpret_cast<uint4*>(vs + rr * KS + cc * 8) = vv;
         }
         __syncthreads();
         // warp-level skip: keys entirely after this warp's last row or before its first row's window
