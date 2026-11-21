@@ -7,7 +7,7 @@
 pub mod repack;
 pub mod weights;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use inkling_core::{Config, Gguf};
 use inkling_cuda::cudarc::driver::{CudaGraph, sys};
 use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, Gpu, HostMapped, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
@@ -40,6 +40,9 @@ impl Q8Buf {
     }
 }
 
+/// Upper bound of the decode attention splits (sizes the partials buffer).
+const ATTN_SPLITS_MAX: usize = 64;
+
 /// Scratch activations.
 struct Act {
     x: DevBuf,
@@ -61,12 +64,15 @@ struct Act {
     f2: DevBuf,
     fnorm: DevBuf,
     fq: Q8Buf,      // q8_1 FFN / head input
-    hq: Q8Buf,      // q8_1 expert hidden [k][F]
+    hq: Q8Buf,      // int8 expert hidden [k][F], scales per 16 values [k][F/16]
     sel: DevBuf,
     wts: DevBuf,
     rlog: DevBuf,
     counter: DevBuf,
-    part: DevBuf,   // expert partial outputs [k][D]
+    bar: DevBuf,    // grid barrier [arrivals, generation] of the persistent MoE kernel
+    attn_part: DevBuf, // split-K attention partials [8 kv heads][ATTN_SPLITS_MAX][3 x (2 + 128)]
+    attn_cnt: DevBuf,  // split-K attention arrival counters [8]
+    part: DevBuf,   // expert hidden h as float [k][F] (persistent MoE kernel)
     ffn_out: DevBuf,
     xp: DevBuf,
     xprev: DevBuf,
@@ -100,6 +106,12 @@ pub struct Engine {
     graph_dec: Option<CudaGraph>,
     /// disable graph replay (debug captures need per-layer host callbacks)
     pub use_graph: bool,
+    /// blocks of the persistent MoE kernel (all resident), 0 = use the two-kernel path
+    moe_blocks: u32,
+    /// position splits of the decode attention (grid y); 0 = the old one-block-per-head kernel
+    attn_splits: u32,
+    /// INKLING_MOE_TL: per-slot, per-block phase timestamps of the persistent MoE kernel (u64 [slot][block][8])
+    pub moe_tl: Option<DevBuf>,
 }
 
 /// Optional per-pass hook, called after each layer pass with (slot, engine); use `Engine::debug_buf` to read state.
@@ -111,7 +123,7 @@ impl Engine {
         let cfg = Config::from_gguf(&g)?;
         // several kernels are specialised for Inkling 2 Mini's dimensions
         ensure!(
-            cfg.n_embd == 2304 && cfg.n_ff_exp == 1152 && cfg.n_expert_used <= 8 && cfg.n_expert <= 128 && cfg.head_dim == 128
+            cfg.n_embd == 2304 && cfg.n_ff_exp == 1152 && cfg.n_expert_used == 8 && cfg.n_expert <= 128 && cfg.head_dim == 128
                 && cfg.n_head == 24 && cfg.n_head_kv == 8 && cfg.n_rel == 16,
             "unsupported model dimensions"
         );
@@ -156,11 +168,14 @@ impl Engine {
             f2: f(d)?,
             fnorm: f(d)?,
             fq: Q8Buf::new(&gpu, d)?,
-            hq: Q8Buf::new(&gpu, k * cfg.n_ff_exp)?,
+            hq: Q8Buf { q: gpu.alloc(k * cfg.n_ff_exp)?, d: gpu.alloc(k * cfg.n_ff_exp / 16 * F32)? }, // 16-value groups
             sel: f(k)?,
             wts: f(k)?,
             rlog: f(cfg.n_expert)?,
             counter: f(1)?,
+            bar: f(2)?,
+            attn_part: f(cfg.n_head_kv * ATTN_SPLITS_MAX * 3 * (2 + cfg.head_dim))?,
+            attn_cnt: f(cfg.n_head_kv)?,
             part: f(k * d)?,
             ffn_out: f(d)?,
             xp: f(d)?,
@@ -173,7 +188,26 @@ impl Engine {
         };
         gpu.sync()?;
         let use_graph = std::env::var_os("INKLING_NO_GRAPH").is_none();
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph })
+        let moe_blocks = if std::env::var("INKLING_MOE").as_deref() == Ok("7") {
+            0
+        } else {
+            // as many blocks as fit, rounded down so the work divides evenly: each block (8 warps) takes whole
+            // shares of the 8*F/2 gate_up tasks and D down tasks when 8 * blocks divides gcd(4F, D)
+            let fit = gpu.max_blocks_per_sm("ink_moe8", 256)? * gpu.info.sm_count as u32;
+            let even = |b: u32| (4 * cfg.n_ff_exp as u32) % (8 * b) == 0 && (cfg.n_embd as u32) % (8 * b) == 0;
+            let override_ = std::env::var("INKLING_MOE_BLOCKS").ok().and_then(|v| v.parse().ok());
+            override_.unwrap_or_else(|| (fit / 2..=fit).rev().find(|&b| even(b)).unwrap_or(fit))
+        };
+        ensure!(std::env::var("INKLING_MOE").as_deref() == Ok("7") || moe_blocks > 0, "persistent MoE kernel does not fit on this GPU");
+        let attn_splits = if std::env::var("INKLING_ATTN").as_deref() == Ok("old") {
+            0
+        } else if n_ctx <= 32768 {
+            32
+        } else {
+            ATTN_SPLITS_MAX as u32
+        };
+        let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -184,6 +218,15 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Persistent MoE kernel timeline of `slot`: per block [start, staged, A done, barrier, h staged, end] (ns).
+    pub fn moe_timeline(&self, slot: usize) -> Result<Vec<[u64; 6]>> {
+        let b = self.moe_tl.as_ref().context("INKLING_MOE_TL not set")?;
+        let nb = self.moe_blocks as usize;
+        let raw = self.gpu.read_f32(b.at(slot * nb * 64), nb * 16)?;
+        let words: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
+        Ok((0..nb).map(|i| std::array::from_fn(|k| words[i * 16 + 2 * k] as u64 | (words[i * 16 + 2 * k + 1] as u64) << 32)).collect())
     }
 
     /// Read a scratch buffer by name (debugging / validation).
@@ -216,7 +259,8 @@ impl Engine {
         ensure!(states.len() <= 6 && nq <= 4, "mix: too many states/queries");
         let mut m = MixArgs { q, out, outn, nw, n: states.len() as i32, nq: nq as i32, d: self.cfg.n_embd as i32, eps: self.cfg.rms_eps, ..Default::default() };
         m.st[..states.len()].copy_from_slice(states);
-        self.gpu.launch("ink_mix5", (1, 1), 768, &[Arg::MixQ(MixArgsQ { m, xq: xq.0, xd: xq.1 })])
+        let k = match nq { 1 => "ink_mix6_1", 3 => "ink_mix6_3", 4 => "ink_mix6_4", _ => anyhow::bail!("mix: nq = {nq} unsupported") };
+        self.gpu.launch(k, (1, 1), 768, &[Arg::MixQ(MixArgsQ { m, xq: xq.0, xd: xq.1 })])
     }
 
     /// RMS-normalize up to 4 vectors (x_j * w_j) into y_j and their q8_1 copies.
@@ -229,7 +273,7 @@ impl Engine {
             a.xq[j] = q;
             a.xd[j] = d;
         }
-        self.gpu.launch("ink_rmsnorm_q", (items.len() as u32, 1), 256, &[Arg::NormQ(a), Arg::I32(self.cfg.n_embd as i32), Arg::F32(self.cfg.rms_eps)])
+        self.gpu.launch("ink_rmsnorm_q2", (items.len() as u32, 1), 768, &[Arg::NormQ(a), Arg::I32(self.cfg.n_embd as i32), Arg::F32(self.cfg.rms_eps)])
     }
 
     /// Q8 matvecs on q8_1 activations: segments (weights, (xq, xd), y, rows), all with K inputs.
@@ -282,8 +326,12 @@ impl Engine {
         }
         let (d, n) = (self.cfg.n_embd as i32, ctrls.len() as u32);
         // Ctrl4 and Ctrl4H share one layout (pointer arrays); the kernel picks the weight type
-        let (kd, ku) = if lp.f16 { ("ink_ctrl_down_h", "ink_ctrl_up_h") } else { ("ink_ctrl_down", "ink_ctrl_up") };
-        self.gpu.launch(kd, ((r / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])?;
+        if lp.f16 {
+            self.gpu.launch("ink_ctrl_down2", (r as u32, n), 192, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])?;
+        } else {
+            self.gpu.launch("ink_ctrl_down", ((r / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])?;
+        }
+        let ku = if lp.f16 { "ink_ctrl_up_h" } else { "ink_ctrl_up" };
         self.gpu.launch(ku, ((self.cfg.n_embd / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])
     }
 
@@ -395,11 +443,20 @@ impl Engine {
             ])?;
             let window = if lw.is_swa { cfg.n_swa as i32 } else { 0 };
             let (oq, od) = a.attq.at(0, qd);
-            self.gpu.launch("ink_attn_decode2", (cfg.n_head as u32, 1), 128, &[
+if self.attn_splits > 0 {
+                self.gpu.launch("ink_attn_split", (cfg.n_head_kv as u32, self.attn_splits), 128, &[
+                    Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
+                    Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
+                    Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
+                    Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr),
+                ])?;
+            } else {
+                            self.gpu.launch("ink_attn_decode2", (cfg.n_head as u32, 1), 128, &[
                 Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
                 Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                 Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
             ])?;
+            }
             self.mv(&[(lw.wo, (oq, od), a.proj.ptr, d)], qd)?;
 
             // post conv fused with the residual: block boundary starts a new stream (x = attn), else x += attn
@@ -422,20 +479,31 @@ impl Engine {
 
             // MoE: router + top-k, experts on int8 activations, weighted partials summed by the post conv
             let k = cfg.n_expert_used;
-            self.gpu.launch("ink_router3", ((cfg.n_expert / 4) as u32, 1), 256, &[
+            self.gpu.launch("ink_router4", (cfg.n_expert as u32, 1), 192, &[
                 Arg::Ptr(a.fnorm.ptr), Arg::Ptr(lw.router), Arg::Ptr(lw.probs_bias), Arg::Ptr(a.rlog.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
                 Arg::Ptr(a.counter.ptr), Arg::I32(d as i32), Arg::I32(cfg.n_expert as i32), Arg::I32(k as i32), Arg::F32(cfg.expert_weights_scale),
             ])?;
             let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32 };
-            let (hq, hd) = a.hq.at(0, k * cfg.n_ff_exp);
-            self.gpu.launch("ink_moe_gate_up6", ((cfg.n_ff_exp / 32) as u32, k as u32), 256, &[
-                Arg::Exp(ew(lw.gate_up)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(hq), Arg::Ptr(hd),
-                Arg::I32(cfg.n_ff_exp as i32), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
-            ])?;
-            self.gpu.launch("ink_moe_down6", ((d / 32) as u32, k as u32), 256, &[
-                Arg::Exp(ew(lw.down)), Arg::Ptr(hq), Arg::Ptr(hd), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(a.part.ptr), Arg::I32(d as i32),
-            ])?;
-            self.conv_res(a.part.ptr, k, lw.ffn_post_conv, conv_ffn, a.x.ptr, a.ffn_out.ptr, true)?;
+            if self.moe_blocks > 0 {
+                // gate_up + down + expert sum + post conv + residual, one persistent kernel
+                self.gpu.launch("ink_moe8", (self.moe_blocks, 1), 256, &[
+                    Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
+                    Arg::Ptr(a.part.ptr), Arg::Ptr(lw.ffn_post_conv), Arg::Ptr(conv_ffn), Arg::Ptr(a.x.ptr), Arg::Ptr(a.ffn_out.ptr),
+                    Arg::Ptr(a.bar.ptr), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
+                    Arg::Ptr(self.moe_tl.as_ref().map_or(0, |b| b.at(p.slot * self.moe_blocks as usize * 64))),
+                ])?;
+            } else {
+                let (hq, hd) = (a.hq.q.ptr, a.hq.d.ptr);
+                self.gpu.launch("ink_moe_gate_up7", ((cfg.n_ff_exp / 16) as u32, k as u32), 256, &[
+                    Arg::Exp(ew(lw.gate_up)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(hq), Arg::Ptr(hd),
+                    Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
+                ])?;
+                // down + weighted sum over the k experts + post conv + residual
+                self.gpu.launch("ink_moe_down7", ((d / 8) as u32, 1), 256, &[
+                    Arg::Exp(ew(lw.down)), Arg::Ptr(hq), Arg::Ptr(hd), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
+                    Arg::Ptr(lw.ffn_post_conv), Arg::Ptr(conv_ffn), Arg::Ptr(a.x.ptr), Arg::Ptr(a.ffn_out.ptr),
+                ])?;
+            }
 
             if let Some(cb) = capture.as_mut() {
                 cb(p.slot, self);

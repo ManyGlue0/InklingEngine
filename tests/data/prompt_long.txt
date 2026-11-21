@@ -1,0 +1,42 @@
+<|message_user|><|content_text|>I'm writing a small command line tool in Rust that reads a CSV file of temperature readings (timestamp, sensor id, value in Celsius) and prints, for each sensor, the minimum, maximum and average temperature. Some rows are malformed. Can you show me a clean implementation and explain the error handling?<|end_message|><|message_model|><|content_text|>Here is a compact implementation that streams the file line by line, so it works on inputs larger than memory, and keeps one running aggregate per sensor.
+
+```rust
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+
+#[derive(Default)]
+struct Stats { min: f64, max: f64, sum: f64, n: u64 }
+
+impl Stats {
+    fn add(&mut self, v: f64) {
+        if self.n == 0 { self.min = v; self.max = v; }
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        self.sum += v;
+        self.n += 1;
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let path = std::env::args().nth(1).expect("usage: temps <file.csv>");
+    let reader = BufReader::new(File::open(path)?);
+    let mut sensors: BTreeMap<String, Stats> = BTreeMap::new();
+    let mut skipped = 0usize;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line?;
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        match (fields.len(), fields.get(2).and_then(|v| v.parse::<f64>().ok())) {
+            (3, Some(v)) if v.is_finite() => sensors.entry(fields[1].to_string()).or_default().add(v),
+            _ => { skipped += 1; eprintln!("line {}: skipped malformed row", i + 1); }
+        }
+    }
+    for (id, s) in &sensors {
+        println!("{id}: min {:.1} max {:.1} avg {:.2}", s.min, s.max, s.sum / s.n as f64);
+    }
+    if skipped > 0 { eprintln!("{skipped} rows skipped"); }
+    Ok(())
+}
+```
+
+A few notes on the error handling. Input and output errors, such as a missing file or a read failure halfway through, are real failures, so they propagate with the question mark operator and end the program with a non-zero exit code. A malformed row, on the other hand, is expected in messy sensor data, so it is reported on standard error with its line number and then skipped; the summary at the end tells you how many rows were ignored. The parse of the value also rejects NaN and infinity, which would otherwise silently poison the averages. Finally, the BTreeMap keeps the sensors sorted by id, which makes the output stable between runs.<|end_message|><|message_user|><|content_text|>Nice. Would it be faster to parse the whole file in parallel?<|end_message|><|message_model|><|content_text|>

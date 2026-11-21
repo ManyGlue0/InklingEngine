@@ -32,6 +32,18 @@ fn bench(model: &str, n: usize) -> Result<()> {
     let dec = (total - pre).max(1e-9);
     let m = out.len() - 1;
     println!("prompt {} tok: {:.1} tok/s | decode {m} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, m as f64 / dec, dec * 1e3 / m as f64);
+    if eng.moe_tl.is_some() {
+        for slot in [0usize, 10, 30] {
+            let tl = eng.moe_timeline(slot)?;
+            let t0 = tl.iter().map(|r| r[0]).min().unwrap();
+            let rel = |k: usize, f: fn(u64, u64) -> u64| tl.iter().map(|r| r[k] - t0).fold(if f(0, 1) == 0 { u64::MAX } else { 0 }, f) as f64 / 1e3;
+            print!("moe timeline slot {slot} (us, min..max over blocks):");
+            for (k, name) in ["start", "staged", "A done", "barrier", "h staged", "end"].iter().enumerate() {
+                print!(" {name} {:.1}..{:.1} |", rel(k, u64::min), rel(k, u64::max));
+            }
+            println!();
+        }
+    }
     Ok(())
 }
 
@@ -148,7 +160,7 @@ fn validate(model: &str, dump: &str) -> Result<()> {
             let l: Vec<String> = order.iter().map(|&s| format!("{s}:{:.4}", errs[s])).collect();
             println!("t=0 per-slot rel.err: {}", l.join(" "));
         }
-        if t < 3 || t + 1 == t_n {
+        if t < 3 || t + 1 == t_n || kl > 0.02 || !top1 || std::env::var_os("INKLING_KL_ALL").is_some() {
             let first_bad = order.iter().find(|&&s| errs[s] > 0.05);
             println!("t={t:3}  KL={kl:.5}  top1={}  max layer rel.err={:.4}{}", if top1 { "same" } else { "DIFF" },
                 errs.iter().cloned().fold(0.0, f64::max), first_bad.map(|s| format!("  (first >5% at slot {s})")).unwrap_or_default());
@@ -267,5 +279,73 @@ fn smoke() -> Result<()> {
         best = best.min(t.elapsed().as_secs_f64());
     }
     println!("DRAM read bandwidth: {:.0} GB/s (decode roofline)", bytes as f64 / best / 1e9);
+
+    // per-kernel cost of streaming one slab (back-to-back launches over distinct slabs, so nothing hits L2)
+    for mb in [1usize, 4, 12, 24, 48] {
+        let slab = mb << 20;
+        let n = (bytes / slab).min(64);
+        let w = (slab / 16) as u64;
+        let blocks = (slab / 16).div_ceil(512).min(i.sm_count as usize * 8) as u32;
+        let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            gpu.stream.synchronize()?;
+            let t = Instant::now();
+            for k in 0..n {
+                let s = src.slice(k * slab..(k + 1) * slab);
+                let mut l = gpu.stream.launch_builder(&rb);
+                l.arg(&s).arg(&w).arg(&sink);
+                unsafe { l.launch(cfg) }?;
+            }
+            gpu.stream.synchronize()?;
+            best = best.min(t.elapsed().as_secs_f64() / n as f64);
+        }
+        println!("  {mb:>2} MiB slab: {:.1} us/kernel = {:.0} GB/s", best * 1e6, slab as f64 / best / 1e9);
+    }
+    // the expert row-gather pattern over 24 MiB slabs, at several grid sizes
+    let slab = 24usize << 20;
+    let rows = (slab / 1152) as i32;
+    let n = 64;
+    for name in ["ink_pattern_bw8", "ink_pattern_bw4", "ink_pattern_bw2"] {
+        let f = gpu.func(name)?;
+        for bps in [2u32, 4, 6] {
+            let cfg = LaunchConfig { grid_dim: (i.sm_count as u32 * bps, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                gpu.stream.synchronize()?;
+                let t = Instant::now();
+                for k in 0..n {
+                    let s = src.slice(k * slab..(k + 1) * slab);
+                    let mut l = gpu.stream.launch_builder(&f);
+                    l.arg(&s).arg(&rows).arg(&sink);
+                    unsafe { l.launch(cfg) }?;
+                }
+                gpu.stream.synchronize()?;
+                best = best.min(t.elapsed().as_secs_f64() / n as f64);
+            }
+            println!("  {name} {bps} blocks/SM: {:.1} us = {:.0} GB/s", best * 1e6, slab as f64 / best / 1e9);
+        }
+    }
+    let f = gpu.func("ink_pattern_bw8s")?;
+    for mode in [1i32, 2] {
+        // rows sized so qs + scales = one 27 MiB slab (24 MiB of qs + 3 MiB of scales)
+        let rows = (slab / 1152) as i32;
+        let total = rows as usize * 1296;
+        let cfg = LaunchConfig { grid_dim: (i.sm_count as u32 * 4, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            gpu.stream.synchronize()?;
+            let t = Instant::now();
+            for k in 0..n {
+                let s = src.slice(k * total..(k + 1) * total);
+                let mut l = gpu.stream.launch_builder(&f);
+                l.arg(&s).arg(&rows).arg(&sink).arg(&mode);
+                unsafe { l.launch(cfg) }?;
+            }
+            gpu.stream.synchronize()?;
+            best = best.min(t.elapsed().as_secs_f64() / n as f64);
+        }
+        println!("  ink_pattern_bw8s scales {}: {:.1} us = {:.0} GB/s", if mode == 1 { "separate" } else { "after row" }, best * 1e6, total as f64 / best / 1e9);
+    }
     Ok(())
 }

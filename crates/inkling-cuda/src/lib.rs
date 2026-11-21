@@ -246,6 +246,11 @@ impl Gpu {
         Ok(k)
     }
 
+    /// Resident blocks per SM for kernel `name` at `block` threads (sizes persistent grids that spin on barriers).
+    pub fn max_blocks_per_sm(&self, name: &str, block: u32) -> Result<u32> {
+        Ok(self.func(name)?.occupancy_max_active_blocks_per_multiprocessor(block, 0, None)?)
+    }
+
     /// Allocate `bytes` of zeroed device memory.
     pub fn alloc(&self, bytes: usize) -> Result<DevBuf> {
         let slice = self.stream.alloc_zeros::<u8>(bytes.max(1))?;

@@ -67,5 +67,10 @@ pub fn nvfp4_soa(src: &[u8], rows: usize, k: usize) -> Result<Soa> {
             }
         }
     });
+    // the expert kernels decode UE4M3 scales with a normal-number bit trick (no subnormals, no zero, no sign bit)
+    ensure!(
+        sc.iter().all(|&b| b & 0x78 != 0 && b & 0x80 == 0),
+        "nvfp4_soa: subnormal/zero/negative block scales are not supported by the fast expert kernels"
+    );
     Ok(Soa { qs, sc })
 }
