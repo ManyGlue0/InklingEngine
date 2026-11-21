@@ -11,3 +11,4 @@ desktop.ini
 .env
 .env.*
 *.log
+/docs/PLAN.md

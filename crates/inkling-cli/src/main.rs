@@ -130,7 +130,7 @@ fn kvstudy(model: &str) -> Result<()> {
     let mut texts: Vec<(&str, Vec<u32>)> = Vec::new();
     texts.push(("chat 807", tok.encode(&std::fs::read_to_string("tests/data/prompt_long.txt")?, true)?));
     let mut src = String::new();
-    for f in ["docs/MODEL.md", "docs/PLAN.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-cuda/kernels/prefill_attn.cu", "crates/inkling-core/src/config.rs"] {
+    for f in ["docs/MODEL.md", "README.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-cuda/kernels/prefill_attn.cu", "crates/inkling-core/src/config.rs"] {
         src.push_str(&std::fs::read_to_string(f).unwrap_or_default());
         src.push_str("
 
@@ -184,7 +184,7 @@ fn benchctx(model: &str, n: usize) -> Result<()> {
     let (free, total) = inkling_cuda::cudarc::driver::result::mem_get_info()?;
     println!("context {ctx}: VRAM in use {:.2} / {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
     let mut src = String::new();
-    for f in ["docs/MODEL.md", "docs/PLAN.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-engine/src/lib.rs", "crates/inkling-cuda/kernels/decode.cu"] {
+    for f in ["docs/MODEL.md", "README.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-engine/src/lib.rs", "crates/inkling-cuda/kernels/decode.cu"] {
         src.push_str(&std::fs::read_to_string(f).unwrap_or_default());
     }
     let base = tok.encode(&src, false)?;

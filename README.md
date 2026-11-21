@@ -37,8 +37,8 @@ F32 GEMMs.
 
 ### KV cache format
 The KV format was chosen by measurement, not assumed (`inkling kvstudy`). 6-bit K/V on the 8 full-attention passes
-costs only +0.0006 mean KL over 8-bit, while the sliding-window passes keep f16. See [docs/PLAN.md](docs/PLAN.md)
-and [docs/MODEL.md](docs/MODEL.md).
+costs only +0.0006 mean KL over 8-bit, while the sliding-window passes keep f16. The forward pass is specified
+in [docs/MODEL.md](docs/MODEL.md).
 
 ## Requirements
 
@@ -218,5 +218,5 @@ Developer commands:
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Third-party notices (the
+[MIT](LICENSE). Third-party notices (the
 llama.cpp MIT notice, the Inkling 2 chat template used as a test oracle) are in [NOTICE](NOTICE).
