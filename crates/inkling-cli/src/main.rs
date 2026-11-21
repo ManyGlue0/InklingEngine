@@ -34,6 +34,10 @@ fn sampling_from_env() -> inkling_engine::Sampling {
         min_p: f("INKLING_MIN_P", 0.0),
         top_k: f("INKLING_TOP_K", 0.0) as i32,
         seed: std::env::var("INKLING_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(42),
+        repeat_penalty: f("INKLING_REPEAT_PENALTY", 1.0),
+        presence_penalty: f("INKLING_PRESENCE_PENALTY", 0.0),
+        frequency_penalty: f("INKLING_FREQUENCY_PENALTY", 0.0),
+        last_n: f("INKLING_REPEAT_LAST_N", 64.0) as i32,
     }
 }
 
@@ -163,7 +167,7 @@ fn cachetest(model: &str) -> Result<()> {
     let (ca, reused_a) = eng.generate_ex(&c, 24, &g, &mut |_| true)?;
     println!("repeat: reused {reused_a} of {} prompt tokens, identical: {}", c.len(), ca == fc);
     // sampling: two seeds differ, same seed repeats
-    let s1 = inkling_engine::Sampling { temperature: 0.8, top_p: 0.95, min_p: 0.0, top_k: 0, seed: 1 };
+    let s1 = inkling_engine::Sampling { temperature: 0.8, top_p: 0.95, min_p: 0.0, top_k: 0, seed: 1, ..inkling_engine::Sampling::greedy() };
     let s2 = inkling_engine::Sampling { seed: 2, ..s1 };
     let x1 = eng.generate(&a, 24, &s1, |_| true)?;
     let x1b = eng.generate(&a, 24, &s1, |_| true)?;
@@ -188,7 +192,7 @@ fn rendertest(cases: &str) -> Result<()> {
 }
 
 /// OpenAI-compatible server: inkling serve <model> [--host H] [--port P] [--ctx N] [--api-key K] [--temp T]
-/// [--top-p P] [--top-k K] [--min-p P] [--model-id NAME]
+/// [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N] [--model-id NAME]
 fn serve(model: &str, flags: &[String]) -> Result<()> {
     let get = |name: &str| flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).cloned();
     let num = |name: &str| -> Result<Option<f64>> { get(name).map(|v| v.parse::<f64>().map_err(|e| anyhow::anyhow!("{name}: {e}"))).transpose() };
@@ -197,6 +201,8 @@ fn serve(model: &str, flags: &[String]) -> Result<()> {
     if let Some(v) = num("--top-p")? { d.top_p = v as f32; }
     if let Some(v) = num("--top-k")? { d.top_k = v as i32; }
     if let Some(v) = num("--min-p")? { d.min_p = v as f32; }
+    if let Some(v) = num("--repeat-penalty")? { d.repeat_penalty = v as f32; }
+    if let Some(v) = num("--repeat-last-n")? { d.repeat_last_n = v as i32; }
     let model_id = get("--model-id").unwrap_or_else(|| {
         std::path::Path::new(model).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "inkling-2-mini".into())
     });

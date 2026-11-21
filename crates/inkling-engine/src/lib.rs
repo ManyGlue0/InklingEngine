@@ -52,13 +52,23 @@ pub struct Sampling {
     pub min_p: f32,
     pub top_k: i32,
     pub seed: u64,
+    /// llama.cpp-style repetition penalty (1 = off) over the last `last_n` context tokens
+    pub repeat_penalty: f32,
+    /// OpenAI-style penalties over the same window
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    /// penalty window (clamped to 1024; 0 = off)
+    pub last_n: i32,
 }
 
 impl Sampling {
     pub fn greedy() -> Self {
-        Self { temperature: 0.0, top_p: 1.0, min_p: 0.0, top_k: 0, seed: 0 }
+        Self { temperature: 0.0, top_p: 1.0, min_p: 0.0, top_k: 0, seed: 0, repeat_penalty: 1.0, presence_penalty: 0.0, frequency_penalty: 0.0, last_n: 0 }
     }
 }
+
+/// Penalty ring size (mirrors smp::RING in sample.cu).
+const PEN_RING: usize = 1024;
 
 /// What the device state currently holds, for prompt caching across `generate` calls.
 #[derive(Default)]
@@ -111,6 +121,7 @@ struct Act {
     prompt: DevBuf, // i32 [n_ctx] prompt tokens (device-side prefill loop)
     hist: HostMapped, // i32 [n_ctx] generated tokens, written by the GPU into host memory
     sparams: DevBuf,  // Sampling
+    pen_ring: DevBuf, // i32 [PEN_RING] context tokens by position, for the sampler's penalties
     snap: DevBuf,     // conv states of every slot (prompt-cache snapshot)
 }
 
@@ -232,6 +243,7 @@ impl Engine {
             prompt: f(n_ctx)?,
             hist: gpu.alloc_host_mapped(n_ctx * 4)?,
             sparams: gpu.alloc(std::mem::size_of::<Sampling>())?,
+            pen_ring: gpu.alloc(PEN_RING * 4)?,
             snap: gpu.alloc(cfg.n_slots() * 3 * (2 * kvw + 2 * d) * F32)?,
         };
         gpu.sync()?;
@@ -641,7 +653,7 @@ if self.attn_splits > 0 {
             Tail::Prefill => self.gpu.launch("ink_advance_prompt", (1, 1), 32, &[Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.prompt.ptr)]),
             Tail::Greedy => self.gpu.launch("ink_sample", (1, 1), 1024, &[
                 Arg::Ptr(self.act.logits.ptr), Arg::I32(self.cfg.n_vocab_unpadded as i32), Arg::Ptr(self.act.sparams.ptr),
-                Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.hist.dev),
+                Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.hist.dev), Arg::Ptr(self.act.pen_ring.ptr),
             ]),
         }
     }
@@ -729,6 +741,13 @@ if self.attn_splits > 0 {
         self.gpu.write(self.act.sparams.ptr, inkling_cuda::as_bytes(std::slice::from_ref(sampling)))?;
         let n = prompt.len();
         let p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+        if sampling.last_n > 0 {
+            let mut ring = vec![-1i32; PEN_RING];
+            for i in n.saturating_sub(PEN_RING)..n {
+                ring[i % PEN_RING] = p[i];
+            }
+            self.gpu.write(self.act.pen_ring.ptr, inkling_cuda::as_bytes(&ring))?;
+        }
         let reused = if std::env::var_os("INKLING_NO_PREFILL").is_some() {
             self.reset()?;
             self.gpu.write(self.act.prompt.ptr, inkling_cuda::as_bytes(&p))?;

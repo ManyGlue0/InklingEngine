@@ -6,15 +6,21 @@
 // deterministic), truncated by top_k and top_p, and one is drawn with a counter-based RNG (seed, step).
 // Writes the token as the next input (step[0]), appends it to hist and advances the position, like
 // ink_argmax_next.
+//
+// Penalties (llama.cpp semantics) over the last `last_n` context tokens, kept in a 1024-entry ring indexed by
+// position (the host writes the prompt tail, the sampler appends): each distinct token t seen c times gets
+// l = l > 0 ? l / repeat : l * repeat, then l -= c * frequency + presence. Applied to the logits in place.
 
 struct SampleParams {
     float temperature, top_p, min_p;
     int top_k;
     unsigned long long seed;
+    float repeat_penalty, presence_penalty, frequency_penalty;
+    int last_n;
 };
 
 namespace smp {
-constexpr int CAP = 1024, NT = 1024;
+constexpr int CAP = 1024, NT = 1024, RING = 1024;
 
 __device__ __forceinline__ unsigned long long splitmix(unsigned long long x) {
     x += 0x9E3779B97F4A7C15ull;
@@ -24,8 +30,8 @@ __device__ __forceinline__ unsigned long long splitmix(unsigned long long x) {
 }
 }  // namespace smp
 
-extern "C" __global__ void __launch_bounds__(1024) ink_sample(const float* __restrict__ x, int n, const SampleParams* __restrict__ P,
-                                                              int* __restrict__ step, int* __restrict__ hist) {
+extern "C" __global__ void __launch_bounds__(1024) ink_sample(float* __restrict__ x, int n, const SampleParams* __restrict__ P,
+                                                              int* __restrict__ step, int* __restrict__ hist, int* __restrict__ ring) {
     using namespace smp;
     __shared__ float cl[CAP];
     __shared__ int ci[CAP];
@@ -36,6 +42,31 @@ extern "C" __global__ void __launch_bounds__(1024) ink_sample(const float* __res
     __shared__ int s_tok;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SampleParams p = *P;
+
+    if (p.last_n > 0 && (p.repeat_penalty != 1.0f || p.presence_penalty != 0.0f || p.frequency_penalty != 0.0f)) {
+        int* wt = ci;  // reuse the candidate index buffer
+        const int pos = step[1];
+        const int nw = min(min(p.last_n, RING), pos + 1);
+        if (tid < nw) wt[tid] = ring[(pos - tid) & (RING - 1)];
+        __syncthreads();
+        if (tid < nw) {
+            const int t = wt[tid];
+            bool first = true;
+            int c = 0;
+            for (int k = 0; k < nw; ++k) {
+                if (wt[k] == t) {
+                    ++c;
+                    first &= k >= tid;
+                }
+            }
+            if (first && t >= 0 && t < n) {
+                float l = x[t];
+                l = l > 0.0f ? l / p.repeat_penalty : l * p.repeat_penalty;
+                x[t] = l - (float)c * p.frequency_penalty - p.presence_penalty;
+            }
+        }
+        __syncthreads();
+    }
 
     // max logit (and its index for the greedy path)
     float v = -INFINITY;
@@ -178,6 +209,7 @@ extern "C" __global__ void __launch_bounds__(1024) ink_sample(const float* __res
         const int t = s_tok;
         hist[step[2]] = t;
         step[2] += 1;
+        ring[(step[1] + 1) & (smp::RING - 1)] = t;
         step[0] = t;
         step[1] += 1;
     }
