@@ -1,0 +1,16 @@
+[package]
+name = "inkling-server"
+description = "OpenAI-compatible HTTP server for InklingEngine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8.9"
+futures-util = "0.3.34"
+inkling-core = { path = "../inkling-core" }
+inkling-engine = { path = "../inkling-engine" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+tokio-stream = "0.1.19"

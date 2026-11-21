@@ -132,11 +132,17 @@ impl PrefillBufs {
 
 impl Engine {
     /// Process `tokens` at positions `pos0..`, writing KV cache and conv states (no logits). Chunked.
-    pub fn prefill(&mut self, tokens: &[u32], pos0: usize) -> Result<()> {
+    pub(crate) fn prefill(&mut self, tokens: &[u32], pos0: usize) -> Result<()> {
         for (i, ch) in tokens.chunks(PREFILL_CHUNK).enumerate() {
             self.prefill_chunk(ch, pos0 + i * PREFILL_CHUNK, None)?;
         }
         Ok(())
+    }
+
+    /// Fresh sequence: prefill `tokens` from position 0 (benchmarks).
+    pub fn prefill_fresh(&mut self, tokens: &[u32]) -> Result<()> {
+        self.reset()?;
+        self.prefill(tokens, 0)
     }
 
     /// Prefill a fresh sequence and return the (soft-capped) logits of every position, row-major [n][vocab].

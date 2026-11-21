@@ -43,6 +43,32 @@ impl Q8Buf {
     }
 }
 
+/// Token sampling parameters (mirrors `SampleParams` in sample.cu). temperature <= 0 or top_k == 1: greedy.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub top_k: i32,
+    pub seed: u64,
+}
+
+impl Sampling {
+    pub fn greedy() -> Self {
+        Self { temperature: 0.0, top_p: 1.0, min_p: 0.0, top_k: 0, seed: 0 }
+    }
+}
+
+/// What the device state currently holds, for prompt caching across `generate` calls.
+#[derive(Default)]
+struct PromptCache {
+    /// tokens whose KV / conv state is on the device, in order (state is exactly "after these tokens")
+    tokens: Vec<u32>,
+    /// conv-state snapshot taken right after prefilling `snap_tokens` (the previous prompt minus its last token)
+    snap_tokens: Option<Vec<u32>>,
+}
+
 /// Upper bound of the decode attention splits (sizes the partials buffer).
 const ATTN_SPLITS_MAX: usize = 64;
 
@@ -84,6 +110,8 @@ struct Act {
     step: DevBuf,   // i32 [token, pos, n_out, pad]
     prompt: DevBuf, // i32 [n_ctx] prompt tokens (device-side prefill loop)
     hist: HostMapped, // i32 [n_ctx] generated tokens, written by the GPU into host memory
+    sparams: DevBuf,  // Sampling
+    snap: DevBuf,     // conv states of every slot (prompt-cache snapshot)
 }
 
 /// Which work follows the forward pass in a captured graph.
@@ -117,6 +145,7 @@ pub struct Engine {
     pub moe_tl: Option<DevBuf>,
     /// batched prompt-processing buffers
     pre: Option<prefill::PrefillBufs>,
+    cache: PromptCache,
 }
 
 /// Optional per-pass hook, called after each layer pass with (slot, engine); use `Engine::debug_buf` to read state.
@@ -202,6 +231,8 @@ impl Engine {
             step: f(4)?,
             prompt: f(n_ctx)?,
             hist: gpu.alloc_host_mapped(n_ctx * 4)?,
+            sparams: gpu.alloc(std::mem::size_of::<Sampling>())?,
+            snap: gpu.alloc(cfg.n_slots() * 3 * (2 * kvw + 2 * d) * F32)?,
         };
         gpu.sync()?;
         let use_graph = std::env::var_os("INKLING_NO_GRAPH").is_none();
@@ -226,11 +257,12 @@ impl Engine {
         };
         let pre = Some(prefill::PrefillBufs::new(&gpu, &cfg)?);
         let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre })
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default() })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
     pub fn reset(&mut self) -> Result<()> {
+        self.cache = PromptCache::default();
         for s in &self.slots {
             for b in [&s.k, &s.v, &s.conv] {
                 unsafe { inkling_cuda::cudarc::driver::result::memset_d8_async(b.ptr, 0, b.bytes, self.gpu.stream.cu_stream()) }?;
@@ -607,8 +639,9 @@ if self.attn_splits > 0 {
         match tail {
             Tail::None => Ok(()),
             Tail::Prefill => self.gpu.launch("ink_advance_prompt", (1, 1), 32, &[Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.prompt.ptr)]),
-            Tail::Greedy => self.gpu.launch("ink_argmax_next", (1, 1), 1024, &[
-                Arg::Ptr(self.act.logits.ptr), Arg::I32(self.cfg.n_vocab_unpadded as i32), Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.hist.dev),
+            Tail::Greedy => self.gpu.launch("ink_sample", (1, 1), 1024, &[
+                Arg::Ptr(self.act.logits.ptr), Arg::I32(self.cfg.n_vocab_unpadded as i32), Arg::Ptr(self.act.sparams.ptr),
+                Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.hist.dev),
             ]),
         }
     }
@@ -635,28 +668,80 @@ if self.attn_splits > 0 {
         Ok(())
     }
 
-    /// Greedy generation with the autoregressive loop on the device: the prompt is fed by a device-side prefill
-    /// loop, every decode step writes its argmax token as the next input, and the host queues steps ahead,
-    /// reading tokens from mapped memory behind per-step events. `on_token` returns false to stop.
-    /// Starts a new sequence (state is reset).
-    pub fn generate(&mut self, prompt: &[u32], max_new: usize, mut on_token: impl FnMut(u32) -> bool) -> Result<Vec<u32>> {
+    /// Copy every slot's conv state to (`save`) or from the prompt-cache snapshot.
+    fn snapshot(&self, save: bool) -> Result<()> {
+        let per = self.slots[0].conv.bytes;
+        for (i, s) in self.slots.iter().enumerate() {
+            let (src, dst) = if save { (s.conv.ptr, self.act.snap.at(i * per)) } else { (self.act.snap.at(i * per), s.conv.ptr) };
+            unsafe { inkling_cuda::cudarc::driver::result::memcpy_dtod_async(dst, src, per, self.gpu.stream.cu_stream()) }?;
+        }
+        Ok(())
+    }
+
+    /// Positions that may be processed after a snapshot before the sliding-window rings overwrite entries the
+    /// snapshot point still needs.
+    fn snap_margin(&self) -> usize {
+        self.slots.iter().filter(|s| s.kv_cap < self.n_ctx && s.kv_cap > self.cfg.n_swa).map(|s| s.kv_cap - self.cfg.n_swa).min().unwrap_or(usize::MAX)
+    }
+
+    /// Bring the device state to "after prompt[..n-1]", reusing what the previous call left behind when the new
+    /// prompt extends it (prompt caching). Returns how many prompt tokens were reused.
+    fn prepare_prompt(&mut self, prompt: &[u32]) -> Result<usize> {
+        let n = prompt.len();
+        let head = &prompt[..n - 1];
+        let c = &self.cache;
+        let start = if !c.tokens.is_empty() && c.tokens.len() <= head.len() && head.starts_with(&c.tokens) {
+            c.tokens.len() // the state is exactly after a prefix of the new prompt
+        } else if let Some(st) = c.snap_tokens.as_ref().filter(|st| {
+            !st.is_empty() && st.len() <= head.len() && head.starts_with(st) && c.tokens.len() - st.len() <= self.snap_margin()
+        }) {
+            let k = st.len();
+            self.snapshot(false)?; // conv states back to the snapshot; KV beyond position k is simply overwritten
+            k
+        } else {
+            self.reset()?;
+            0
+        };
+        if std::env::var_os("INKLING_NO_PREFILL").is_some() {
+            ensure!(start == 0, "INKLING_NO_PREFILL with a cached prompt");
+            return Ok(0);
+        }
+        self.prefill(&head[start..], start)?;
+        self.snapshot(true)?;
+        self.cache = PromptCache { tokens: head.to_vec(), snap_tokens: Some(head.to_vec()) };
+        Ok(start)
+    }
+
+    /// Generation with the autoregressive loop on the device: the prompt is prefilled in batches (reusing the
+    /// state left by the previous call when the new prompt extends it), every decode step samples its token on
+    /// the device as the next input, and the host queues steps ahead, reading tokens from mapped memory behind
+    /// per-step events. `on_token` returns false to stop. Returns the sampled tokens.
+    pub fn generate(&mut self, prompt: &[u32], max_new: usize, sampling: &Sampling, mut on_token: impl FnMut(u32) -> bool) -> Result<Vec<u32>> {
+        self.generate_ex(prompt, max_new, sampling, &mut on_token).map(|(out, _)| out)
+    }
+
+    /// As `generate`, also returning how many prompt tokens came from the cache.
+    pub fn generate_ex(&mut self, prompt: &[u32], max_new: usize, sampling: &Sampling, on_token: &mut dyn FnMut(u32) -> bool) -> Result<(Vec<u32>, usize)> {
         ensure!(!prompt.is_empty(), "empty prompt");
         ensure!(prompt.len() + max_new <= self.n_ctx, "prompt + generation exceed the context ({})", self.n_ctx);
         ensure!(self.use_graph, "generate needs CUDA graphs");
-        self.reset()?;
-        let p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-        self.gpu.write(self.act.prompt.ptr, inkling_cuda::as_bytes(&p))?;
+        ensure!(max_new > 0, "max_new must be positive");
+        self.gpu.write(self.act.sparams.ptr, inkling_cuda::as_bytes(std::slice::from_ref(sampling)))?;
         let n = prompt.len();
-        if n > 1 && std::env::var_os("INKLING_NO_PREFILL").is_none() {
-            // batched prompt processing for all but the last token; the last one runs as the first decode step
-            self.prefill(&prompt[..n - 1], 0)?;
-            self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[n - 1], (n - 1) as i32, 0, 0]))?;
-        } else {
+        let p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+        let reused = if std::env::var_os("INKLING_NO_PREFILL").is_some() {
+            self.reset()?;
+            self.gpu.write(self.act.prompt.ptr, inkling_cuda::as_bytes(&p))?;
             self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[0], 0, 0, 0]))?;
             for _ in 0..n - 1 {
                 self.launch_graph(Tail::Prefill)?;
             }
-        }
+            0
+        } else {
+            self.prepare_prompt(prompt)?
+        };
+        // the last prompt token runs as the first decode step
+        self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[n - 1], (n - 1) as i32, 0, 0]))?;
         const AHEAD: usize = 3;
         let mut events = Vec::with_capacity(max_new);
         let mut out = Vec::with_capacity(max_new);
@@ -675,7 +760,11 @@ if self.attn_splits > 0 {
             }
         }
         self.gpu.sync()?;
-        Ok(out)
+        // the device fed the last prompt token and every sampled token but the last launched one
+        let mut fed = prompt.to_vec();
+        fed.extend((0..launched - 1).map(|i| self.act.hist.read_i32(i) as u32));
+        self.cache.tokens = fed;
+        Ok((out, reused))
     }
 
     /// Run one token and return the greedy next token (argmax on the GPU, 4-byte readback).
@@ -689,6 +778,7 @@ if self.attn_splits > 0 {
 
     /// Run one token at position `pos`; returns the logits over the unpadded vocabulary.
     pub fn step(&mut self, token: u32, pos: usize, capture: Option<Capture>) -> Result<Vec<f32>> {
+        self.cache = PromptCache::default();
         self.run(token, pos, capture)?;
         self.gpu.read_f32(self.act.logits.ptr, self.cfg.n_vocab_unpadded)
     }

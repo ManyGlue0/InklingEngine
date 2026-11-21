@@ -15,10 +15,25 @@ fn main() -> Result<()> {
         Some("gemmtest") if args.len() > 1 => gemmtest(&args[1]),
         Some("kvstudy") if args.len() > 1 => kvstudy(&args[1]),
         Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
+        Some("cachetest") if args.len() > 1 => cachetest(&args[1]),
+        Some("rendertest") if args.len() > 1 => rendertest(&args[1]),
+        Some("serve") if args.len() > 1 => serve(&args[1], &args[2..]),
         Some("benchpp") if args.len() > 1 => benchpp(&args[1], args.get(2).and_then(|s| s.parse().ok())),
         Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
         _ => bail!("usage: inkling smoke | inkling inspect <model.gguf> | inkling tokenize <model.gguf> <file> [--special]"),
+    }
+}
+
+/// Sampling from INKLING_TEMP / INKLING_TOP_P / INKLING_TOP_K / INKLING_MIN_P / INKLING_SEED (greedy by default).
+fn sampling_from_env() -> inkling_engine::Sampling {
+    let f = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    inkling_engine::Sampling {
+        temperature: f("INKLING_TEMP", 0.0),
+        top_p: f("INKLING_TOP_P", 1.0),
+        min_p: f("INKLING_MIN_P", 0.0),
+        top_k: f("INKLING_TOP_K", 0.0) as i32,
+        seed: std::env::var("INKLING_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(42),
     }
 }
 
@@ -103,7 +118,7 @@ fn benchctx(model: &str, n: usize) -> Result<()> {
     let ids: Vec<u32> = base.iter().cycle().take(n).copied().collect();
     let t0 = Instant::now();
     let mut first = None;
-    let out = eng.generate(&ids, 65, |_| {
+    let out = eng.generate(&ids, 65, &inkling_engine::Sampling::greedy(), |_| {
         if first.is_none() {
             first = Some(t0.elapsed().as_secs_f64());
         }
@@ -116,6 +131,86 @@ fn benchctx(model: &str, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Prompt caching must not change results: cached continuations vs fresh runs (greedy), plus sampling.
+fn cachetest(model: &str) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 8192)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let g = inkling_engine::Sampling::greedy();
+    let a = tok.encode("<|message_user|><|content_text|>Name three rivers in Europe.<|end_message|><|message_model|><|content_text|>", true)?;
+    let fresh = |eng: &mut inkling_engine::Engine, p: &[u32]| -> Result<Vec<u32>> {
+        eng.reset()?;
+        eng.generate(p, 24, &g, |_| true)
+    };
+    let out_a = fresh(&mut eng, &a)?;
+    // (1) extension of prompt + generated tokens: state reused directly
+    let mut b = a.clone();
+    b.extend_from_slice(&out_a);
+    b.extend(tok.encode(" Also, ", false)?);
+    let fb = fresh(&mut eng, &b)?;
+    eng.reset()?;
+    eng.generate(&a, 24, &g, |_| true)?;
+    let (cb, reused_b) = eng.generate_ex(&b, 24, &g, &mut |_| true)?;
+    println!("extension: reused {reused_b} of {} prompt tokens, identical to fresh: {}", b.len(), cb == fb);
+    // (2) different continuation of the same prompt: conv snapshot restored
+    let mut c = a.clone();
+    c.extend(tok.encode(" The Danube, the Rhine and", false)?);
+    let fc = fresh(&mut eng, &c)?;
+    eng.reset()?;
+    eng.generate(&a, 24, &g, |_| true)?;
+    let (cc, reused_c) = eng.generate_ex(&c, 24, &g, &mut |_| true)?;
+    println!("snapshot: reused {reused_c} of {} prompt tokens, identical to fresh: {}", c.len(), cc == fc);
+    // (3) same prompt again (regenerate)
+    let (ca, reused_a) = eng.generate_ex(&c, 24, &g, &mut |_| true)?;
+    println!("repeat: reused {reused_a} of {} prompt tokens, identical: {}", c.len(), ca == fc);
+    // sampling: two seeds differ, same seed repeats
+    let s1 = inkling_engine::Sampling { temperature: 0.8, top_p: 0.95, min_p: 0.0, top_k: 0, seed: 1 };
+    let s2 = inkling_engine::Sampling { seed: 2, ..s1 };
+    let x1 = eng.generate(&a, 24, &s1, |_| true)?;
+    let x1b = eng.generate(&a, 24, &s1, |_| true)?;
+    let x2 = eng.generate(&a, 24, &s2, |_| true)?;
+    println!("sampling: seed 1 repeatable: {}, seed 2 differs: {}", x1 == x1b, x1 != x2);
+    println!("  greedy: {}", tok.decode(&out_a, false).replace('\n', " "));
+    println!("  seed 1: {}", tok.decode(&x1, false).replace('\n', " "));
+    println!("  seed 2: {}", tok.decode(&x2, false).replace('\n', " "));
+    Ok(())
+}
+
+/// Render chat test cases with the native template (one JSON string per line; compare with tools/chat_oracle.py).
+fn rendertest(cases: &str) -> Result<()> {
+    let v: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(cases)?)?;
+    for c in v {
+        let msgs = c["messages"].as_array().cloned().unwrap_or_default();
+        let tools = c.get("tools").and_then(|t| t.as_array()).cloned();
+        let r = inkling_core::chat::render(&msgs, tools.as_deref(), c.get("reasoning_effort"))?;
+        println!("{}", serde_json::to_string(&r)?);
+    }
+    Ok(())
+}
+
+/// OpenAI-compatible server: inkling serve <model> [--host H] [--port P] [--ctx N] [--api-key K] [--temp T]
+/// [--top-p P] [--top-k K] [--min-p P] [--model-id NAME]
+fn serve(model: &str, flags: &[String]) -> Result<()> {
+    let get = |name: &str| flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).cloned();
+    let num = |name: &str| -> Result<Option<f64>> { get(name).map(|v| v.parse::<f64>().map_err(|e| anyhow::anyhow!("{name}: {e}"))).transpose() };
+    let mut d = inkling_server::Defaults::default();
+    if let Some(v) = num("--temp")? { d.temperature = v as f32; }
+    if let Some(v) = num("--top-p")? { d.top_p = v as f32; }
+    if let Some(v) = num("--top-k")? { d.top_k = v as i32; }
+    if let Some(v) = num("--min-p")? { d.min_p = v as f32; }
+    let model_id = get("--model-id").unwrap_or_else(|| {
+        std::path::Path::new(model).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "inkling-2-mini".into())
+    });
+    let opts = inkling_server::Options {
+        host: get("--host").unwrap_or_else(|| "127.0.0.1".into()),
+        port: num("--port")?.map(|v| v as u16).unwrap_or(8080),
+        n_ctx: num("--ctx")?.map(|v| v as usize).unwrap_or(131072),
+        api_key: get("--api-key").or_else(|| std::env::var("INKLING_API_KEY").ok()),
+        model_id,
+        defaults: d,
+    };
+    inkling_server::serve(model, opts)
+}
+
 /// Prompt-processing throughput of the batched prefill at several prompt lengths.
 fn benchpp(model: &str, only: Option<usize>) -> Result<()> {
     let mut eng = inkling_engine::Engine::load(model, 16384)?;
@@ -124,14 +219,12 @@ fn benchpp(model: &str, only: Option<usize>) -> Result<()> {
     let base = tok.encode(&text, true)?;
     for n in only.map_or(vec![128usize, 512, 2048, 8192], |n| vec![n]) {
         let ids: Vec<u32> = base.iter().cycle().take(n).copied().collect();
-        eng.reset()?;
-        eng.prefill(&ids, 0)?; // warm-up
+        eng.prefill_fresh(&ids)?; // warm-up
         eng.gpu.sync()?;
         let reps = (4096 / n).max(1);
         let t0 = Instant::now();
         for _ in 0..reps {
-            eng.reset()?;
-            eng.prefill(&ids, 0)?;
+            eng.prefill_fresh(&ids)?;
         }
         eng.gpu.sync()?;
         let s = t0.elapsed().as_secs_f64() / reps as f64;
@@ -145,12 +238,12 @@ fn bench(model: &str, n: usize) -> Result<()> {
     let mut eng = inkling_engine::Engine::load(model, 4096)?;
     let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
     let ids = tok.encode("<|message_user|><|content_text|>Write a long story about a lighthouse keeper.<|end_message|><|message_model|><|content_text|>", true)?;
-    eng.generate(&ids, 4, |_| true)?; // warm-up: capture the graphs
+    eng.generate(&ids, 4, &inkling_engine::Sampling::greedy(), |_| true)?; // warm-up: capture the graphs
     let t0 = Instant::now();
-    eng.generate(&ids, 1, |_| true)?;
+    eng.generate(&ids, 1, &inkling_engine::Sampling::greedy(), |_| true)?;
     let pre = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
-    let out = eng.generate(&ids, n, |_| true)?;
+    let out = eng.generate(&ids, n, &inkling_engine::Sampling::greedy(), |_| true)?;
     let total = t1.elapsed().as_secs_f64();
     let dec = (total - pre).max(1e-9);
     let m = out.len() - 1;
@@ -181,7 +274,7 @@ fn generate(model: &str, prompt: &str, n_gen: usize) -> Result<()> {
     let t0 = Instant::now();
     let mut first: Option<f64> = None;
     let eos = tok.eos;
-    let out = eng.generate(&ids, n_gen, |t| {
+    let out = eng.generate(&ids, n_gen, &sampling_from_env(), |t| {
         if first.is_none() {
             first = Some(t0.elapsed().as_secs_f64());
         }

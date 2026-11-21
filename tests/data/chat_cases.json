@@ -1,0 +1,27 @@
+[
+  {"messages": [{"role": "user", "content": "Hi"}]},
+  {"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hello there"}], "reasoning_effort": "low"},
+  {"messages": [{"role": "system", "content": "Only a system prompt."}], "reasoning_effort": 0.5},
+  {"messages": [
+    {"role": "user", "content": "What is 2+2?"},
+    {"role": "assistant", "content": "4", "reasoning_content": "Simple arithmetic: 2+2 = 4."},
+    {"role": "user", "content": "And times 3? Ünïcødé ✓ 日本語"}], "reasoning_effort": "none"},
+  {"messages": [
+    {"role": "system", "content": "You can call tools."},
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": "", "reasoning_content": "Need two calls.", "tool_calls": [
+      {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\", \"units\": {\"temp\": \"C\", \"a\": [1, 2.5, true, null]}}"}},
+      {"id": "call_2", "type": "function", "function": {"name": "get_weather", "arguments": {"units": {"temp": "C"}, "city": "Rome"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 18}"},
+    {"role": "tool", "name": "get_weather", "content": "{\"temp\": 22}"},
+    {"role": "assistant", "content": "Paris 18C, Rome 22C."},
+    {"role": "user", "content": "Thanks!"}],
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}, "units": {"type": "object"}}, "required": ["city"]}}},
+    {"type": "function", "function": {"name": "no_args"}}],
+   "reasoning_effort": "high"},
+  {"messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Describe this:"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}, "plain string part"]},
+    {"role": "assistant", "name": "helper", "content": "A tiny image."}]},
+  {"messages": [{"role": "user", "content": "Quotes \" and \\ backslash\nnewline\ttab"}], "reasoning_effort": "max"}
+]

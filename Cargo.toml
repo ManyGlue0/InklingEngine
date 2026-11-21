@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/inkling-core", "crates/inkling-cuda", "crates/inkling-engine", "crates/inkling-cli"]
+members = ["crates/inkling-core", "crates/inkling-cuda", "crates/inkling-engine", "crates/inkling-cli", "crates/inkling-server"]
 
 [workspace.package]
 version = "0.1.0"
