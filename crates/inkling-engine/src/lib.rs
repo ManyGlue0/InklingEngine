@@ -46,6 +46,7 @@ struct Act {
     rlog: DevBuf,
     h: DevBuf,
     y: DevBuf,
+    part: DevBuf,  // expert partial outputs [k][D]
     ffn_out: DevBuf,
     xp: DevBuf,
     xprev: DevBuf,
@@ -73,6 +74,8 @@ impl Engine {
     pub fn load(model: &str, n_ctx: usize) -> Result<Self> {
         let g = Gguf::open(model)?;
         let cfg = Config::from_gguf(&g)?;
+        // the v3 expert kernels are specialised for Inkling 2 Mini's dimensions
+        ensure!(cfg.n_embd == 2304 && cfg.n_ff_exp == 1152 && cfg.n_expert_used <= 8, "unsupported model dimensions");
         let gpu = Gpu::new(0)?;
         let w = Weights::load(&gpu, &g, &cfg)?;
         let d = cfg.n_embd;
@@ -117,6 +120,7 @@ impl Engine {
             rlog: f(cfg.n_expert)?,
             h: f(cfg.n_expert_used * cfg.n_ff_exp)?,
             y: f(d)?,
+            part: f(cfg.n_expert_used * d)?,
             ffn_out: f(d)?,
             xp: f(d)?,
             xprev: f(d)?,
@@ -125,7 +129,7 @@ impl Engine {
             step: f(2)?,
         };
         gpu.sync()?;
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, use_graph: true })
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, use_graph: std::env::var_os("INKLING_NO_GRAPH").is_none() })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -166,10 +170,10 @@ impl Engine {
     // ---- launch helpers ------------------------------------------------------------------------------------
 
     fn mix(&self, states: &[u64], q: u64, nq: usize, out: u64, outn: u64, nw: [u64; 4]) -> Result<()> {
-        ensure!(states.len() <= 8 && nq <= 4, "mix: too many states/queries");
+        ensure!(states.len() <= 6 && nq <= 4, "mix: too many states/queries");
         let mut m = MixArgs { q, out, outn, nw, n: states.len() as i32, nq: nq as i32, d: self.cfg.n_embd as i32, eps: self.cfg.rms_eps, ..Default::default() };
         m.st[..states.len()].copy_from_slice(states);
-        self.gpu.launch("ink_mix2", (1, 1), 512, &[Arg::Mix(m)])
+        self.gpu.launch("ink_mix3", (1, 1), 512, &[Arg::Mix(m)])
     }
 
     fn rmsnorm(&self, x: u64, w: u64, y: u64) -> Result<()> {
@@ -199,6 +203,15 @@ impl Engine {
     fn conv(&self, x: u64, w: u64, state: u64, dynamic: u64, out: u64, ch: usize) -> Result<()> {
         self.gpu.launch("ink_conv", (ch.div_ceil(256) as u32, 1), 256, &[
             Arg::Ptr(x), Arg::Ptr(w), Arg::Ptr(state), Arg::Ptr(dynamic), Arg::Ptr(out), Arg::I32(ch as i32), Arg::I32(self.cfg.head_dim as i32),
+        ])
+    }
+
+    /// Post conv over the sum of `nparts` inputs (D apart), written to x (accumulate) or replacing x.
+    fn conv_res(&self, xin: u64, nparts: usize, w: u64, state: u64, x: u64, dbg: u64, accumulate: bool) -> Result<()> {
+        let d = self.cfg.n_embd;
+        self.gpu.launch("ink_conv_res", (d.div_ceil(256) as u32, 1), 256, &[
+            Arg::Ptr(xin), Arg::I32(nparts as i32), Arg::I32(d as i32), Arg::Ptr(w), Arg::Ptr(state), Arg::Ptr(x), Arg::Ptr(dbg),
+            Arg::I32(accumulate as i32), Arg::I32(d as i32),
         ])
     }
 
@@ -337,14 +350,11 @@ impl Engine {
             ])?;
             self.ew("ink_gate_sigmoid", &[Arg::Ptr(a.att.ptr), Arg::Ptr(gate_ptr)], qd)?;
             self.mv_q8(&[(lw.wo, a.att.ptr, a.proj.ptr, d)], qd)?;
-            self.conv(a.proj.ptr, lw.attn_post_conv, conv_attn, 0, a.attn_out.ptr, d)?;
-
+            // post conv fused with the residual: block boundary starts a new stream (x = attn), else x += attn
             if let Some(dst) = inp_copy {
                 blocks.push(dst);
-                self.ew("ink_copy", &[Arg::Ptr(a.attn_out.ptr), Arg::Ptr(a.x.ptr)], d)?;
-            } else {
-                self.ew("ink_add", &[Arg::Ptr(a.x.ptr), Arg::Ptr(a.attn_out.ptr), Arg::Ptr(a.x.ptr)], d)?;
             }
+            self.conv_res(a.proj.ptr, 1, lw.attn_post_conv, conv_attn, a.x.ptr, a.attn_out.ptr, inp_copy.is_none())?;
 
             // FFN input
             let mut st = blocks.clone();
@@ -366,16 +376,16 @@ impl Engine {
                 Arg::I32(cfg.n_expert as i32), Arg::I32(cfg.n_expert_used as i32), Arg::F32(cfg.expert_weights_scale),
             ])?;
             let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32 };
-            self.gpu.launch("ink_moe_gate_up2", ((cfg.n_ff_exp / 8) as u32, cfg.n_expert_used as u32), 256, &[
+            let k = cfg.n_expert_used;
+            self.gpu.launch("ink_moe_gate_up5", ((cfg.n_ff_exp / 32) as u32, k as u32), 256, &[
                 Arg::Exp(ew(lw.gate_up)), Arg::Ptr(a.fnorm.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.h.ptr),
-                Arg::I32(d as i32), Arg::I32(cfg.n_ff_exp as i32), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
+                Arg::I32(cfg.n_ff_exp as i32), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
             ])?;
-            self.gpu.launch("ink_moe_down2", ((d / 8) as u32, 1), 256, &[
-                Arg::Exp(ew(lw.down)), Arg::Ptr(a.h.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(a.y.ptr),
-                Arg::I32(cfg.n_ff_exp as i32), Arg::I32(d as i32), Arg::I32(cfg.n_expert_used as i32),
+            self.gpu.launch("ink_moe_down5", ((d / 32) as u32, k as u32), 256, &[
+                Arg::Exp(ew(lw.down)), Arg::Ptr(a.h.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(a.part.ptr), Arg::I32(d as i32),
             ])?;
-            self.conv(a.y.ptr, lw.ffn_post_conv, conv_ffn, 0, a.ffn_out.ptr, d)?;
-            self.ew("ink_add", &[Arg::Ptr(a.x.ptr), Arg::Ptr(a.ffn_out.ptr), Arg::Ptr(a.x.ptr)], d)?;
+            // sum of the k expert partials -> post conv -> x += ffn
+            self.conv_res(a.part.ptr, k, lw.ffn_post_conv, conv_ffn, a.x.ptr, a.ffn_out.ptr, true)?;
 
             if let Some(cb) = capture.as_mut() {
                 cb(p.slot, self);
