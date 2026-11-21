@@ -1,6 +1,9 @@
 //! OpenAI-compatible HTTP server: `/v1/chat/completions` and `/v1/completions` (streaming SSE or not), `/v1/models`,
 //! `/health`. CORS is open (browser UIs); authentication, when configured, is a bearer API key.
 //!
+//! Images (with `--mmproj`) arrive as content parts (`image_url` / `input_image` / `image`) carrying `data:` URLs
+//! or bare base64; each becomes `<|content_image|>` + its embedding rows + `<|end_message|>` in the prompt.
+//!
 //! One GPU worker thread owns the engine and serves requests in arrival order. Prompts are rendered with the
 //! model's chat template (`inkling_core::chat`); generated tokens go through the streaming parser, which splits
 //! reasoning (`reasoning_content`), answer text (`content`) and tool calls (`tool_calls`). Consecutive requests that
@@ -21,7 +24,7 @@ use axum::routing::{get, post};
 use futures_util::StreamExt;
 use inkling_core::chat::{self, Event};
 use inkling_core::{Gguf, Tokenizer};
-use inkling_engine::{Engine, Sampling};
+use inkling_engine::{EMBED_TOKEN_BASE, Engine, Image, ImageEmbed, Sampling};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -38,6 +41,8 @@ pub struct Options {
     pub model_id: String,
     /// sampling defaults for requests that do not set them
     pub defaults: Defaults,
+    /// vision encoder (mmproj GGUF)
+    pub mmproj: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +69,8 @@ struct Job {
     stop: Vec<String>,
     /// raw text completion (no chat parsing)
     raw: bool,
+    /// images: (prompt position of the first embedding row, image)
+    images: Vec<(usize, Arc<Image>)>,
     tx: mpsc::UnboundedSender<Out>,
 }
 
@@ -80,6 +87,9 @@ struct AppState {
     jobs: std::sync::mpsc::Sender<Job>,
     opts: Options,
     n_ctx: usize,
+    /// (patch, merge) of the loaded vision encoder
+    vision: Option<(usize, usize)>,
+    image_pad: u32,
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -98,15 +108,22 @@ fn now() -> u64 {
 pub fn serve(model: &str, opts: Options) -> Result<()> {
     let tok = Arc::new(Tokenizer::from_gguf(&Gguf::open(model)?)?);
     let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<Job>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(usize, Option<(usize, usize)>)>>();
     let model_path = model.to_string();
     let wtok = tok.clone();
     let n_ctx_req = opts.n_ctx;
+    let mmproj = opts.mmproj.clone();
     std::thread::Builder::new().name("inkling-gpu".into()).spawn(move || {
-        let eng = Engine::load(&model_path, n_ctx_req);
+        let eng = Engine::load(&model_path, n_ctx_req).and_then(|mut e| {
+            if let Some(m) = &mmproj {
+                e.load_vision(m)?;
+            }
+            Ok(e)
+        });
         match eng {
             Ok(mut eng) => {
-                let _ = ready_tx.send(Ok(n_ctx_req));
+                let geom = eng.vision().map(|v| (v.patch, v.merge));
+                let _ = ready_tx.send(Ok((n_ctx_req, geom)));
                 worker(&mut eng, &wtok, jobs_rx);
             }
             Err(e) => {
@@ -114,8 +131,9 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
             }
         }
     })?;
-    let n_ctx = ready_rx.recv().context("GPU worker died")??;
-    let state = Arc::new(AppState { tok, jobs: jobs_tx, opts: opts.clone(), n_ctx });
+    let (n_ctx, vision) = ready_rx.recv().context("GPU worker died")??;
+    let image_pad = tok.token_id("<|unused_200054|>").context("image placeholder token missing")?;
+    let state = Arc::new(AppState { tok, jobs: jobs_tx, opts: opts.clone(), n_ctx, vision, image_pad });
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/v1/models", get(models))
@@ -127,7 +145,8 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
     rt.block_on(async move {
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
-        println!("InklingEngine serving {} on http://{addr} (context {n_ctx}) - OpenAI API at /v1", opts.model_id);
+        let vis = if vision.is_some() { ", vision on" } else { "" };
+        println!("InklingEngine serving {} on http://{addr} (context {n_ctx}{vis}) - OpenAI API at /v1", opts.model_id);
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -137,11 +156,37 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
     })
 }
 
+/// Recently encoded images (conversations resend them every turn), bounded by total size.
+#[derive(Default)]
+struct EmbedCache {
+    items: Vec<ImageEmbed>,
+}
+
+impl EmbedCache {
+    const MAX_BYTES: usize = 512 << 20;
+
+    fn get_or_encode(&mut self, eng: &Engine, img: &Image) -> Result<ImageEmbed> {
+        let h = img.hash();
+        if let Some(i) = self.items.iter().position(|e| e.hash == h) {
+            let e = self.items.remove(i);
+            self.items.push(e.clone());
+            return Ok(e);
+        }
+        let e = eng.encode_image(img)?;
+        self.items.push(e.clone());
+        while self.items.iter().map(|e| e.data.len() * 4).sum::<usize>() > Self::MAX_BYTES && self.items.len() > 1 {
+            self.items.remove(0);
+        }
+        Ok(e)
+    }
+}
+
 /// GPU worker: one job at a time.
 fn worker(eng: &mut Engine, tok: &Tokenizer, jobs: std::sync::mpsc::Receiver<Job>) {
+    let mut embeds = EmbedCache::default();
     while let Ok(job) = jobs.recv() {
         let tx = job.tx.clone();
-        if let Err(e) = run_job(eng, tok, job) {
+        if let Err(e) = run_job(eng, tok, &mut embeds, job) {
             let _ = tx.send(Out::Error(format!("{e:#}")));
         }
     }
@@ -186,7 +231,11 @@ impl Decoder {
     }
 }
 
-fn run_job(eng: &mut Engine, tok: &Tokenizer, job: Job) -> Result<()> {
+fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job) -> Result<()> {
+    let mut embeds = Vec::with_capacity(job.images.len());
+    for (pos, img) in &job.images {
+        embeds.push((*pos, embed_cache.get_or_encode(eng, img)?));
+    }
     let mut parser = Decoder::new(tok, job.raw)?;
     let tx = job.tx;
     let stop = job.stop;
@@ -248,7 +297,7 @@ fn run_job(eng: &mut Engine, tok: &Tokenizer, job: Job) -> Result<()> {
             }
             on_token(t)
         };
-        eng.generate_ex(&job.prompt, job.max_new, &job.sampling, &mut cb)?
+        eng.generate_mm(&job.prompt, &embeds, job.max_new, &job.sampling, &mut cb)?
     };
     let _ = tx.send(Out::Started { prompt_tokens, cached });
     if finish.is_none() && !held.is_empty() {
@@ -282,6 +331,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 /// Parsed request pieces.
 struct Req {
     prompt: Vec<u32>,
+    images: Vec<(usize, Arc<Image>)>,
     max_new: usize,
     sampling: Sampling,
     stop: Vec<String>,
@@ -289,35 +339,107 @@ struct Req {
     include_usage: bool,
 }
 
+/// Bytes of an image reference: a `data:` URL or bare base64.
+fn image_bytes(s: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let s = s.trim();
+    let b64 = if let Some(rest) = s.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',').ok_or_else(|| anyhow!("malformed data: URL"))?;
+        if !meta.ends_with(";base64") {
+            return Err(anyhow!("data: URLs must be base64-encoded"));
+        }
+        data
+    } else if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file:") {
+        return Err(anyhow!("image URLs are not fetched; send the image inline as a data: URL (base64)"));
+    } else {
+        s
+    };
+    let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(clean.trim_end_matches('=')).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean.trim_end_matches('='))).map_err(|e| anyhow!("invalid base64 image: {e}"))
+}
+
+/// The image reference of a content part, in the shapes clients send.
+fn part_image(part: &Value) -> Option<&str> {
+    fn s(v: Option<&Value>) -> Option<&str> {
+        v.and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
+    }
+    s(part.get("image_url"))
+        .or_else(|| s(part.get("image")))
+        .or_else(|| part.get("source").filter(|src| src.get("type").and_then(Value::as_str) == Some("base64")).and_then(|src| src.get("data")).and_then(Value::as_str))
+}
+
+/// Images of a chat request in prompt order (the order the chat template renders their placeholders).
+fn request_images(messages: &[Value]) -> Result<Vec<Image>> {
+    let mut out = Vec::new();
+    for m in messages {
+        for part in m.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if matches!(part.get("type").and_then(Value::as_str), Some("image" | "input_image" | "image_url")) {
+                let r = part_image(part).ok_or_else(|| anyhow!("image part without image data"))?;
+                out.push(Image::decode(&image_bytes(r)?)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Prompt tokens of a request: the rendered chat (`raw` false) or a completion prompt (string or token ids).
-fn request_prompt(state: &AppState, body: &Value, raw: bool) -> Result<Vec<u32>> {
+fn request_prompt(state: &AppState, body: &Value, raw: bool) -> Result<(Vec<u32>, Vec<(usize, Arc<Image>)>)> {
     if raw {
         let p = body.get("prompt").ok_or_else(|| anyhow!("`prompt` is required"))?;
         let p = match p {
             Value::Array(a) if a.len() == 1 && !a[0].is_number() => &a[0],
             p => p,
         };
-        return match p {
+        let ids = match p {
             Value::String(s) => state.tok.encode(s, true),
             Value::Array(a) => a
                 .iter()
                 .map(|v| v.as_u64().filter(|&t| (t as usize) < state.tok.n_vocab()).map(|t| t as u32).ok_or_else(|| anyhow!("invalid token id in `prompt`")))
                 .collect(),
             _ => Err(anyhow!("`prompt` must be a string or an array of token ids (one prompt per request)")),
-        };
+        }?;
+        if ids.contains(&state.image_pad) {
+            return Err(anyhow!("raw completions do not take images"));
+        }
+        return Ok((ids, vec![]));
     }
     let messages = body.get("messages").and_then(Value::as_array).ok_or_else(|| anyhow!("`messages` must be an array"))?;
     let tool_choice_none = body.get("tool_choice").and_then(Value::as_str) == Some("none");
     let tools = if tool_choice_none { None } else { body.get("tools").and_then(Value::as_array).map(|v| v.as_slice()) };
     let text = chat::render(messages, tools, body.get("reasoning_effort"))?;
-    state.tok.encode(&text, true)
+    let ids = state.tok.encode(&text, true)?;
+    let images = request_images(messages)?;
+    let n_pad = ids.iter().filter(|&&t| t == state.image_pad).count();
+    if images.is_empty() && n_pad == 0 {
+        return Ok((ids, vec![]));
+    }
+    let (patch, merge) = state.vision.ok_or_else(|| anyhow!("this server has no vision encoder (start it with --mmproj)"))?;
+    if n_pad != images.len() {
+        return Err(anyhow!("{} image placeholders for {} images", n_pad, images.len()));
+    }
+    // each placeholder becomes the image's embedding rows; their ids identify the image for the prompt cache
+    let mut out = Vec::with_capacity(ids.len());
+    let mut placed = Vec::with_capacity(images.len());
+    let mut it = images.into_iter();
+    for t in ids {
+        if t != state.image_pad {
+            out.push(t);
+            continue;
+        }
+        let img = it.next().expect("counted");
+        let n = inkling_engine::vision::image_tokens(patch, merge, img.width, img.height);
+        let h = img.hash() as u32;
+        placed.push((out.len(), Arc::new(img)));
+        out.extend((0..n as u32).map(|r| EMBED_TOKEN_BASE | (h.wrapping_add(r) & 0x7fff_ffff)));
+    }
+    Ok((out, placed))
 }
 
 fn parse_request(state: &AppState, body: &Value, raw: bool) -> Result<Req> {
     if body.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
         return Err(anyhow!("only n = 1 is supported"));
     }
-    let prompt = request_prompt(state, body, raw)?;
+    let (prompt, images) = request_prompt(state, body, raw)?;
     if prompt.is_empty() {
         return Err(anyhow!("empty prompt"));
     }
@@ -355,7 +477,7 @@ fn parse_request(state: &AppState, body: &Value, raw: bool) -> Result<Req> {
     };
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Value::as_bool).unwrap_or(false);
-    Ok(Req { prompt, max_new, sampling, stop, stream, include_usage })
+    Ok(Req { prompt, images, max_new, sampling, stop, stream, include_usage })
 }
 
 fn usage(prompt_tokens: usize, cached: usize, completion: usize) -> Value {
@@ -382,7 +504,7 @@ async fn start(state: Arc<AppState>, headers: HeaderMap, body: Value, raw: bool)
     let (tx, rx) = mpsc::unbounded_channel();
     let stream = req.stream;
     let include_usage = req.include_usage;
-    if state.jobs.send(Job { prompt: req.prompt, max_new: req.max_new, sampling: req.sampling, stop: req.stop, raw, tx }).is_err() {
+    if state.jobs.send(Job { prompt: req.prompt, images: req.images, max_new: req.max_new, sampling: req.sampling, stop: req.stop, raw, tx }).is_err() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "GPU worker is not running");
     }
     let id = new_id(if raw { "cmpl-" } else { "chatcmpl-" });

@@ -263,12 +263,20 @@ impl Engine {
         let row = |j: usize| j * td * F32; // j-th [T][D] slab
         let nqv = |j: usize| p.nq.at(j * td);
 
-        let ids: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
+        let ids: Vec<i32> = tokens.iter().map(|&x| if x >= crate::EMBED_TOKEN_BASE { 0 } else { x as i32 }).collect();
         self.gpu.write(p.tokens.ptr, inkling_cuda::as_bytes(&ids))?;
         self.gpu.write(p.step.ptr, inkling_cuda::as_bytes(&[0i32, pos0 as i32, 0, 0]))?;
         self.gpu.launch("ink_embed_b", (t as u32, 1), 256, &[
             Arg::Ptr(self.w.token_embd), Arg::Ptr(p.tokens.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(p.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
         ])?;
+        // image embeddings replace their rows as they are (no embedding norm, as in the reference)
+        for (epos, e) in &self.embeds {
+            let (lo, hi) = ((*epos).max(pos0), (epos + e.n).min(pos0 + t));
+            if lo < hi {
+                let src = &e.data[(lo - epos) * d..(hi - epos) * d];
+                self.gpu.write(p.x.at((lo - pos0) * d * F32), inkling_cuda::as_bytes(src))?;
+            }
+        }
 
         let mut blocks: Vec<u64> = Vec::new();
         let mut prelude_blocks: Vec<u64> = Vec::new();

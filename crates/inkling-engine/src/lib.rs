@@ -6,6 +6,7 @@
 
 mod prefill;
 pub mod repack;
+pub mod vision;
 pub mod weights;
 
 use anyhow::{Context, Result, ensure};
@@ -13,7 +14,12 @@ use inkling_core::{Config, Gguf};
 use inkling_cuda::cudarc::driver::{CudaGraph, sys};
 use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, GemmArgs, GemmSeg, Gpu, HostMapped, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
 
+pub use vision::{Image, ImageEmbed, Vision};
 pub use weights::{ExpertFmt, LayerW, Weights};
+
+/// Prompt token ids at or above this value are image-embedding rows (the low bits only identify the image for the
+/// prompt cache); their input comes from `generate_mm`'s embeddings instead of the token table.
+pub const EMBED_TOKEN_BASE: u32 = 0x8000_0000;
 
 const F32: usize = 4;
 
@@ -157,6 +163,9 @@ pub struct Engine {
     /// batched prompt-processing buffers
     pre: Option<prefill::PrefillBufs>,
     cache: PromptCache,
+    vision: Option<Vision>,
+    /// image embeddings of the current request: (absolute position of the first row, rows)
+    embeds: Vec<(usize, ImageEmbed)>,
 }
 
 /// Optional per-pass hook, called after each layer pass with (slot, engine); use `Engine::debug_buf` to read state.
@@ -269,7 +278,7 @@ impl Engine {
         };
         let pre = Some(prefill::PrefillBufs::new(&gpu, &cfg)?);
         let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default() })
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default(), vision: None, embeds: Vec::new() })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -734,7 +743,27 @@ if self.attn_splits > 0 {
 
     /// As `generate`, also returning how many prompt tokens came from the cache.
     pub fn generate_ex(&mut self, prompt: &[u32], max_new: usize, sampling: &Sampling, on_token: &mut dyn FnMut(u32) -> bool) -> Result<(Vec<u32>, usize)> {
+        self.generate_mm(prompt, &[], max_new, sampling, on_token)
+    }
+
+    /// As `generate_ex` with image embeddings: `embeds` are (position, embedding) pairs whose rows replace the
+    /// prompt positions pos..pos + n (those prompt ids must be >= EMBED_TOKEN_BASE and should identify the image,
+    /// e.g. EMBED_TOKEN_BASE | hash bits, so the prompt cache does not confuse different images).
+    pub fn generate_mm(&mut self, prompt: &[u32], embeds: &[(usize, ImageEmbed)], max_new: usize, sampling: &Sampling, on_token: &mut dyn FnMut(u32) -> bool) -> Result<(Vec<u32>, usize)> {
         ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(*prompt.last().unwrap() < EMBED_TOKEN_BASE, "the prompt must not end inside an image");
+        for (pos, e) in embeds {
+            ensure!(e.data.len() == e.n * self.cfg.n_embd, "image embedding width");
+            ensure!(pos + e.n <= prompt.len() && prompt[*pos..pos + e.n].iter().all(|&t| t >= EMBED_TOKEN_BASE), "image embedding positions do not match the prompt");
+        }
+        ensure!(prompt.iter().filter(|&&t| t >= EMBED_TOKEN_BASE).count() == embeds.iter().map(|(_, e)| e.n).sum::<usize>(), "prompt has image positions without embeddings");
+        self.embeds = embeds.to_vec();
+        let r = self.generate_inner(prompt, max_new, sampling, on_token);
+        self.embeds.clear();
+        r
+    }
+
+    fn generate_inner(&mut self, prompt: &[u32], max_new: usize, sampling: &Sampling, on_token: &mut dyn FnMut(u32) -> bool) -> Result<(Vec<u32>, usize)> {
         ensure!(prompt.len() + max_new <= self.n_ctx, "prompt + generation exceed the context ({})", self.n_ctx);
         ensure!(self.use_graph, "generate needs CUDA graphs");
         ensure!(max_new > 0, "max_new must be positive");
@@ -749,6 +778,7 @@ if self.attn_splits > 0 {
             self.gpu.write(self.act.pen_ring.ptr, inkling_cuda::as_bytes(&ring))?;
         }
         let reused = if std::env::var_os("INKLING_NO_PREFILL").is_some() {
+            ensure!(self.embeds.is_empty(), "INKLING_NO_PREFILL does not support images");
             self.reset()?;
             self.gpu.write(self.act.prompt.ptr, inkling_cuda::as_bytes(&p))?;
             self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[0], 0, 0, 0]))?;

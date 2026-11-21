@@ -17,6 +17,7 @@ fn main() -> Result<()> {
         Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
         Some("cachetest") if args.len() > 1 => cachetest(&args[1]),
         Some("rendertest") if args.len() > 1 => rendertest(&args[1]),
+        Some("visiontest") if args.len() > 2 => visiontest(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(400)),
         Some("serve") if args.len() > 1 => serve(&args[1], &args[2..]),
         Some("benchpp") if args.len() > 1 => benchpp(&args[1], args.get(2).and_then(|s| s.parse().ok())),
         Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
@@ -39,6 +40,60 @@ fn sampling_from_env() -> inkling_engine::Sampling {
         frequency_penalty: f("INKLING_FREQUENCY_PENALTY", 0.0),
         last_n: f("INKLING_REPEAT_LAST_N", 64.0) as i32,
     }
+}
+
+/// Vision encoder vs llama-mtmd-debug (`-p encode -n N --image rainbow`): prints the projected embeddings like
+/// common_debug_cb_eval, then encoder timings for a few image sizes.
+fn visiontest(model: &str, mmproj: &str, n: usize) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    eng.load_vision(mmproj)?;
+    // the reference debug tool's "rainbow" pattern, fed as already-normalized pixels
+    let mut pix = vec![0f32; n * n * 3];
+    let (cx, cy) = (n as f32 / 2.0, n as f32 / 2.0);
+    let max_dist = (cx * cx + cy * cy).sqrt();
+    for y in 0..n {
+        for x in 0..n {
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            let mut hue = dy.atan2(dx) / (2.0 * 3.14159265);
+            if hue < 0.0 {
+                hue += 1.0;
+            }
+            let sat = ((dx * dx + dy * dy).sqrt() / max_dist).min(1.0);
+            let h6 = hue * 6.0;
+            let i6 = h6 as i32;
+            let f = h6 - i6 as f32;
+            let (p, q, t) = (1.0 - sat, 1.0 - sat * f, 1.0 - sat * (1.0 - f));
+            let (r, g, b) = match i6 % 6 {
+                0 => (1.0, t, p),
+                1 => (q, 1.0, p),
+                2 => (p, 1.0, t),
+                3 => (p, q, 1.0),
+                4 => (t, p, 1.0),
+                _ => (1.0, p, q),
+            };
+            pix[(y * n + x) * 3..][..3].copy_from_slice(&[r, g, b]);
+        }
+    }
+    let gp = n.div_ceil(40) * 2;
+    let e = eng.encode_pixels(n, n, gp, gp, &pix, [0.0; 3])?;
+    let w = eng.cfg.n_embd;
+    let row = |i: usize| {
+        let r = &e.data[i * w..(i + 1) * w];
+        println!("  [{:>11.4}, {:>11.4}, {:>11.4}, ..., {:>11.4}, {:>11.4}, {:>11.4}]", r[0], r[1], r[2], r[w - 3], r[w - 2], r[w - 1]);
+    };
+    println!("projected {{{w}, {}}}", e.n);
+    for i in [0, 1, 2, e.n - 3, e.n - 2, e.n - 1] {
+        row(i);
+    }
+    println!("  sum = {:.6}", e.data.iter().map(|&x| x as f64).sum::<f64>());
+    for side in [640usize, 1280, 2560] {
+        let img = inkling_engine::Image { width: side, height: side, rgb: vec![128; side * side * 3] };
+        eng.encode_image(&img)?; // warm-up
+        let t = Instant::now();
+        let e = eng.encode_image(&img)?;
+        println!("encode {side}x{side}: {} tokens in {:.1} ms", e.n, t.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok(())
 }
 
 /// Prefill GEMM self-test vs the decode matvec, plus GEMM throughput.
@@ -192,7 +247,7 @@ fn rendertest(cases: &str) -> Result<()> {
 }
 
 /// OpenAI-compatible server: inkling serve <model> [--host H] [--port P] [--ctx N] [--api-key K] [--temp T]
-/// [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N] [--model-id NAME]
+/// [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N] [--mmproj FILE] [--model-id NAME]
 fn serve(model: &str, flags: &[String]) -> Result<()> {
     let get = |name: &str| flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).cloned();
     let num = |name: &str| -> Result<Option<f64>> { get(name).map(|v| v.parse::<f64>().map_err(|e| anyhow::anyhow!("{name}: {e}"))).transpose() };
@@ -213,6 +268,7 @@ fn serve(model: &str, flags: &[String]) -> Result<()> {
         api_key: get("--api-key").or_else(|| std::env::var("INKLING_API_KEY").ok()),
         model_id,
         defaults: d,
+        mmproj: get("--mmproj"),
     };
     inkling_server::serve(model, opts)
 }
