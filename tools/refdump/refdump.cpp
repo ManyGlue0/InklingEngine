@@ -63,6 +63,12 @@ static bool eval_cb(struct ggml_tensor * t, bool ask, void * ud) {
     auto * st = (dump_state *) ud;
     const char * name = ggml_get_name(t);
     if (!name || !name[0]) return ask ? false : true;
+    // views/reshapes alias other tensors and may not own valid data at eval time
+    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
+        t->op == GGML_OP_NONE) {
+        return ask ? false : true;
+    }
+    if (!ask && (t->data == nullptr || ggml_nelements(t) == 0)) return true;
     const bool want = std::regex_match(name, st->re);
     if (ask) return want;
     if (!want) return true;
@@ -103,7 +109,9 @@ static bool eval_cb(struct ggml_tensor * t, bool ask, void * ud) {
 }
 
 int main(int argc, char ** argv) {
-    std::string model, outdir = "refdump_out", prompt = "The quick brown fox jumps over the lazy dog.", regex = ".*";
+    std::string model, outdir = "refdump_out", prompt = "The quick brown fox jumps over the lazy dog.",
+                regex = "(Qcur|Kcur|Vcur|Rcur|kq_b|attn_out|ffn_inp|ffn_out|l_out|attn_norm|ffn_norm|ffn_moe_[a-z_]+)-[0-9]+"
+                        "|result_norm|result_output|inp_embd|norm-1|attn_inp_.*";
     int n_ctx = 4096;
     std::string kv = "f16";
     bool special = false;
@@ -113,7 +121,12 @@ int main(int argc, char ** argv) {
         if (a == "-m") model = next();
         else if (a == "-o") outdir = next();
         else if (a == "-p") prompt = next();
-        else if (a == "-f") { std::ifstream f(next(), std::ios::binary); prompt.assign(std::istreambuf_iterator<char>(f), {}); }
+        else if (a == "-f") {
+            std::string path = next();
+            std::ifstream f(path, std::ios::binary);
+            if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return 1; }
+            prompt.assign(std::istreambuf_iterator<char>(f), {});
+        }
         else if (a == "-r") regex = next();
         else if (a == "-c") n_ctx = std::stoi(next());
         else if (a == "--kv") kv = next();
@@ -132,7 +145,7 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> toks(prompt.size() + 16);
     int nt = llama_tokenize(vocab, prompt.data(), (int) prompt.size(), toks.data(), (int) toks.size(), true, special);
-    if (nt < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
+    if (nt <= 0) { fprintf(stderr, "tokenize failed or empty prompt\n"); return 1; }
     toks.resize(nt);
     fprintf(stderr, "refdump: %d tokens\n", nt);
 

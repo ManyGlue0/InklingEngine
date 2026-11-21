@@ -10,8 +10,130 @@ fn main() -> Result<()> {
         Some("smoke") => smoke(),
         Some("inspect") if args.len() > 1 => inspect(&args[1]),
         Some("tokenize") if args.len() > 2 => tokenize(&args[1], &args[2], args.iter().any(|a| a == "--special")),
+        Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
+        Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
         _ => bail!("usage: inkling smoke | inkling inspect <model.gguf> | inkling tokenize <model.gguf> <file> [--special]"),
     }
+}
+
+/// Greedy generation from a raw prompt (special tokens parsed); reports prefill and decode speed.
+fn generate(model: &str, prompt: &str, n_gen: usize) -> Result<()> {
+    use std::io::Write;
+    let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let text = std::fs::read_to_string(prompt).unwrap_or_else(|_| prompt.to_owned());
+    let ids = tok.encode(&text, true)?;
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+    let t0 = Instant::now();
+    let mut logits = Vec::new();
+    for (pos, &id) in ids.iter().enumerate() {
+        logits = eng.step(id, pos, None)?;
+    }
+    let pre = t0.elapsed().as_secs_f64();
+    print!("{}", text);
+    let t1 = Instant::now();
+    let mut n = 0;
+    for i in 0..n_gen {
+        let next = argmax(&logits);
+        if next == tok.eos {
+            break;
+        }
+        print!("{}", String::from_utf8_lossy(&tok.token_bytes(next, true)));
+        std::io::stdout().flush()?;
+        logits = eng.step(next, ids.len() + i, None)?;
+        n += 1;
+    }
+    let dec = t1.elapsed().as_secs_f64();
+    println!("\n---\nprompt {} tok in {:.2}s ({:.1} tok/s) | decode {} tok in {:.2}s ({:.1} tok/s)", ids.len(), pre, ids.len() as f64 / pre, n, dec, n as f64 / dec);
+    Ok(())
+}
+
+/// Relative L2 error ‖a−b‖/‖b‖.
+fn rel_err(a: &[f32], b: &[f32]) -> f64 {
+    let (mut num, mut den) = (0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        num += ((x - y) as f64).powi(2);
+        den += (*y as f64).powi(2);
+    }
+    (num / den.max(1e-30)).sqrt()
+}
+
+/// KL(ref || ours) over softmax of logits, and whether the argmax agrees.
+fn kl_top1(ours: &[f32], reference: &[f32]) -> (f64, bool) {
+    let lse = |v: &[f32]| {
+        let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+    };
+    let (lo, lr) = (lse(ours), lse(reference));
+    let mut kl = 0f64;
+    for (o, r) in ours.iter().zip(reference) {
+        let pr = (*r as f64 - lr).exp();
+        kl += pr * ((*r as f64 - lr) - (*o as f64 - lo));
+    }
+    let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    (kl, am(ours) == am(reference))
+}
+
+/// Replay a refdump prompt token by token; compare every layer output (l_out-<slot>) and the logits.
+fn validate(model: &str, dump: &str) -> Result<()> {
+    use inkling_core::npy;
+    let dir = std::path::Path::new(dump);
+    let toks = npy::read(dir.join("tokens.npy"))?;
+    let ref_logits = npy::read(dir.join("logits.npy"))?;
+    let t_n = toks.data.len();
+    let t0 = Instant::now();
+    let mut eng = inkling_engine::Engine::load(model, 4096)?;
+    println!("loaded {:.2} GiB of weights in {:.1} s", eng.w.bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64());
+    let d = eng.cfg.n_embd;
+    let n_slots = eng.cfg.n_slots();
+    let refs: Vec<Option<Vec<f32>>> = (0..n_slots).map(|s| npy::read(dir.join(format!("l_out-{s}.npy"))).ok().map(|n| n.data)).collect();
+    let nv = eng.cfg.n_vocab_unpadded;
+    let n_vocab_ref = ref_logits.shape[1];
+
+    let mut worst = vec![0f64; n_slots];
+    let dbg_slot: Option<usize> = std::env::var("INKLING_DEBUG_SLOT").ok().and_then(|v| v.parse().ok());
+    let dbg_t: usize = std::env::var("INKLING_DEBUG_T").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let (mut kl_sum, mut agree) = (0f64, 0usize);
+    let order: Vec<usize> = eng.cfg.schedule().iter().map(|p| p.slot).collect();
+    for t in 0..t_n {
+        let mut errs = vec![0f64; n_slots];
+        let mut cb = |slot: usize, e: &inkling_engine::Engine| {
+            if let Some(r) = &refs[slot] {
+                let x = e.debug_buf("x").unwrap();
+                errs[slot] = rel_err(&x, &r[t * d..(t + 1) * d]);
+            }
+            if t == dbg_t && Some(slot) == dbg_slot {
+                for (ours, refname) in [("q", "Qcur"), ("k", "Kcur"), ("v", "Vcur"), ("r", "Rcur"), ("attn_out", "attn_out"),
+                    ("rlog", "ffn_moe_logits"), ("wts", "ffn_moe_weights_scaled"), ("ffn_out", "ffn_out"), ("x", "l_out")] {
+                    match npy::read(dir.join(format!("{refname}-{slot}.npy"))) {
+                        Ok(r) => {
+                            let v = e.debug_buf(ours).unwrap();
+                            let n = v.len();
+                            println!("  slot {slot} t={t} {ours:>8} vs {refname:<24} rel.err {:.5}   ours[..4]={:?} ref[..4]={:?}", rel_err(&v, &r.data[t * n..(t + 1) * n]), &v[..4], &r.data[t * n..t * n + 4]);
+                        }
+                        Err(_) => println!("  slot {slot}: no reference {refname}"),
+                    }
+                }
+            }
+        };
+        let logits = eng.step(toks.data[t] as u32, t, Some(&mut cb))?;
+        for s in 0..n_slots {
+            worst[s] = worst[s].max(errs[s]);
+        }
+        let rl = &ref_logits.data[t * n_vocab_ref..t * n_vocab_ref + nv];
+        let (kl, top1) = kl_top1(&logits, rl);
+        kl_sum += kl;
+        agree += top1 as usize;
+        if t < 3 || t + 1 == t_n {
+            let first_bad = order.iter().find(|&&s| errs[s] > 0.05);
+            println!("t={t:3}  KL={kl:.5}  top1={}  max layer rel.err={:.4}{}", if top1 { "same" } else { "DIFF" },
+                errs.iter().cloned().fold(0.0, f64::max), first_bad.map(|s| format!("  (first >5% at slot {s})")).unwrap_or_default());
+        }
+    }
+    println!("--- {t_n} tokens: mean KL {:.5}, top-1 agreement {}/{t_n}", kl_sum / t_n as f64, agree);
+    let line: Vec<String> = order.iter().map(|&s| format!("{s}:{:.3}", worst[s])).collect();
+    println!("worst rel.err per slot (execution order): {}", line.join(" "));
+    Ok(())
 }
 
 /// Tokenize a file; prints comma-separated ids (same format as `llama-tokenize --ids`).

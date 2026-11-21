@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>You are a helpful assistant<|end_message|><|message_user|><|content_text|>Write a Python function that returns the n-th Fibonacci number, then explain its complexity in one sentence.<|end_message|><|message_model|><|content_thinking|>

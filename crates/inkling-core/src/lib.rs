@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod gguf;
+pub mod npy;
 pub mod tokenizer;
 
 pub use config::{Config, Pass};

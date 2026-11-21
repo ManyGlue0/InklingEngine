@@ -98,6 +98,7 @@ dependencies = [
  "anyhow",
  "inkling-core",
  "inkling-cuda",
+ "inkling-engine",
 ]
 
 [[package]]
@@ -117,6 +118,15 @@ dependencies = [
  "anyhow",
  "cc",
  "cudarc",
+]
+
+[[package]]
+name = "inkling-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inkling-core",
+ "inkling-cuda",
 ]
 
 [[package]]
