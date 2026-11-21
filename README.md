@@ -7,6 +7,11 @@ OpenAI-compatible API with reasoning, tool calls and image input, and fits a 256
 It is built for this one model. That focus is why it is fast: the looped 48-pass schedule, the depth attention,
 the short convolutions and the NVFP4 experts each get fused, specialized kernels.
 
+> InklingEngine is an independent inference engine optimized for Thinking Machines Lab's Inkling 2 Mini model. It is
+> not affiliated with or endorsed by Thinking Machines Lab.
+
+![inkling serve answering a streaming chat request](docs/screenshot.png)
+
 ## Performance
 
 RTX 3090 (24 GB), `Inkling-2-Mini-UD-Q4_K_XL.gguf`, single stream:
@@ -58,25 +63,63 @@ and [docs/MODEL.md](docs/MODEL.md).
 Tested on Windows 11 with an RTX 3090. The code has no Windows-specific parts, but Linux builds have not been tested
 yet. The sm_75 code paths were validated by running the compute_75 PTX on the 3090.
 
-## Build
+## Quick start
+
+InklingEngine is one program, `inkling`. You build it from source with Cargo; there are no prebuilt downloads yet.
+
+**1. Install the prerequisites** (see [Requirements](#requirements)):
+- an NVIDIA driver;
+- the [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads): check with `nvcc --version`;
+- [Rust](https://rustup.rs): check with `cargo --version`.
+
+**2. Get the code and install the `inkling` command:**
 
 ```sh
-cargo build --release                      # kernels for the GPUs in this machine only (fast)
-# portable binary for every supported architecture (sm_75..sm_120 + PTX for future GPUs):
-INKLING_CUDA_ARCHS=75,80,86,89,90,100,120 cargo build --release
+git clone https://github.com/ManyGlue0/InklingEngine.git
+cd InklingEngine
+cargo install --locked --path crates/inkling-cli
 ```
 
-The binary is `target/release/inkling` (`inkling.exe` on Windows). The kernels are embedded in it.
-
-## Run
+This compiles everything, CUDA kernels included (a few minutes the first time), and copies `inkling` to Cargo's bin
+folder: `~/.cargo/bin`, or `%USERPROFILE%\.cargo\bin` on Windows. Rustup puts that folder on your PATH, so open a new
+terminal and check:
 
 ```sh
-# OpenAI-compatible server (http://127.0.0.1:8080/v1)
-inkling serve Inkling-2-Mini-UD-Q4_K_XL.gguf --mmproj mmproj-F32.gguf --ctx 131072
-
-# one-off generation (greedy by default; see "Environment" below for sampling)
-inkling generate Inkling-2-Mini-UD-Q4_K_XL.gguf "The three largest moons of Jupiter are" 64
+inkling --version
 ```
+
+If you would rather not install it, run `cargo build --release` instead and call the binary by its path,
+`target/release/inkling`.
+
+**3. Download the model** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth):
+`Inkling-2-Mini-UD-Q4_K_XL.gguf`, plus `mmproj-F32.gguf` if you want image input.
+
+**4. Run it:**
+
+```sh
+# OpenAI-compatible server at http://127.0.0.1:8080/v1 (point any OpenAI client or chat UI at it)
+inkling serve path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf --mmproj path/to/mmproj-F32.gguf --ctx 131072
+
+# or a one-off generation in the terminal (greedy by default; see "Environment" for sampling)
+inkling generate path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf "The three largest moons of Jupiter are" 64
+```
+
+Running `inkling` with no arguments lists every command.
+
+### Build options
+
+The kernels are compiled into the binary.
+- **Default (`native`):** builds only for the GPUs in the build machine, which is fastest.
+- **Portable:** a binary for every supported architecture, sm_75 to sm_120, plus PTX for future GPUs:
+
+```sh
+INKLING_CUDA_ARCHS=75,80,86,89,90,100,120 cargo install --locked --path crates/inkling-cli
+```
+
+On Windows PowerShell, set the variable first: `$env:INKLING_CUDA_ARCHS="75,80,86,89,90,100,120"`.
+`nvcc` must be on PATH, or `CUDA_PATH` set (the CUDA installer does this).
+
+## Server
 
 Server flags:
 
@@ -118,6 +161,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   "reasoning_effort": "low", "stream": true }'
 ```
 
+Try it from a terminal with the bundled client: `python tools/chat.py "Hello!"` (add `--image photo.jpg` for vision).
 Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python tools/vision_smoke.py` (image input).
 
 ### Environment
