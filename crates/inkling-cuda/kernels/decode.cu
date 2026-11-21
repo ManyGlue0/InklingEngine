@@ -1008,6 +1008,256 @@ INK_EXTERN void ink_router2(const float* __restrict__ x, const float* __restrict
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Pass 8: register-cached depth attention, wider router, F16 loop-control weights.
+
+// ink_mix5: as ink_mix4, but every thread keeps its elements of all states in registers (one global read).
+// Launch with exactly 768 threads for D = 2304 (3 elements per thread).
+INK_EXTERN void __launch_bounds__(768) ink_mix5(MixArgsQ A) {
+    const MixArgs& a = A.m;
+    constexpr int MS = 6, MQ = 4, NV = MS + MQ * MS, EPT = 3, NWARP = 24;
+    __shared__ float red[NWARP][NV];
+    __shared__ float prob[MQ][MS];
+    __shared__ float onorm[MQ];
+    const int n = a.n, nq = a.nq, D = a.D;
+    float v[EPT][MS];
+    float part[NV];
+#pragma unroll
+    for (int t = 0; t < NV; ++t) part[t] = 0.0f;
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int i = threadIdx.x + e * 768;
+        float qv[MQ];
+#pragma unroll
+        for (int q = 0; q < MQ; ++q) qv[q] = q < nq ? a.q[q * D + i] : 0.0f;
+#pragma unroll
+        for (int s = 0; s < MS; ++s) {
+            v[e][s] = s < n ? a.st[s][i] : 0.0f;
+            part[s] = fmaf(v[e][s], v[e][s], part[s]);
+#pragma unroll
+            for (int q = 0; q < MQ; ++q) part[MS + q * MS + s] = fmaf(qv[q], v[e][s], part[MS + q * MS + s]);
+        }
+    }
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+#pragma unroll
+    for (int t = 0; t < NV; ++t) {
+        const float r = warp_sum(part[t]);
+        if (l == 0) red[w][t] = r;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        const int q = threadIdx.x;
+        float inv[MS], sc[MS], mx = -INFINITY;
+        for (int s = 0; s < n; ++s) {
+            float ss = 0.0f, dd = 0.0f;
+            for (int ww = 0; ww < NWARP; ++ww) { ss += red[ww][s]; dd += red[ww][MS + q * MS + s]; }
+            inv[s] = rsqrtf(ss / D + 1e-6f);
+            sc[s] = dd * inv[s] * rsqrtf((float)D);
+            mx = fmaxf(mx, sc[s]);
+        }
+        float sum = 0.0f;
+        for (int s = 0; s < n; ++s) { sc[s] = __expf(sc[s] - mx); sum += sc[s]; }
+        for (int s = 0; s < MS; ++s) prob[q][s] = s < n ? sc[s] / sum * inv[s] : 0.0f;
+    }
+    __syncthreads();
+    float o[EPT][MQ], osq[MQ] = {0, 0, 0, 0};
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int i = threadIdx.x + e * 768;
+#pragma unroll
+        for (int q = 0; q < MQ; ++q) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < MS; ++s) acc = fmaf(prob[q][s], v[e][s], acc);
+            o[e][q] = acc;
+            if (q < nq) {
+                a.out[q * D + i] = acc;
+                osq[q] = fmaf(acc, acc, osq[q]);
+            }
+        }
+    }
+    if (!a.outn) return;
+    __syncthreads();
+#pragma unroll
+    for (int q = 0; q < MQ; ++q) {
+        const float r = warp_sum(osq[q]);
+        if (l == 0) red[w][q] = r;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        float ss = 0.0f;
+        for (int ww = 0; ww < NWARP; ++ww) ss += red[ww][threadIdx.x];
+        onorm[threadIdx.x] = rsqrtf(ss / D + a.eps);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int q = 0; q < MQ; ++q) {
+        if (q >= nq || !a.nw[q]) continue;
+#pragma unroll
+        for (int e = 0; e < EPT; ++e) {
+            const int i = threadIdx.x + e * 768;  // warp covers 32 consecutive i: one q8_1 block
+            const float val = o[e][q] * onorm[q] * a.nw[q][i];
+            a.outn[q * D + i] = val;
+            if (A.xq) warp_quant32(val, A.xq + q * D + (i & ~31), A.xd + q * (D / 32) + (i >> 5));
+        }
+    }
+}
+
+// Router with 2 warps per expert row (split K), 4 rows per block -> E/4 blocks; last block does the top-k.
+INK_EXTERN void ink_router3(const float* __restrict__ x, const float* __restrict__ W, const float* __restrict__ bias, float* __restrict__ logits,
+                            int* __restrict__ sel, float* __restrict__ wts, unsigned int* __restrict__ counter, int D, int E, int k, float wscale) {
+    __shared__ float halfsum[8];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int e = blockIdx.x * 4 + (warp >> 1), half = warp & 1;
+    {
+        const float4* row = reinterpret_cast<const float4*>(W + (size_t)e * D) + half * (D / 8);
+        const float4* x4 = reinterpret_cast<const float4*>(x) + half * (D / 8);
+        float acc = 0.0f;
+        for (int i = lane; i < D / 8; i += 32) {
+            const float4 a = row[i], b = x4[i];
+            acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) halfsum[warp] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x < 4) logits[blockIdx.x * 4 + threadIdx.x] = halfsum[2 * threadIdx.x] + halfsum[2 * threadIdx.x + 1];
+    __threadfence();
+    __shared__ bool last;
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(counter, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last || warp != 0) return;
+    __threadfence();
+    float p[4], s[4];
+    for (int t = 0; t < 4; ++t) {
+        const int ee = lane + 32 * t;
+        const float lg = ee < E ? *((volatile float*)logits + ee) : 0.0f;
+        p[t] = ee < E ? 1.0f / (1.0f + __expf(-lg)) : 0.0f;
+        s[t] = ee < E ? p[t] + (bias ? bias[ee] : 0.0f) : -INFINITY;
+    }
+    float sum = 0.0f, mine = 0.0f;
+    for (int rr = 0; rr < k; ++rr) {
+        float bv = s[0];
+        int bi = lane;
+        for (int t = 1; t < 4; ++t) if (s[t] > bv) { bv = s[t]; bi = lane + 32 * t; }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        const float pb = __shfl_sync(0xffffffffu, p[bi >> 5], bi & 31);
+        if ((bi & 31) == lane) s[bi >> 5] = -INFINITY;
+        sum += pb;
+        if (lane == rr) mine = pb;
+        if (lane == 0) sel[rr] = bi;
+    }
+    if (lane < k) wts[lane] = mine / (sum + 1e-20f) * wscale;
+    if (lane == 0) *counter = 0;
+}
+
+// Loop control with F16 weights (same math as ink_ctrl_down / ink_ctrl_up).
+struct Ctrl4H {
+    const float* c[4];
+    const float* m[4];
+    const __half* wd[4];  // [R][2D]
+    const __half* wg[4];  // [D][R]
+    const __half* wf[4];
+    float* g[4];
+    float* out[4];
+    int n;
+};
+
+INK_EXTERN void ink_ctrl_down_h(Ctrl4H a, int D, int R) {
+    const int j = blockIdx.y;
+    const float* c = a.c[j];
+    const float* m = a.m[j];
+    float sc = 0.0f, sm = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) { sc += c[i] * c[i]; sm += m[i] * m[i]; }
+    const float ic = rsqrtf(block_sum2(sc) / D + 1e-6f);
+    const float im = rsqrtf(block_sum2(sm) / D + 1e-6f);
+    const int r = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= R) return;
+    const uint4* row = reinterpret_cast<const uint4*>(a.wd[j] + (size_t)r * 2 * D);  // 8 halves per uint4
+    float acc = 0.0f;
+    for (int i = lane; i < 2 * D / 8; i += 32) {
+        const uint4 u = __ldg(row + i);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+        const int base = i * 8;
+        const bool second = base >= D;
+        const float* src = second ? m + (base - D) : c + base;
+        const float sclf = second ? im : ic;
+        float s = 0.0f;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const float2 w2 = __half22float2(h[t]);
+            s += w2.x * src[2 * t] + w2.y * src[2 * t + 1];
+        }
+        acc = fmaf(s, sclf, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) a.g[j][r] = acc;
+}
+
+INK_EXTERN void ink_ctrl_up_h(Ctrl4H a, int D, int R) {
+    const int j = blockIdx.y;
+    const int i = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (i >= D) return;
+    const float* g = a.g[j];
+    const __half2 wg = reinterpret_cast<const __half2*>(a.wg[j] + (size_t)i * R)[lane];  // R = 64: 2 per lane
+    const __half2 wf = reinterpret_cast<const __half2*>(a.wf[j] + (size_t)i * R)[lane];
+    const float2 g2 = make_float2(g[2 * lane], g[2 * lane + 1]);
+    const float2 a2 = __half22float2(wg), f2 = __half22float2(wf);
+    const float ga = warp_sum(a2.x * g2.x + a2.y * g2.y);
+    const float fa = warp_sum(f2.x * g2.x + f2.y * g2.y);
+    if (lane == 0) a.out[j][i] = (1.0f - tanhf(fa)) * a.c[j][i] + tanhf(ga) * a.m[j][i];
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Device-side autoregressive loop. step = [token, pos, n_out].
+
+// Greedy: argmax of the logits becomes the next input token; it is appended to hist and pos advances.
+INK_EXTERN void ink_argmax_next(const float* __restrict__ x, int n, int* __restrict__ step, int* __restrict__ hist) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    float v = -INFINITY;
+    int idx = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float t = x[i];
+        if (t > v) { v = t; idx = i; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+        if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = v; bi[threadIdx.x >> 5] = idx; }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = bv[threadIdx.x];
+        idx = bi[threadIdx.x];
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+            if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+        }
+        if (threadIdx.x == 0) {
+            hist[step[2]] = idx;
+            step[2] += 1;
+            step[0] = idx;
+            step[1] += 1;
+        }
+    }
+}
+
+// Prefill: the next prompt token becomes the input and pos advances.
+INK_EXTERN void ink_advance_prompt(int* __restrict__ step, const int* __restrict__ prompt) {
+    if (threadIdx.x == 0) {
+        step[1] += 1;
+        step[0] = prompt[step[1]];
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Loop control, two phases over up to 4 controls at once.
 struct Ctrl4 {
     const float* c[4];

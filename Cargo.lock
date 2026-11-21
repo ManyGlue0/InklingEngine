@@ -125,6 +125,7 @@ name = "inkling-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "inkling-core",
  "inkling-cuda",
 ]

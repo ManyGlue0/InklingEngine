@@ -17,23 +17,21 @@ fn main() -> Result<()> {
     }
 }
 
-/// Decode throughput: greedy generation of `n` tokens after a short prompt, no printing.
+/// Throughput with the device-side loop: prompt processing + greedy decode of `n` tokens, no printing.
 fn bench(model: &str, n: usize) -> Result<()> {
     let mut eng = inkling_engine::Engine::load(model, 4096)?;
     let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
     let ids = tok.encode("<|message_user|><|content_text|>Write a long story about a lighthouse keeper.<|end_message|><|message_model|><|content_text|>", true)?;
+    eng.generate(&ids, 4, |_| true)?; // warm-up: capture the graphs
     let t0 = Instant::now();
-    let mut next = 0;
-    for (pos, &id) in ids.iter().enumerate() {
-        next = eng.step_greedy(id, pos)?;
-    }
+    eng.generate(&ids, 1, |_| true)?;
     let pre = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
-    for i in 0..n {
-        next = eng.step_greedy(next, ids.len() + i)?;
-    }
-    let dec = t1.elapsed().as_secs_f64();
-    println!("prompt {} tok: {:.1} tok/s | decode {n} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, n as f64 / dec, dec * 1e3 / n as f64);
+    let out = eng.generate(&ids, n, |_| true)?;
+    let total = t1.elapsed().as_secs_f64();
+    let dec = (total - pre).max(1e-9);
+    let m = out.len() - 1;
+    println!("prompt {} tok: {:.1} tok/s | decode {m} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, m as f64 / dec, dec * 1e3 / m as f64);
     Ok(())
 }
 

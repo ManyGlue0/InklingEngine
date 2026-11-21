@@ -10,7 +10,7 @@ pub mod weights;
 use anyhow::{Result, ensure};
 use inkling_core::{Config, Gguf};
 use inkling_cuda::cudarc::driver::{CudaGraph, sys};
-use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, Gpu, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
+use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, Gpu, HostMapped, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
 
 pub use weights::{ExpertFmt, LayerW, Weights};
 
@@ -72,7 +72,20 @@ struct Act {
     xprev: DevBuf,
     blocks: DevBuf, // block storage [16][D], indexed by push order within a token
     logits: DevBuf,
-    step: DevBuf,   // i32 [token, pos]
+    step: DevBuf,   // i32 [token, pos, n_out, pad]
+    prompt: DevBuf, // i32 [n_ctx] prompt tokens (device-side prefill loop)
+    hist: HostMapped, // i32 [n_ctx] generated tokens, written by the GPU into host memory
+}
+
+/// Which work follows the forward pass in a captured graph.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// nothing: logits stay on the device
+    None,
+    /// next prompt token becomes the input, pos += 1
+    Prefill,
+    /// greedy: argmax becomes the input and is appended to hist, pos += 1
+    Greedy,
 }
 
 pub struct Engine {
@@ -83,6 +96,8 @@ pub struct Engine {
     act: Act,
     pub n_ctx: usize,
     graph: Option<CudaGraph>,
+    graph_pre: Option<CudaGraph>,
+    graph_dec: Option<CudaGraph>,
     /// disable graph replay (debug captures need per-layer host callbacks)
     pub use_graph: bool,
 }
@@ -152,11 +167,13 @@ impl Engine {
             xprev: f(d)?,
             blocks: f(16 * d)?,
             logits: f(cfg.n_vocab)?,
-            step: f(2)?,
+            step: f(4)?,
+            prompt: f(n_ctx)?,
+            hist: gpu.alloc_host_mapped(n_ctx * 4)?,
         };
         gpu.sync()?;
         let use_graph = std::env::var_os("INKLING_NO_GRAPH").is_none();
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, use_graph })
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph })
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -199,7 +216,7 @@ impl Engine {
         ensure!(states.len() <= 6 && nq <= 4, "mix: too many states/queries");
         let mut m = MixArgs { q, out, outn, nw, n: states.len() as i32, nq: nq as i32, d: self.cfg.n_embd as i32, eps: self.cfg.rms_eps, ..Default::default() };
         m.st[..states.len()].copy_from_slice(states);
-        self.gpu.launch("ink_mix4", (1, 1), 512, &[Arg::MixQ(MixArgsQ { m, xq: xq.0, xd: xq.1 })])
+        self.gpu.launch("ink_mix5", (1, 1), 768, &[Arg::MixQ(MixArgsQ { m, xq: xq.0, xd: xq.1 })])
     }
 
     /// RMS-normalize up to 4 vectors (x_j * w_j) into y_j and their q8_1 copies.
@@ -264,8 +281,10 @@ impl Engine {
             a.out[j] = out;
         }
         let (d, n) = (self.cfg.n_embd as i32, ctrls.len() as u32);
-        self.gpu.launch("ink_ctrl_down", ((r / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])?;
-        self.gpu.launch("ink_ctrl_up", ((self.cfg.n_embd / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])
+        // Ctrl4 and Ctrl4H share one layout (pointer arrays); the kernel picks the weight type
+        let (kd, ku) = if lp.f16 { ("ink_ctrl_down_h", "ink_ctrl_up_h") } else { ("ink_ctrl_down", "ink_ctrl_up") };
+        self.gpu.launch(kd, ((r / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])?;
+        self.gpu.launch(ku, ((self.cfg.n_embd / 8) as u32, n), 256, &[Arg::Ctrl(a), Arg::I32(d), Arg::I32(r as i32)])
     }
 
     // ---- the token step ------------------------------------------------------------------------------------
@@ -403,7 +422,7 @@ impl Engine {
 
             // MoE: router + top-k, experts on int8 activations, weighted partials summed by the post conv
             let k = cfg.n_expert_used;
-            self.gpu.launch("ink_router2", ((cfg.n_expert / 8) as u32, 1), 256, &[
+            self.gpu.launch("ink_router3", ((cfg.n_expert / 4) as u32, 1), 256, &[
                 Arg::Ptr(a.fnorm.ptr), Arg::Ptr(lw.router), Arg::Ptr(lw.probs_bias), Arg::Ptr(a.rlog.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
                 Arg::Ptr(a.counter.ptr), Arg::I32(d as i32), Arg::I32(cfg.n_expert as i32), Arg::I32(k as i32), Arg::F32(cfg.expert_weights_scale),
             ])?;
@@ -433,6 +452,74 @@ impl Engine {
         self.gpu.launch("ink_softcap", (nv.div_ceil(256) as u32, 1), 256, &[Arg::Ptr(a.logits.ptr), Arg::I32(nv as i32), Arg::F32(cfg.final_softcap)])
     }
 
+    fn enqueue_tail(&self, tail: Tail) -> Result<()> {
+        match tail {
+            Tail::None => Ok(()),
+            Tail::Prefill => self.gpu.launch("ink_advance_prompt", (1, 1), 32, &[Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.prompt.ptr)]),
+            Tail::Greedy => self.gpu.launch("ink_argmax_next", (1, 1), 1024, &[
+                Arg::Ptr(self.act.logits.ptr), Arg::I32(self.cfg.n_vocab_unpadded as i32), Arg::Ptr(self.act.step.ptr), Arg::Ptr(self.act.hist.dev),
+            ]),
+        }
+    }
+
+    fn graph_slot(&mut self, tail: Tail) -> &mut Option<CudaGraph> {
+        match tail {
+            Tail::None => &mut self.graph,
+            Tail::Prefill => &mut self.graph_pre,
+            Tail::Greedy => &mut self.graph_dec,
+        }
+    }
+
+    /// Capture (once) and launch the graph for `tail`.
+    fn launch_graph(&mut self, tail: Tail) -> Result<()> {
+        if self.graph_slot(tail).is_none() {
+            self.gpu.sync()?;
+            self.gpu.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let r = self.enqueue_step(None).and_then(|_| self.enqueue_tail(tail));
+            let g = self.gpu.stream.end_capture(sys::CUgraphInstantiate_flags(0))?;
+            r?;
+            *self.graph_slot(tail) = g;
+        }
+        self.graph_slot(tail).as_ref().expect("graph").launch()?;
+        Ok(())
+    }
+
+    /// Greedy generation with the autoregressive loop on the device: the prompt is fed by a device-side prefill
+    /// loop, every decode step writes its argmax token as the next input, and the host queues steps ahead,
+    /// reading tokens from mapped memory behind per-step events. `on_token` returns false to stop.
+    /// Starts a new sequence (state is reset).
+    pub fn generate(&mut self, prompt: &[u32], max_new: usize, mut on_token: impl FnMut(u32) -> bool) -> Result<Vec<u32>> {
+        ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(prompt.len() + max_new <= self.n_ctx, "prompt + generation exceed the context ({})", self.n_ctx);
+        ensure!(self.use_graph, "generate needs CUDA graphs");
+        self.reset()?;
+        let p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+        self.gpu.write(self.act.prompt.ptr, inkling_cuda::as_bytes(&p))?;
+        self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[0], 0, 0, 0]))?;
+        for _ in 0..prompt.len() - 1 {
+            self.launch_graph(Tail::Prefill)?;
+        }
+        const AHEAD: usize = 3;
+        let mut events = Vec::with_capacity(max_new);
+        let mut out = Vec::with_capacity(max_new);
+        let mut launched = 0;
+        while out.len() < max_new {
+            while launched < max_new && launched - out.len() < AHEAD {
+                self.launch_graph(Tail::Greedy)?;
+                events.push(self.gpu.stream.record_event(None)?);
+                launched += 1;
+            }
+            events[out.len()].synchronize()?;
+            let t = self.act.hist.read_i32(out.len()) as u32;
+            out.push(t);
+            if !on_token(t) {
+                break;
+            }
+        }
+        self.gpu.sync()?;
+        Ok(out)
+    }
+
     /// Run one token and return the greedy next token (argmax on the GPU, 4-byte readback).
     pub fn step_greedy(&mut self, token: u32, pos: usize) -> Result<u32> {
         self.run(token, pos, None)?;
@@ -451,19 +538,11 @@ impl Engine {
     /// Enqueue one token step (graph replay when possible); results stay on the device.
     fn run(&mut self, token: u32, pos: usize, capture: Option<Capture>) -> Result<()> {
         ensure!(pos < self.n_ctx, "position {pos} exceeds context {}", self.n_ctx);
-        self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[token as i32, pos as i32]))?;
+        self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[token as i32, pos as i32, 0, 0]))?;
         if capture.is_some() || !self.use_graph {
             self.enqueue_step(capture)?;
         } else {
-            if self.graph.is_none() {
-                self.gpu.sync()?;
-                self.gpu.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                let r = self.enqueue_step(None);
-                let g = self.gpu.stream.end_capture(sys::CUgraphInstantiate_flags(0))?;
-                r?;
-                self.graph = g;
-            }
-            self.graph.as_ref().expect("graph").launch()?;
+            self.launch_graph(Tail::None)?;
         }
         Ok(())
     }

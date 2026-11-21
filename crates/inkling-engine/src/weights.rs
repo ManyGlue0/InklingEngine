@@ -33,7 +33,9 @@ pub struct ExpM {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LoopW {
-    /// q, k, v, ffn controls: down [R][2D], gain [D][R], forget [D][R] (F32)
+    /// weights stored as F16 (default) or F32 (INKLING_LOOP_F32=1)
+    pub f16: bool,
+    /// q, k, v, ffn controls: down [R][2D], gain [D][R], forget [D][R]
     pub down: [u64; 4],
     pub gain: [u64; 4],
     pub forget: [u64; 4],
@@ -109,6 +111,14 @@ impl Loader<'_> {
         self.put(name.to_owned(), &data)
     }
 
+    /// F32 tensor converted to F16 on upload.
+    fn f16(&mut self, name: &str) -> Result<u64> {
+        let t = self.g.require(name)?;
+        ensure!(t.ty == GgmlType::F32, "{name}: expected F32");
+        let h: Vec<u16> = self.g.data(t).chunks_exact(4).map(|c| half::f16::from_f32(f32::from_le_bytes(c.try_into().unwrap())).to_bits()).collect();
+        self.put(format!("{name}#f16"), inkling_cuda::as_bytes(&h))
+    }
+
     fn raw_opt(&mut self, name: &str) -> Result<u64> {
         if self.g.tensor(name).is_some() { self.raw(name) } else { Ok(0) }
     }
@@ -158,11 +168,13 @@ impl Weights {
         for i in 0..cfg.n_phys {
             let n = |s: &str| format!("blk.{i}.{s}");
             let lp = if (cfg.core_start..cfg.core_end).contains(&i) {
-                let mut lw = LoopW { down: [0; 4], gain: [0; 4], forget: [0; 4], msg_query: 0 };
+                let f16 = std::env::var_os("INKLING_LOOP_F32").is_none();
+                let mut lw = LoopW { f16, down: [0; 4], gain: [0; 4], forget: [0; 4], msg_query: 0 };
                 for (c, nm) in ["attn", "k", "v", "mlp"].iter().enumerate() {
-                    lw.down[c] = l.raw(&n(&format!("loop_{nm}_down.weight")))?;
-                    lw.gain[c] = l.raw(&n(&format!("loop_{nm}_gain.weight")))?;
-                    lw.forget[c] = l.raw(&n(&format!("loop_{nm}_forget.weight")))?;
+                    for (dst, kind) in [(&mut lw.down[c], "down"), (&mut lw.gain[c], "gain"), (&mut lw.forget[c], "forget")] {
+                        let name = n(&format!("loop_{nm}_{kind}.weight"));
+                        *dst = if f16 { l.f16(&name)? } else { l.raw(&name)? };
+                    }
                 }
                 // message queries of core layer ci: rows [res[2ci], kv[2ci], kv[2ci+1], res[2ci+1]] (q, k, v, ffn)
                 let ci = i - cfg.core_start;

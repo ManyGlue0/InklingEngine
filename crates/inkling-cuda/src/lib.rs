@@ -177,6 +177,31 @@ impl DevBuf {
     }
 }
 
+/// Page-locked host memory mapped into the device address space: kernels write it directly, the host reads it
+/// after synchronizing on an event recorded behind those kernels.
+pub struct HostMapped {
+    host: *mut u8,
+    pub dev: u64,
+    pub bytes: usize,
+}
+
+unsafe impl Send for HostMapped {}
+
+impl HostMapped {
+    pub fn read_i32(&self, idx: usize) -> i32 {
+        assert!((idx + 1) * 4 <= self.bytes);
+        unsafe { std::ptr::read_volatile((self.host as *const i32).add(idx)) }
+    }
+}
+
+impl Drop for HostMapped {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cudarc::driver::result::free_host(self.host as *mut std::ffi::c_void);
+        }
+    }
+}
+
 /// One GPU: context, main stream, the loaded kernel module and its functions.
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
@@ -226,6 +251,18 @@ impl Gpu {
         let slice = self.stream.alloc_zeros::<u8>(bytes.max(1))?;
         let ptr = raw_ptr(&slice, &self.stream);
         Ok(DevBuf { ptr, bytes, _slice: slice })
+    }
+
+    /// Allocate zeroed host-mapped pinned memory.
+    pub fn alloc_host_mapped(&self, bytes: usize) -> Result<HostMapped> {
+        self.ctx.bind_to_thread()?;
+        const PORTABLE: u32 = 0x01;
+        const DEVICEMAP: u32 = 0x02;
+        let host = unsafe { cudarc::driver::result::malloc_host(bytes.max(4), PORTABLE | DEVICEMAP) }? as *mut u8;
+        unsafe { std::ptr::write_bytes(host, 0, bytes.max(4)) };
+        let mut dev: cudarc::driver::sys::CUdeviceptr = 0;
+        unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut std::ffi::c_void, 0) }.result()?;
+        Ok(HostMapped { host, dev, bytes })
     }
 
     /// Upload host bytes into a new device buffer.
