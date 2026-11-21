@@ -168,8 +168,11 @@ Developer commands:
 - **GGUF conversion and quantization** by [Unsloth](https://unsloth.ai).
 - **Reference implementation:** [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), Unsloth's Inkling 2
   branch. It was used as the numerical reference and as the source of the model and preprocessing semantics. No
-  llama.cpp code is included.
+  llama.cpp code is included; its license notice is reproduced in [NOTICE](NOTICE).
+- **Chat template** (`tests/data/chat_template.jinja`, a test oracle) is the model's own, from the Inkling 2 Mini
+  release (Apache-2.0).
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Third-party notices (the
+llama.cpp MIT notice, the Inkling 2 chat template used as a test oracle) are in [NOTICE](NOTICE).

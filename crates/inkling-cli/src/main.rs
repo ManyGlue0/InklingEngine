@@ -22,7 +22,21 @@ fn main() -> Result<()> {
         Some("benchpp") if args.len() > 1 => benchpp(&args[1], args.get(2).and_then(|s| s.parse().ok())),
         Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
-        _ => bail!("usage: inkling smoke | inkling inspect <model.gguf> | inkling tokenize <model.gguf> <file> [--special]"),
+        Some("--version" | "-V" | "version") => {
+            println!("inkling {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        _ => bail!(
+            "InklingEngine {} - Inkling 2 Mini inference on NVIDIA GPUs\n\n\
+             usage:\n\
+             \x20 inkling serve <model.gguf> [--mmproj FILE] [--ctx N] [--host H] [--port P] [--api-key KEY] [--model-id NAME]\n\
+             \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
+             \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
+             \x20 inkling bench <model.gguf> [n] | benchpp <model.gguf> [n] | benchctx <model.gguf> <n>\n\
+             \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | smoke | --version\n\n\
+             developer checks: validate, kvstudy, cachetest, rendertest, gemmtest, visiontest (see README)",
+            env!("CARGO_PKG_VERSION")
+        ),
     }
 }
 
