@@ -1,0 +1,12 @@
+[package]
+name = "inkling-core"
+description = "InklingEngine core: GGUF reader, model config, tokenizer, sampling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fancy-regex = "0.20.2"
+half.workspace = true
+memmap2.workspace = true

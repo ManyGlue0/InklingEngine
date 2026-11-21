@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>You are a helpful assistant<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Simple arithmetic.<|end_message|><|message_model|><|content_text|>4<|content_model_end_sampling|> and a fake <|not_special|> token

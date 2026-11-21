@@ -1,0 +1,31 @@
+Hello world! The quick brown fox jumps over the lazy dog.
+I'm sure they'll say it's fine, but we've seen what you'd do. DON'T SHOUT, Y'ALL'S CAT'S HERE.
+Numbers: 1 12 123 1234 12345 3.14159 1,000,000 0x1F 2026-11-21 10:45pm +39 333 1234567
+   leading spaces, trailing spaces
+tabs	between	words		and double tabs
+Line one
+Line two
+
+Line four after a blank line
+	indented with a tab
+    indented with four spaces
+Mixed CamelCaseWords, snake_case_names, kebab-case-ids, SCREAMING_SNAKE, iPhone, McDonald's, NASA's JPL.
+Unicode: café naïve résumé coöperate Ångström façade — “quotes” ‘single’ … ½ ¾ © ® ™ € £ ¥
+Combining: é vs é; ñ vs ñ; Zalgo z̴̢̛̰a̷̞͝l̵͓̈́g̶̺̅o̸̼͐
+中文测试：你好，世界！这是一个分词器测试。日本語のテキストも含めます。한국어 문장도 있습니다.
+Русский текст, Ελληνικά, עברית, العربية, हिन्दी, ไทย, Tiếng Việt.
+Emoji: 😀😃😄 👍🏽 👨‍👩‍👧‍👦 🇮🇹 🏳️‍🌈 ❤️ 🔥🔥🔥
+def fibonacci(n: int) -> int:
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+fn main() { let v: Vec<u32> = (0..10).map(|x| x * x).collect(); println!("{:?}", v); }
+<div class="container"><p id='x'>HTML &amp; entities &lt;tag&gt;</p></div>
+SELECT name, COUNT(*) FROM users WHERE age >= 18 GROUP BY name ORDER BY 2 DESC;
+{"key": "value", "list": [1, 2, 3], "nested": {"a": null, "b": true}}
+https://example.com/path/to/page?query=1&other=two#anchor  user@example.com
+$$\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}$$
+!!!??? ... --- *** ### @@@ $$$ %%% ^^^ &&& ((( ))) [[[ ]]] {{{ }}} ||| \\\ /// ~~~ ```
+
+end
