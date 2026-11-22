@@ -216,6 +216,15 @@ impl HostMapped {
         assert!((idx + 1) * 4 <= self.bytes);
         unsafe { std::ptr::read_volatile((self.host as *const i32).add(idx)) }
     }
+
+    /// Host view of the buffer (the device may be reading it: only write while no kernel uses it).
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.host, self.bytes) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.host, self.bytes) }
+    }
 }
 
 impl Drop for HostMapped {

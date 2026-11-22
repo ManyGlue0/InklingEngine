@@ -4,6 +4,7 @@
 //! Activations feeding the quantized matvecs are int8 (q8_1 blocks of 32, as llama.cpp's mmvq), produced by the
 //! kernel that computes them (depth-attention mix, norms, attention output, expert gate_up).
 
+pub mod cpu_moe;
 mod prefill;
 pub mod repack;
 pub mod vision;
@@ -273,7 +274,8 @@ impl Engine {
                 if swa { 2 * cap * kvw * 2 } else { cap * cfg.n_head_kv * (kv_k.head_bytes() + kv_v.head_bytes()) }
             })
             .sum();
-        let weight_bytes: usize = g.tensors.iter().map(|t| t.n_bytes).sum();
+        let weight_bytes: usize =
+            g.tensors.iter().filter(|t| !(weights::embed_on_host() && t.name == "token_embd.weight")).map(|t| t.n_bytes).sum();
         let need = weight_bytes + kv_bytes + VRAM_FIXED;
         let free_at_start = gpu.free_vram()?;
         check_vram(free_at_start, need, &format!("this model at context {n_ctx}"))?;

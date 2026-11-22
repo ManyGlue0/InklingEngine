@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail, ensure};
 use inkling_core::{Config, GgmlType, Gguf};
-use inkling_cuda::{DevBuf, Gpu};
+use inkling_cuda::{DevBuf, Gpu, HostMapped};
 
 use crate::repack::{self, Soa};
 
@@ -78,6 +78,8 @@ pub struct LayerW {
 
 pub struct Weights {
     pub bufs: HashMap<String, DevBuf>,
+    /// tensors kept in pinned host memory that kernels read over PCIe (token embeddings: one row per token)
+    pub host_bufs: Vec<HostMapped>,
     pub token_embd: u64,
     pub token_embd_norm: u64,
     pub output: Q8M,
@@ -217,13 +219,30 @@ impl Weights {
                 lp,
             });
         }
-        let token_embd = l.raw("token_embd.weight")?;
+        // the token embedding table is only gathered (one row per token): keep it in host memory, readable by the GPU
+        // over PCIe, and save ~0.5 GB of VRAM (INKLING_EMBED_GPU=1 keeps it on the GPU)
+        let mut host_bufs = Vec::new();
+        let token_embd = if embed_on_host() {
+            let t = g.require("token_embd.weight")?;
+            let mut h = gpu.alloc_host_mapped(t.n_bytes)?;
+            h.as_mut_slice().copy_from_slice(g.data(t));
+            let p = h.dev;
+            host_bufs.push(h);
+            p
+        } else {
+            l.raw("token_embd.weight")?
+        };
         let token_embd_norm = l.raw("token_embd_norm.weight")?;
         let output = l.q8(&["output.weight".to_owned()])?;
         let output_norm = l.raw("output_norm.weight")?;
         let output_res_query = l.raw("output_res_query.weight")?;
-        Ok(Self { token_embd, token_embd_norm, output, output_norm, output_res_query, layers, bytes: l.bytes, bufs: l.bufs })
+        Ok(Self { host_bufs, token_embd, token_embd_norm, output, output_norm, output_res_query, layers, bytes: l.bytes, bufs: l.bufs })
     }
+}
+
+/// Whether the token embedding table lives in host memory (default) instead of VRAM.
+pub fn embed_on_host() -> bool {
+    std::env::var_os("INKLING_EMBED_GPU").is_none()
 }
 
 fn f32_rows(g: &Gguf, name: &str) -> Result<Vec<f32>> {
