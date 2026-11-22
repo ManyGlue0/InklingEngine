@@ -382,23 +382,37 @@ impl Gpu {
 
     /// Allocate zeroed host-mapped pinned memory.
     pub fn alloc_host_mapped(&self, bytes: usize) -> Result<HostMapped> {
-        self.ctx.bind_to_thread()?;
-        const PORTABLE: u32 = 0x01;
-        const DEVICEMAP: u32 = 0x02;
-        let host = unsafe { cudarc::driver::result::malloc_host(bytes.max(4), PORTABLE | DEVICEMAP) }? as *mut u8;
-        unsafe { std::ptr::write_bytes(host, 0, bytes.max(4)) };
-        let mut dev: cudarc::driver::sys::CUdeviceptr = 0;
-        unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut std::ffi::c_void, 0) }.result()?;
-        Ok(HostMapped { host, dev, bytes })
+        let h = self.alloc_host_mapped_uninit(bytes)?;
+        unsafe { std::ptr::write_bytes(h.host, 0, bytes.max(4)) };
+        Ok(h)
     }
 
-    /// Allocate host-mapped pinned memory without zeroing it (large buffers the caller fills entirely).
+    /// Allocate host-mapped pinned memory without zeroing it (large buffers the caller fills entirely). The driver
+    /// can refuse transiently (on Windows right after another process released a lot of pinned memory), so a
+    /// failed attempt is retried a few times.
     pub fn alloc_host_mapped_uninit(&self, bytes: usize) -> Result<HostMapped> {
         self.ctx.bind_to_thread()?;
-        let host = unsafe { cudarc::driver::result::malloc_host(bytes.max(4), 0x01 | 0x02) }? as *mut u8;
-        let mut dev: cudarc::driver::sys::CUdeviceptr = 0;
-        unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut std::ffi::c_void, 0) }.result()?;
-        Ok(HostMapped { host, dev, bytes })
+        let mut last = None;
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+            }
+            match unsafe { cudarc::driver::result::malloc_host(bytes.max(4), 0x01 | 0x02) } {
+                Ok(p) => {
+                    let host = p as *mut u8;
+                    let mut dev: cudarc::driver::sys::CUdeviceptr = 0;
+                    match unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut std::ffi::c_void, 0) }.result() {
+                        Ok(()) => return Ok(HostMapped { host, dev, bytes }),
+                        Err(e) => {
+                            unsafe { let _ = cudarc::driver::result::free_host(host as *mut std::ffi::c_void); }
+                            last = Some(e);
+                        }
+                    }
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(anyhow::anyhow!("pinning {} MiB of host memory failed: {:?}", bytes >> 20, last.unwrap()))
     }
 
     /// Upload host bytes into a new device buffer.
