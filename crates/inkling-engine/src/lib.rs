@@ -398,6 +398,9 @@ impl Engine {
         if std::env::var_os("INKLING_VRAM_DEBUG").is_some() {
             let free_now = gpu.free_vram()?;
             eprintln!("vram: estimated {need} B (fixed part {VRAM_FIXED}), used by load {} B", free_at_start.saturating_sub(free_now));
+            if let Some((peak, now)) = offload::working_set() {
+                eprintln!("ram: process working set {:.2} GiB (peak during load {:.2} GiB)", now as f64 / (1u64 << 30) as f64, peak as f64 / (1u64 << 30) as f64);
+            }
         }
         if let Some(c) = &cpu {
             let layers: Vec<String> = (0..cfg.n_phys).filter(|&i| c.plan.on_cpu[i]).map(|i| i.to_string()).collect();

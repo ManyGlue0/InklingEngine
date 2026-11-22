@@ -338,6 +338,11 @@ impl Weights {
                 down,
                 lp,
             });
+            // this layer is on the GPU / in pinned memory: let its file pages go (see Gguf::release)
+            let prefix = format!("blk.{i}.");
+            for t in g.tensors.iter().filter(|t| t.name.starts_with(&prefix)) {
+                g.release(t);
+            }
         }
         // the token embedding table is only gathered (one row per token): keep it in host memory, readable by the GPU
         // over PCIe, and save ~0.5 GB of VRAM (INKLING_EMBED_GPU=1 keeps it on the GPU)
@@ -357,6 +362,9 @@ impl Weights {
         let output = l.mat("output.weight")?;
         let output_norm = l.raw("output_norm.weight")?;
         let output_res_query = l.raw("output_res_query.weight")?;
+        for t in &g.tensors {
+            g.release(t);
+        }
         Ok(Self { host_bufs, token_embd, token_embd_fmt, token_embd_norm, output, output_norm, output_res_query, layers, cpu, bytes: l.bytes, bufs: l.bufs })
     }
 }

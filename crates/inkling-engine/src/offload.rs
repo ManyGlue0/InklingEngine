@@ -90,6 +90,36 @@ pub fn free_ram() -> Option<usize> {
     }
 }
 
+/// (peak, current) working set of this process (Windows; None elsewhere).
+pub fn working_set() -> Option<(usize, usize)> {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            peak_ws: usize,
+            ws: usize,
+            quota: [usize; 4],
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(p: isize, c: *mut Counters, cb: u32) -> i32;
+        }
+        let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 {
+            return Some((c.peak_ws, c.ws));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 /// Free VRAM as seen by the planner: the device's free memory, reduced by INKLING_VRAM_LIMIT (GiB) to what a card
 /// of that size with the same other usage would have.
 pub fn effective_free_vram(free: usize, total: usize) -> Result<usize> {

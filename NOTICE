@@ -15,7 +15,11 @@ Third-party material
    https://github.com/ggml-org/llama.cpp
    The forward-pass math (docs/MODEL.md), the vision preprocessing and the numerical
    expectations were derived from this implementation, which served as the correctness
-   reference. No llama.cpp source code is included. Its license notice follows:
+   reference. The codebook tables of the GGUF IQ quantization formats
+   (crates/inkling-cuda/kernels/codec_tables.cuh and crates/inkling-engine/src/codec_tables.rs)
+   are copied from ggml's ggml-common.h by tools/gen_codec_tables.py; they are part of the
+   format definitions. No other llama.cpp source code is included; the quantization formats
+   are decoded by code written for InklingEngine. Its license notice follows:
 
    MIT License
 

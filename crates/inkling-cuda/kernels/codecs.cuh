@@ -11,7 +11,7 @@
 
 namespace cdc {
 
-enum : int { Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20,
+enum : int { Q5_0 = 6, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20,
              IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, MXFP4 = 39, Q2_0 = 42 };
 
 struct G32 {
@@ -19,9 +19,9 @@ struct G32 {
     float s0, s1, m;
 };
 
-__host__ __device__ constexpr int blk_elems(int f) { return f == 20 || f == 39 ? 32 : f == 42 ? 64 : 256; }
+__host__ __device__ constexpr int blk_elems(int f) { return f == 20 || f == 39 || f == 6 ? 32 : f == 42 ? 64 : 256; }
 __host__ __device__ constexpr int blk_bytes(int f) {
-    return f == Q3_K ? 110 : f == Q4_K ? 144 : f == Q5_K ? 176 : f == Q6_K ? 210 : f == 16 ? 66 : f == 17 ? 74 : f == 18 ? 98
+    return f == 6 ? 22 : f == Q3_K ? 110 : f == Q4_K ? 144 : f == Q5_K ? 176 : f == Q6_K ? 210 : f == 16 ? 66 : f == 17 ? 74 : f == 18 ? 98
          : f == 19 ? 50 : f == 20 ? 18 : f == 21 ? 110 : f == 22 ? 82 : f == 23 ? 136 : f == 39 ? 17 : f == 42 ? 18 : 0;
 }
 __host__ __device__ inline size_t row_bytes(int f, int k) { return (size_t)(k / blk_elems(f)) * blk_bytes(f); }
@@ -296,6 +296,26 @@ __device__ __forceinline__ G32 g32_iq4_xs(const uint8_t* row, int g) {
     return r;
 }
 
+// Q5_0 (22 B per 32): d | qh u32 | 16 bytes; value l = (low nibble l | qh bit l << 4) - 16, value 16 + l from the
+// high nibble and qh bit 16 + l
+__device__ __forceinline__ G32 g32_q5_0(const uint8_t* row, int g) {
+    const uint8_t* b = row + (size_t)g * 22;
+    const uint32_t qh = ldu32(b + 2);
+    G32 r;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t v = ldu32(b + 6 + 4 * w);
+        const uint32_t hl = qh >> (4 * w), hh = qh >> (16 + 4 * w);
+        const uint32_t bl = (hl & 1) | ((hl & 2) << 7) | ((hl & 4) << 14) | ((hl & 8) << 21);
+        const uint32_t bh = (hh & 1) | ((hh & 2) << 7) | ((hh & 4) << 14) | ((hh & 8) << 21);
+        r.q[w] = (int)__vsub4((v & 0x0F0F0F0Fu) | (bl << 4), 0x10101010u);
+        r.q[w + 4] = (int)__vsub4(((v >> 4) & 0x0F0F0F0Fu) | (bh << 4), 0x10101010u);
+    }
+    r.s0 = r.s1 = h2f(ld16(b));
+    r.m = 0.0f;
+    return r;
+}
+
 // Q2_0 (Unsloth, 18 B per 64): d | 16 bytes of 2-bit values q, value = q - 1
 __device__ __forceinline__ G32 g32_q2_0(const uint8_t* row, int g) {
     const uint8_t* b = row + (size_t)(g >> 1) * 18;
@@ -314,6 +334,7 @@ __device__ __forceinline__ G32 g32_q2_0(const uint8_t* row, int g) {
 
 __device__ __forceinline__ G32 g32(int f, const uint8_t* row, int g) {
     switch (f) {
+        case Q5_0: return g32_q5_0(row, g);
         case Q3_K: return g32_q3_k(row, g);
         case Q4_K: return g32_q4_k(row, g);
         case Q5_K: return g32_q5_k(row, g);

@@ -6,6 +6,7 @@ use inkling_core::GgmlType;
 
 use crate::codec_tables::*;
 
+pub const Q5_0: u32 = 6;
 pub const Q3_K: u32 = 11;
 pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
@@ -31,7 +32,7 @@ pub struct G32 {
 
 /// Formats the generic kernels decode.
 pub fn supported(fmt: u32) -> bool {
-    matches!(fmt, Q3_K | Q4_K | Q5_K | Q6_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ4_NL | IQ4_XS | MXFP4 | Q2_0)
+    matches!(fmt, Q5_0 | Q3_K | Q4_K | Q5_K | Q6_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ4_NL | IQ4_XS | MXFP4 | Q2_0)
 }
 
 /// Bytes of one row of `k` values.
@@ -217,6 +218,17 @@ pub fn g32(fmt: u32, row: &[u8], g: usize) -> G32 {
                 r.q[l + 16] = KVALUES_IQ4NL[(qs[l] >> 4) as usize];
             }
             r.s0 = f16(b) * (ls as i32 - 32) as f32;
+            r.s1 = r.s0;
+        }
+        Q5_0 => {
+            // d | qh u32 | qs 16: value l = (low nibble of qs[l] | bit l of qh << 4) - 16, value 16 + l: high nibble, bit 16 + l
+            let b = &row[g * 22..];
+            let qh = u32le(&b[2..]);
+            for l in 0..16 {
+                r.q[l] = ((b[6 + l] & 15) | (((qh >> l) & 1) << 4) as u8) as i8 - 16;
+                r.q[l + 16] = ((b[6 + l] >> 4) | (((qh >> (l + 16)) & 1) << 4) as u8) as i8 - 16;
+            }
+            r.s0 = f16(b);
             r.s1 = r.s0;
         }
         Q2_0 => {

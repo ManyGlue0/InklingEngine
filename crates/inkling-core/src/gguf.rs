@@ -71,6 +71,7 @@ impl GgmlType {
 /// (elements, bytes) per block of the other quantized types the engine decodes natively (ggml-common.h layouts).
 fn quant_block(id: u32) -> Option<(usize, usize)> {
     Some(match id {
+        6 => (32, 22),    // Q5_0: d | qh u32 | qs 16
         10 => (256, 84),  // Q2_K
         11 => (256, 110), // Q3_K: hmask 32 | qs 64 | scales 12 | d
         12 => (256, 144), // Q4_K: d, dmin | scales 12 | qs 128
@@ -92,6 +93,7 @@ fn quant_block(id: u32) -> Option<(usize, usize)> {
 
 fn quant_name(id: u32) -> Option<&'static str> {
     Some(match id {
+        6 => "Q5_0",
         10 => "Q2_K",
         11 => "Q3_K",
         12 => "Q4_K",
@@ -289,6 +291,29 @@ impl Gguf {
 
     pub fn data(&self, t: &TensorInfo) -> &[u8] {
         &self.mmap[t.offset..t.offset + t.n_bytes]
+    }
+
+    /// Drop the tensor's file pages from this process's working set once it has been copied elsewhere (GPU or
+    /// pinned memory). Otherwise loading keeps the whole model file resident until the map closes, briefly
+    /// using as much RAM as the file is large on top of everything else. The pages stay in the OS file cache;
+    /// reading the tensor again just faults them back in.
+    pub fn release(&self, t: &TensorInfo) {
+        if t.n_bytes == 0 {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn VirtualUnlock(addr: *const std::ffi::c_void, size: usize) -> i32;
+            }
+            // VirtualUnlock on pages that are not locked removes them from the working set (returns an error)
+            unsafe { VirtualUnlock(self.mmap.as_ptr().add(t.offset) as *const std::ffi::c_void, t.n_bytes) };
+        }
+        #[cfg(unix)]
+        {
+            let _ = unsafe { self.mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, t.offset, t.n_bytes) };
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
