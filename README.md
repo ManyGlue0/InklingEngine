@@ -121,7 +121,7 @@ compute_75 PTX on the 3090; other GPUs have not been tested on real hardware yet
 
 ## Quick start
 
-InklingEngine is one program, `inkling`. Get it in one of two ways.
+InklingEngine is one program, `inkling`. Download it (Windows or Linux) or build it from source.
 
 ### Windows: download
 
@@ -132,6 +132,21 @@ InklingEngine is one program, `inkling`. Get it in one of two ways.
    the license files and `tools/chat.py`.
 4. `inkling.exe` is a command-line program: open a terminal in that folder (in Explorer, right-click > Open in
    Terminal) and run it as `.\inkling.exe`. Double-clicking it only flashes a window.
+
+### Linux: download
+
+Download `inkling-<version>-linux-x64.zip` from the same release page. It works on native Linux and under WSL2:
+
+```sh
+unzip inkling-<version>-linux-x64.zip
+cd inkling-<version>-linux-x64
+./inkling --version
+```
+
+- **Prerequisites:** only the NVIDIA driver (under WSL2, the Windows driver provides the GPU).
+- **Distribution:** built on Ubuntu 24.04, so it needs glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+).
+  On older distributions, build from source.
+- **What's inside:** the same files as the Windows zip, with `inkling` in place of `inkling.exe`.
 
 ### Any OS: build from source
 
@@ -164,7 +179,7 @@ If you would rather not install it, run `cargo build --release` instead and call
 **Download the model** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth):
 `Inkling-2-Mini-UD-Q4_K_XL.gguf`, plus `mmproj-F32.gguf` if you want image input.
 
-**Run it** (with the zip, type `.\inkling.exe` instead of `inkling`):
+**Run it** (from an unzipped release, type `.inkling.exe` on Windows or `./inkling` on Linux instead of `inkling`):
 
 ```sh
 # OpenAI-compatible server at http://127.0.0.1:8080/v1 (point any OpenAI client or chat UI at it)

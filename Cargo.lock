@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "inkling-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "inkling-core",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "inkling-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fancy-regex",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "inkling-cuda"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "inkling-engine"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "half",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "inkling-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
