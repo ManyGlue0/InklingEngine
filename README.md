@@ -1,9 +1,10 @@
 # InklingEngine
 
 A from-scratch inference engine for **Inkling 2 Mini** (Thinking Machines Lab) on NVIDIA GPUs: a Rust host, hand-written
-CUDA kernels, and nothing else. It runs the Unsloth GGUF directly (weights are repacked on load), serves an
-OpenAI-compatible API with reasoning, tool calls and image input, and fits a 384k-token context in 24 GB. On smaller
-GPUs (8 GB and up) it keeps part of the experts in system RAM and runs them on the CPU.
+CUDA kernels, and nothing else. It runs Unsloth's GGUFs directly, from UD-Q4_K_XL (16.4 GiB) down to UD-IQ1_S
+(7.2 GiB), with every quantization format decoded natively. It serves an OpenAI-compatible API with reasoning, tool
+calls and image input, and fits a 384k-token context in 24 GB. On smaller GPUs (8 GB and up) it keeps part of the
+experts in system RAM and runs them on the CPU.
 
 It is built for this one model. That focus is why it is fast: the looped 48-pass schedule, the depth attention,
 the short convolutions and the NVFP4 experts each get fused, specialized kernels.
@@ -31,11 +32,14 @@ On Linux the same card is faster: **135 tok/s** decode and **4,880 tok/s** at a 
 WSL2). The Windows driver model adds overhead to every CUDA graph launch.
 
 ### How correctness is checked
-Logits are compared against the reference llama.cpp implementation on the same GGUF. On an 807-token prompt with
-batched prefill:
-- median KL divergence is 6e-5;
-- top-1 agreement is 97%;
-- the mean KL (~0.018) comes almost entirely from router near-ties that flip an expert choice.
+Logits are compared against the reference llama.cpp implementation on the same GGUF, for every supported file
+(table under [Quantizations](#quantizations)). For UD-Q4_K_XL on an 873-token prompt with batched prefill:
+- median KL divergence is 3e-5;
+- top-1 agreement is 98.7%;
+- the mean KL (0.0037) comes almost entirely from router near-ties that flip an expert choice.
+
+Every weight format is also decoded three ways, by the CUDA kernels, the CPU path and gguf-py's reference
+dequantizers, and the results are bit-identical (`inkling codectest` + `tools/codec_oracle.py`).
 
 The vision encoder's projected embeddings match `llama-mtmd-debug` to about ±0.002, the difference between f16 and
 F32 GEMMs.
@@ -58,6 +62,29 @@ So `q8` and `q6` are at that floor and `q4` costs a little. At 32k tokens the ga
 
 The forward pass is specified in [docs/MODEL.md](docs/MODEL.md).
 
+### Quantizations
+All UD files of [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (the root folder,
+not `Mainline_Support`) run, except UD-Q8_K_XL, which stores weights in BF16. Each file mixes several formats
+(NVFP4, Q8_0, the K-quants, the IQ formats, MXFP4 and Unsloth's Q2_0). The engine decodes all of them in its own
+kernels, on the GPU and in the CPU offload path. Measured on the RTX 3090:
+
+| file | size | quality vs Q8_K_XL (Unsloth) | KL vs reference, decode / prefill | decode | prefill, 8k prompt |
+|---|---|---|---|---|---|
+| UD-Q4_K_XL | 16.4 GiB | KLD 0.0107, top-1 98.0% | 0.0039 / 0.0037 | 122 tok/s | 4,150 tok/s |
+| UD-Q4_K_M | 15.5 GiB | 0.0108, 97.9% | 0.0039 / 0.0037 | 118 tok/s | 4,080 tok/s |
+| UD-IQ4_XS | 14.7 GiB | 0.0109, 97.7% | 0.0038 / 0.0036 | 111 tok/s | 3,530 tok/s |
+| UD-Q3_K_XL | 12.7 GiB | 0.0174, 96.3% | 0.0041 / 0.0029 | 123 tok/s | 3,730 tok/s |
+| UD-IQ3_XXS | 10.9 GiB | 0.0269, 94.7% | 0.0042 / 0.0044 | 119 tok/s | 3,310 tok/s |
+| UD-Q2_K_XL | 8.5 GiB | 0.0595, 91.6% | 0.0054 / 0.0047 | 127 tok/s | 3,370 tok/s |
+| UD-IQ2_XXS | 7.9 GiB | 0.0726, 90.6% | 0.0054 / 0.0063 | 128 tok/s | 3,210 tok/s |
+| UD-IQ1_M | 7.5 GiB | 0.0867, 90.2% | 0.0053 / 0.0053 | 132 tok/s | 3,400 tok/s |
+| UD-IQ1_S | 7.2 GiB | 0.0911, 89.4% | 0.0046 / 0.0038 | 134 tok/s | 3,230 tok/s |
+
+The quality column is Unsloth's measurement of each file against their largest one: it is the cost of the quant
+itself. The KL column checks this engine against the reference llama.cpp on the same file: it should stay small for
+every row, and it does. Q4_K_M and IQ4_XS are as good as Q4_K_XL and smaller; Q3_K_XL is the best trade-off for
+16 GB cards; the 1- and 2-bit files lose noticeably more, and the three smallest fit a 12 GB card entirely.
+
 ### Smaller GPUs: CPU offload
 When the model and context do not fit in free VRAM, `inkling` keeps the experts of some MoE layers in system RAM
 and runs them on the CPU (AVX2, all cores). Every token reads only 8 of each layer's 128 experts, so a layer on the
@@ -68,20 +95,31 @@ in this order:
 
 During prompt processing the offloaded experts stream to the GPU over PCIe in groups, overlapped with compute.
 
-Measured on the RTX 3090 with its memory capped by `INKLING_VRAM_LIMIT` (Ryzen 9 5950X, dual-channel DDR4-3200).
-A real smaller card has a slower GPU as well, but most of the time goes to the CPU part:
+Decode speed in tok/s, measured on the RTX 3090 with its memory capped by `INKLING_VRAM_LIMIT` (Ryzen 9 5950X,
+dual-channel DDR4-3200, 4k context). A real smaller card has a slower GPU as well, but most of the time goes to the
+CPU part. In brackets: GiB of experts kept in system RAM.
 
-| VRAM | layers on the CPU | experts in RAM | decode | prefill, 8k prompt |
-|---|---|---|---|---|
-| 24 GB | 0 | 0 | 118 tok/s | 4,050 tok/s |
-| 16 GB | 5–6 | 4.6–5.1 GiB | 59 tok/s | 3,000 tok/s |
-| 12 GB | 13 | 8.8 GiB | 34 tok/s | |
-| 8 GB | 20–21 | 12.6–13.1 GiB | 19 tok/s | 1,600 tok/s |
+| file | 24 GB | 16 GB | 12 GB | 10 GB | 8 GB |
+|---|---|---|---|---|---|
+| UD-Q4_K_XL | 122 | 56 (5.1) | 36 (8.8) | 24 (11.0) | 19 (13.1) |
+| UD-Q4_K_M | 118 | 62 (3.6) | 37 (7.9) | 26 (9.5) | 21 (11.6) |
+| UD-IQ4_XS | 111 | 45 (2.9) | 33 (6.7) | 24 (8.8) | 19 (10.9) |
+| UD-Q3_K_XL | 123 | 86 (1.0) | 33 (5.1) | 24 (7.2) | 20 (8.8) |
+| UD-IQ3_XXS | 119 | 127 | 43 (3.2) | 29 (5.1) | 16 (7.2) |
+| UD-Q2_K_XL | 127 | 136 | 88 (0.8) | 40 (2.8) | 20 (4.9) |
+| UD-IQ2_XXS | 128 | 133 | 135 | 47 (2.2) | 23 (4.4) |
+| UD-IQ1_M | 132 | 137 | 139 | 49 (1.7) | 25 (3.7) |
+| UD-IQ1_S | 134 | 139 | 142 | 50 (1.6) | 25 (3.6) |
 
-Decode speed with offload is set by system RAM bandwidth (~38 GB/s here); faster RAM or more channels help
-directly. The planner measures free VRAM *and* free system RAM before loading and refuses, with a message, when
-the offloaded experts plus 2 GiB of headroom do not fit in RAM. So an 8 GB card needs about 16 GB of free RAM,
-which in practice means a 32 GB machine. `--offload off` disables offloading, `--offload N` forces N layers.
+Prompt processing with offload: about 3,000 tok/s on 16 GB and 1,600 tok/s on 8 GB for UD-Q4_K_XL (8k prompt).
+
+With NVFP4 and Q8_0 experts, offloaded decode is bound by system RAM bandwidth (~38 GB/s here): faster RAM or more
+channels help directly. The IQ formats read fewer bytes but take more CPU work to decode, so on 8 GB the small files
+are only a little faster than UD-Q4_K_M. What they change is how much fits: a 12 GB card runs UD-IQ2_XXS, UD-IQ1_M and
+UD-IQ1_S entirely on the GPU, and the small files need much less system RAM. The planner measures free VRAM *and* free system RAM before loading and refuses, with a message, when
+the offloaded experts plus 2 GiB of headroom do not fit in RAM. With UD-Q4_K_XL an 8 GB card needs about 15 GB of
+free RAM, in practice a 32 GB machine; with UD-IQ1_M about 6 GB. Loading itself stays light: each layer's file pages
+are released once the layer is uploaded, so a load peaks around 2.5 GB of RAM plus the offloaded experts. `--offload off` disables offloading, `--offload N` forces N layers.
 
 The KV cache always stays in VRAM, so on a small card the context competes with the experts. A smaller `--ctx` (the
 server defaults to 131072) or `--kv q4` leaves room for more experts on the GPU and makes decode faster. The table
@@ -107,12 +145,13 @@ On a CPU without AVX2 a scalar fallback runs, much slower.
   At startup `inkling` checks the free VRAM (device-wide, as `nvidia-smi` reports it) and the free system RAM, and
   refuses to load, with a message, when the model and context do not fit, for example while another instance is
   running. Otherwise Windows would page the overflow into system RAM and stall the machine.
-- **System RAM:** with offload, enough free RAM for the offloaded experts plus 2 GiB (about 16 GB free for an 8 GB
-  card, 11 GB for 12 GB, 7 GB for 16 GB).
+- **System RAM:** with offload, enough free RAM for the offloaded experts plus 2 GiB (bracketed numbers in the
+  offload table; with UD-Q4_K_XL about 15 GB free for an 8 GB card, 11 GB for 12 GB, 7 GB for 16 GB).
 - **Driver:** a recent NVIDIA driver with CUDA 12.8+ support. Only the driver is needed to run; the toolkit is
   needed only to build.
-- **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): `Inkling-2-Mini-UD-Q4_K_XL.gguf`
-  and, for images, `mmproj-F32.gguf`. Only UD-Q4_K_XL has been tested.
+- **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): any UD file in the root folder
+  except UD-Q8_K_XL (see [Quantizations](#quantizations); UD-Q4_K_XL is the default choice, UD-Q3_K_XL for 16 GB
+  cards) and, for images, `mmproj-F32.gguf`. All nine were checked against the reference llama.cpp.
 - **To build:** Rust 1.85 or newer, and the CUDA Toolkit 12.x (`nvcc` on PATH or `CUDA_PATH` set).
 
 Tested with an RTX 3090 on Windows 11 and on Ubuntu 24.04 under WSL2: build, generation, server and image input.
@@ -263,6 +302,8 @@ Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python t
 | `INKLING_KV`, `INKLING_KV_K`, `INKLING_KV_V` | KV cache type, as `--kv` / `--kv-k` / `--kv-v` |
 | `INKLING_OFFLOAD` | as `--offload` |
 | `INKLING_CPU_THREADS` | CPU expert threads (default: physical cores, at most 16) |
+| `INKLING_CPU_PIN=1` | pin CPU expert threads to physical cores (Windows; faster in isolation, slower in practice) |
+| `INKLING_NO_PIN=1` | keep offloaded experts in ordinary instead of pinned memory |
 | `INKLING_VRAM_LIMIT`, `INKLING_RAM_LIMIT` | plan as if only that many GiB were free (simulate a smaller machine) |
 | `INKLING_TEMP`, `INKLING_TOP_P`, `INKLING_TOP_K`, `INKLING_MIN_P`, `INKLING_SEED` | sampling for `inkling generate` |
 | `INKLING_REPEAT_PENALTY`, `INKLING_PRESENCE_PENALTY`, `INKLING_FREQUENCY_PENALTY`, `INKLING_REPEAT_LAST_N` | penalties for `inkling generate` |
@@ -270,10 +311,10 @@ Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python t
 | `INKLING_CUDA_ARCHS` | build time: target architectures (default `native`) |
 
 Developer commands:
-- **Benchmarks:** `bench`, `benchpp`, `benchctx`.
-- **Benchmarks:** `attnbench` (decode attention on a synthetic cache).
+- **Benchmarks:** `bench`, `benchpp`, `benchctx`, `attnbench` (decode attention on a synthetic cache).
 - **Correctness:** `validate` against reference dumps, `kvstudy`, `cachetest`, `rendertest`, `gemmtest`, `visiontest`,
-  `cpumoetest` (CPU experts against the GPU kernel).
+  `cpumoetest` (CPU experts against the GPU kernel), `codectest` (every weight format: CUDA vs CPU decoders; then
+  `python tools/codec_oracle.py` compares with gguf-py).
 - **Diagnostics:** `vraminfo` prints total and usable VRAM.
 
 ## How it works
@@ -306,7 +347,8 @@ Developer commands:
 ## Limitations
 
 - **Single stream:** one request at a time, no batching across requests.
-- **One model:** Inkling 2 Mini only.
+- **One model:** Inkling 2 Mini only, in the UD GGUFs of Unsloth's root folder (not UD-Q8_K_XL, which uses BF16
+  weights, and not the `Mainline_Support` layout).
 - **Offload:** only the MoE experts move to the CPU; the rest of the model (about 3.3 GiB) and the KV cache stay in
   VRAM.
 - **Hardware:** NVIDIA GPUs only. Native FP4 tensor cores on Blackwell are not used yet; NVFP4 is decoded in
@@ -318,8 +360,9 @@ Developer commands:
 - **Inkling 2 Mini** by [Thinking Machines Lab](https://thinkingmachines.ai) (Apache-2.0).
 - **GGUF conversion and quantization** by [Unsloth](https://unsloth.ai).
 - **Reference implementation:** [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), Unsloth's Inkling 2
-  branch. It was used as the numerical reference and as the source of the model and preprocessing semantics. No
-  llama.cpp code is included; its license notice is reproduced in [NOTICE](NOTICE).
+  branch. It was used as the numerical reference and as the source of the model, preprocessing and quantization
+  format semantics. The only material taken from it is the codebook tables of the IQ formats (generated from
+  `ggml-common.h` by `tools/gen_codec_tables.py`); its license notice is reproduced in [NOTICE](NOTICE).
 - **Chat template** (`tests/data/chat_template.jinja`, a test oracle) is the model's own, from the Inkling 2 Mini
   release (Apache-2.0).
 
