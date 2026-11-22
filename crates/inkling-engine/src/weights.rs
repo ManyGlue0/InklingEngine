@@ -34,6 +34,51 @@ impl ExpertFmt {
     }
 }
 
+/// Host memory for offloaded experts: pinned and GPU-mapped when the driver grants it (fast asynchronous copies
+/// for prompt processing), else ordinary pageable memory (the CPU path is the same; copies are slower).
+pub enum HostMem {
+    Pinned(HostMapped),
+    Plain(Vec<u8>),
+}
+
+impl HostMem {
+    fn alloc(gpu: &Gpu, bytes: usize, what: &str) -> Result<Self> {
+        // INKLING_NO_PIN=1 skips pinning (tests the fallback)
+        let pinned = if std::env::var_os("INKLING_NO_PIN").is_some() { Err(anyhow::anyhow!("pinning disabled")) } else { gpu.alloc_host_mapped_uninit(bytes) };
+        match pinned {
+            Ok(h) => Ok(HostMem::Pinned(h)),
+            Err(_) => {
+                let mut v = Vec::new();
+                v.try_reserve_exact(bytes).map_err(|_| anyhow::anyhow!("not enough system RAM for {} MiB of {what}", bytes >> 20))?;
+                v.resize(bytes, 0);
+                Ok(HostMem::Plain(v))
+            }
+        }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            HostMem::Pinned(h) => h.as_mut_slice(),
+            HostMem::Plain(v) => v.as_mut_slice(),
+        }
+    }
+    pub fn host_ptr(&mut self) -> *mut u8 {
+        match self {
+            HostMem::Pinned(h) => h.host_ptr(),
+            HostMem::Plain(v) => v.as_mut_ptr(),
+        }
+    }
+    /// device address of the mapping (0 for pageable memory: kernels cannot read it)
+    pub fn dev(&self) -> u64 {
+        match self {
+            HostMem::Pinned(h) => h.dev,
+            HostMem::Plain(_) => 0,
+        }
+    }
+    pub fn pinned(&self) -> bool {
+        matches!(self, HostMem::Pinned(_))
+    }
+}
+
 /// Slack after natively stored weights: the generic kernels' unaligned 32-bit loads may read past the last block.
 pub const NATIVE_PAD: usize = 64;
 
@@ -105,7 +150,7 @@ pub struct LayerW {
 pub struct Weights {
     pub bufs: HashMap<String, DevBuf>,
     /// tensors kept in pinned host memory that kernels read over PCIe (token embeddings: one row per token)
-    pub host_bufs: Vec<HostMapped>,
+    pub host_bufs: Vec<HostMem>,
     pub token_embd: u64,
     /// ggml type id of the embedding table (8 = Q8_0)
     pub token_embd_fmt: i32,
@@ -226,7 +271,7 @@ impl Loader<'_> {
 
     /// Expert tensor repacked into pinned host memory (CPU offload). The returned ExpM points at the mapped planes
     /// (a GPU kernel can still read them over PCIe); the per-expert scales are also uploaded.
-    fn experts_host(&mut self, name: &str, scale: &str, host: &mut Vec<HostMapped>) -> Result<(ExpM, CpuExp, Option<Vec<f32>>)> {
+    fn experts_host(&mut self, name: &str, scale: &str, host: &mut Vec<HostMem>) -> Result<(ExpM, CpuExp, Option<Vec<f32>>)> {
         let t = self.g.require(name)?;
         ensure!(t.dims.len() == 3, "{name}: expected 3-D expert tensor");
         let (k, rows, e) = (t.dims[0] as usize, t.dims[1] as usize, t.dims[2] as usize);
@@ -238,18 +283,19 @@ impl Loader<'_> {
         };
         if let ExpertFmt::Native(_) = fmt {
             // native layout: one plane, a pinned copy of the file's blocks (plus slack)
-            let mut hq = self.gpu.alloc_host_mapped(t.n_bytes + NATIVE_PAD).with_context(|| format!("pinning {} MiB of system RAM for {name}", t.n_bytes >> 20))?;
+            let mut hq = HostMem::alloc(self.gpu, t.n_bytes + NATIVE_PAD, name)?;
             hq.as_mut_slice()[..t.n_bytes].copy_from_slice(self.g.data(t));
+            hq.as_mut_slice()[t.n_bytes..].fill(0);
             let scale_dev = self.raw_opt(scale)?;
             let scale_host = if self.g.tensor(scale).is_some() { Some(f32_rows(self.g, scale)?) } else { None };
-            let m = ExpM { qs: hq.dev, sc: 0, scale: scale_dev, fmt };
+            let m = ExpM { qs: hq.dev(), sc: 0, scale: scale_dev, fmt };
             let c = CpuExp { qs: hq.host_ptr(), sc: std::ptr::null(), fmt, rows, k };
             host.push(hq);
             return Ok((m, c, scale_host));
         }
         let qb = if fmt == ExpertFmt::Nvfp4 { rows * e * k / 2 } else { rows * e * k };
-        let mut hq = self.gpu.alloc_host_mapped_uninit(qb).with_context(|| format!("pinning {} MiB of system RAM for {name}", qb >> 20))?;
-        let mut hs = self.gpu.alloc_host_mapped_uninit(rows * e * k / 16).with_context(|| format!("pinning system RAM for {name}"))?;
+        let mut hq = HostMem::alloc(self.gpu, qb, name)?;
+        let mut hs = HostMem::alloc(self.gpu, rows * e * k / 16, name)?;
         match fmt {
             ExpertFmt::Nvfp4 => repack::nvfp4_soa_into(self.g.data(t), rows * e, k, hq.as_mut_slice(), hs.as_mut_slice())?,
             ExpertFmt::Q8_0 => repack::q8_soa_into(self.g.data(t), rows * e, k, hq.as_mut_slice(), hs.as_mut_slice())?,
@@ -257,7 +303,7 @@ impl Loader<'_> {
         }
         let scale_dev = self.raw_opt(scale)?;
         let scale_host = if self.g.tensor(scale).is_some() { Some(f32_rows(self.g, scale)?) } else { None };
-        let m = ExpM { qs: hq.dev, sc: hs.dev, scale: scale_dev, fmt };
+        let m = ExpM { qs: hq.dev(), sc: hs.dev(), scale: scale_dev, fmt };
         let c = CpuExp { qs: hq.host_ptr(), sc: hs.host_ptr(), fmt, rows, k };
         host.push(hq);
         host.push(hs);
@@ -349,11 +395,12 @@ impl Weights {
         let te = g.require("token_embd.weight")?;
         let token_embd_fmt = te.ty.id() as i32;
         ensure!(te.ty == GgmlType::Q8_0 || crate::codecs::supported(te.ty.id()), "token_embd: type {} is not supported yet", te.ty.name());
-        let token_embd = if embed_on_host() {
-            let mut h = gpu.alloc_host_mapped(te.n_bytes + NATIVE_PAD)?;
+        // the GPU reads it over PCIe, so it must be pinned; if the driver refuses, keep it in VRAM instead
+        let pinned_embd = if embed_on_host() { gpu.alloc_host_mapped(te.n_bytes + NATIVE_PAD).ok() } else { None };
+        let token_embd = if let Some(mut h) = pinned_embd {
             h.as_mut_slice()[..te.n_bytes].copy_from_slice(g.data(te));
             let p = h.dev;
-            host_bufs.push(h);
+            host_bufs.push(HostMem::Pinned(h));
             p
         } else {
             l.put_padded("token_embd.weight".to_owned(), g.data(te))?

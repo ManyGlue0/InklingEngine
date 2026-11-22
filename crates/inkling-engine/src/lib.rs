@@ -402,6 +402,10 @@ impl Engine {
                 eprintln!("ram: process working set {:.2} GiB (peak during load {:.2} GiB)", now as f64 / (1u64 << 30) as f64, peak as f64 / (1u64 << 30) as f64);
             }
         }
+        let pageable: usize = w.host_bufs.iter().filter(|h| !h.pinned()).count();
+        if pageable > 0 {
+            eprintln!("note: the driver refused to pin part of the offloaded experts; using ordinary memory for {pageable} buffers (prompt processing is slower)");
+        }
         if let Some(c) = &cpu {
             let layers: Vec<String> = (0..cfg.n_phys).filter(|&i| c.plan.on_cpu[i]).map(|i| i.to_string()).collect();
             eprintln!(
@@ -532,6 +536,7 @@ impl Engine {
     /// (layer, relative RMS error, max |y|).
     pub fn test_cpu_moe(&self, trials: usize) -> Result<Vec<(usize, f32, f32)>> {
         let c = self.cpu.as_ref().context("no layer is offloaded (use --offload N)")?;
+        ensure!(self.w.host_bufs.iter().all(|h| h.pinned()), "cpumoetest needs pinned (GPU-mapped) expert memory");
         let (d, f, k) = (self.cfg.n_embd, self.cfg.n_ff_exp, self.cfg.n_expert_used);
         let mut seed = 0x9E3779B97F4A7C15u64;
         let mut rnd = move || {
