@@ -235,6 +235,58 @@ inkling generate path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf "The three largest moons
 
 Running `inkling` with no arguments lists every command.
 
+### Benchmark
+
+`inkling bench` measures prompt processing and decode speed on your GPU, at the context depths you choose:
+
+```sh
+# decode speed on an empty context (under a minute, most of it loading the model)
+inkling bench path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf
+
+# prompt and decode speed at 8k and 32k tokens, comparing 4-bit and 6-bit KV caches
+inkling bench path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf --fill 0,8k,32k --kv q4,q6
+
+# the full 1M-token context
+inkling bench path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 1M --fill 0,128k,512k,1M --kv q4
+```
+
+The last one on the RTX 3090. The 9 GiB cache of a 1M context leaves too little VRAM for all the experts, so 7 MoE
+layers run on the CPU:
+
+```
+note: --fill 1M is capped to 1048447 tokens so that the 128 decoded tokens fit in --ctx 1048576
+Inkling-2-Mini-UD-Q4_K_XL, context 1M (1048576 tokens), 128 decoded tokens at each depth
+CPU offload: 7 of 24 MoE layers run on the CPU (5.6 GiB of experts in system RAM: layers 5,18,19,20,21,22,23; 16 threads, AVX2)
+
+KV q4: 9.0 KiB/token, 9.00 GiB at this context | loaded in 14.3 s, VRAM in use 23.0 / 24.0 GiB (NVIDIA GeForce RTX 3090)
+    depth  prompt                                  decode
+        0                                          52.7 tok/s
+     128k  0→128k: 1960 tok/s in 66.9 s            46.9 tok/s
+     512k  128k→512k: 883 tok/s in 445.2 s         41.2 tok/s
+       1M  512k→1M: 451 tok/s in 1163.1 s          33.4 tok/s
+  CPU experts: 1457 us per layer visit (3612 visits)
+```
+
+How it works:
+- **`--fill`:** the depths to measure at (default `0`). They are filled in one pass. The prompt is prefilled to the
+  first depth and `--gen` tokens are decoded there. The prefill then continues from the cache to the next depth.
+  - Each row shows the prompt speed of the segment that ended at that depth and the decode speed there.
+  - Prompt speed falls with depth because every new token attends to all the earlier ones. Filling 1M from empty
+    takes about 28 minutes on the 3090.
+- **`--ctx`:** the context to allocate. Default: just enough for the deepest fill.
+  - The context decides how much VRAM the cache takes, and so whether experts move to the CPU. To measure the setup
+    you will serve with, pass the same `--ctx` as `inkling serve`.
+  - If the deepest fill plus `--gen` does not fit, that depth is shortened by a few tokens, as in the note above.
+- **`--kv`:** the KV cache type (default `q6`), `K:V` for separate key and value types (`q8:q4`), or a comma list
+  such as `q4,q6`. With a list, the model is reloaded for each entry and a table comparing their decode speeds closes
+  the run.
+- **`--gen N`:** tokens decoded at each depth (default 128, at most 2,000).
+- **`--offload`:** as for `serve`.
+- **Sizes:** `k` = 1,024 and `M` = 1,048,576 tokens, so `128k` = 131,072. Plain numbers work too.
+
+The filler text is built into the binary. Speed does not depend on what the text says, so results are comparable
+across machines.
+
 ### Build options
 
 The kernels are compiled into the binary.
@@ -255,8 +307,8 @@ Server flags:
 | flag | default |
 |---|---|
 | `--host`, `--port` | `127.0.0.1`, `8080` |
-| `--ctx N` | `131072` (max ~262144 on 24 GB, ~393216 with `--kv q4`) |
-| `--kv q4\|q6\|q8\|f16`, `--kv-k`, `--kv-v` | `q6` (KV cache type; also on `generate` and the benchmarks) |
+| `--ctx N` | `131072` (all on the GPU of a 24 GB card: up to ~262144, ~393216 with `--kv q4`; beyond that, up to 1M, some experts move to the CPU) |
+| `--kv q4\|q6\|q8\|f16`, `--kv-k`, `--kv-v` | `q6` (KV cache type, `K:V` such as `q8:q4` for separate types; also on `generate` and `bench`) |
 | `--offload auto\|off\|all\|N` | `auto` (MoE layers on the CPU only when VRAM is short) |
 | `--mmproj FILE` | none (enables image input) |
 | `--api-key KEY` (or `INKLING_API_KEY`) | none |
@@ -311,7 +363,7 @@ Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python t
 | `INKLING_CUDA_ARCHS` | build time: target architectures (default `native`) |
 
 Developer commands:
-- **Benchmarks:** `bench`, `benchpp`, `benchctx`, `attnbench` (decode attention on a synthetic cache).
+- **Benchmarks:** `bench` (see above), `attnbench` (decode attention on a synthetic cache).
 - **Correctness:** `validate` against reference dumps, `kvstudy`, `cachetest`, `rendertest`, `gemmtest`, `visiontest`,
   `cpumoetest` (CPU experts against the GPU kernel), `codectest` (every weight format: CUDA vs CPU decoders; then
   `python tools/codec_oracle.py` compares with gguf-py).

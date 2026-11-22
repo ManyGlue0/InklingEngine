@@ -21,6 +21,22 @@ fn main() -> Result<()> {
             if var == "INKLING_OFFLOAD" {
                 let ok = matches!(v.to_ascii_lowercase().as_str(), "auto" | "off" | "none" | "all") || v.parse::<usize>().is_ok();
                 ensure!(ok, "--offload: expected auto, off, all or a number of layers, got `{v}`");
+            } else if var == "INKLING_KV" && (v.contains(',') || v.contains(':')) {
+                // `--kv q8:q4` sets keys and values; `--kv q4,q6` is a list (bench runs each)
+                for kv in v.split(',') {
+                    parse_kv_pair(kv)?;
+                }
+                // SAFETY: single-threaded at this point, before any engine or server thread starts
+                unsafe {
+                    if v.contains(',') {
+                        std::env::set_var("INKLING_KV_LIST", &v);
+                    } else {
+                        let (k, val) = v.split_once(':').unwrap();
+                        std::env::set_var("INKLING_KV_K", k);
+                        std::env::set_var("INKLING_KV_V", val);
+                    }
+                }
+                continue;
             } else {
                 inkling_engine::KvType::parse(&v)?;
             }
@@ -29,6 +45,9 @@ fn main() -> Result<()> {
         } else {
             args.push(a);
         }
+    }
+    if std::env::var_os("INKLING_KV_LIST").is_some() && args.first().map(String::as_str) != Some("bench") {
+        bail!("a list of KV types (--kv q4,q6) only works with bench; give one type, or K:V such as q8:q4");
     }
     match args.first().map(String::as_str) {
         Some("smoke") => smoke(),
@@ -46,14 +65,12 @@ fn main() -> Result<()> {
         Some("codectest") if args.len() > 1 => codectest(&args[1], args.get(2).map(String::as_str).unwrap_or("codectest-out")),
         Some("cpumoetest") if args.len() > 1 => cpumoetest(&args[1]),
         Some("kvstudy") if args.len() > 1 => kvstudy(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32768)),
-        Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
         Some("cachetest") if args.len() > 1 => cachetest(&args[1]),
         Some("attnbench") if args.len() > 1 => attnbench(args[1].parse()?, args.get(2).map(String::as_str).unwrap_or("q6"), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200)),
         Some("rendertest") if args.len() > 1 => rendertest(&args[1]),
         Some("visiontest") if args.len() > 2 => visiontest(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(400)),
         Some("serve") if args.len() > 1 => serve(&args[1], &args[2..]),
-        Some("benchpp") if args.len() > 1 => benchpp(&args[1], args.get(2).and_then(|s| s.parse().ok())),
-        Some("bench") if args.len() > 1 => bench(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256)),
+        Some("bench") if args.len() > 1 => bench(&args[1], &args[2..]),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
         Some("--version" | "-V" | "version") => {
             println!("inkling {}", env!("CARGO_PKG_VERSION"));
@@ -65,10 +82,10 @@ fn main() -> Result<()> {
              \x20 inkling serve <model.gguf> [--mmproj FILE] [--ctx N] [--host H] [--port P] [--api-key KEY] [--model-id NAME]\n\
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
-             \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6),\n\
-             \x20 or --kv-k / --kv-v to set keys and values separately, and --offload auto|off|all|N (MoE layers\n\
-             \x20 kept in system RAM and run on the CPU when the GPU is too small; default auto)\n\
-             \x20 inkling bench <model.gguf> [n] | benchpp <model.gguf> [n] | benchctx <model.gguf> <n>\n\
+             \x20 inkling bench <model.gguf> [--ctx N] [--fill 0,128k,512k,1M] [--kv q4,q6] [--gen N]\n\
+             \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6; K:V such\n\
+             \x20 as q8:q4 sets keys and values separately) and --offload auto|off|all|N (MoE layers kept in\n\
+             \x20 system RAM and run on the CPU when the GPU is too small; default auto)\n\
              \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | vraminfo | smoke | --version\n\n\
              developer checks: validate, kvstudy, cachetest, rendertest, gemmtest, visiontest (see README)",
             env!("CARGO_PKG_VERSION")
@@ -317,35 +334,6 @@ fn kvstudy(model: &str, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Long context: load with a 256k context, prefill `n` tokens of repository text, then decode 64 tokens at that
-/// depth. Reports VRAM in use, prompt and decode throughput.
-fn benchctx(model: &str, n: usize) -> Result<()> {
-    let ctx: usize = std::env::var("INKLING_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(262144);
-    let mut eng = inkling_engine::Engine::load(model, ctx)?;
-    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
-    let (free, total) = inkling_cuda::cudarc::driver::result::mem_get_info()?;
-    println!("context {ctx}: VRAM in use {:.2} / {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
-    let mut src = String::new();
-    for f in ["docs/MODEL.md", "README.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-engine/src/lib.rs", "crates/inkling-cuda/kernels/decode.cu"] {
-        src.push_str(&std::fs::read_to_string(f).unwrap_or_default());
-    }
-    let base = tok.encode(&src, false)?;
-    let ids: Vec<u32> = base.iter().cycle().take(n).copied().collect();
-    let t0 = Instant::now();
-    let mut first = None;
-    let out = eng.generate(&ids, 65, &inkling_engine::Sampling::greedy(), |_| {
-        if first.is_none() {
-            first = Some(t0.elapsed().as_secs_f64());
-        }
-        true
-    })?;
-    let total_s = t0.elapsed().as_secs_f64();
-    let ttft = first.unwrap();
-    let m = out.len() - 1;
-    println!("prompt {n} tok: {:.0} tok/s ({:.2} s) | decode {m} tok at depth {n}: {:.1} tok/s", n as f64 / ttft, ttft, m as f64 / (total_s - ttft));
-    Ok(())
-}
-
 /// Prompt caching must not change results: cached continuations vs fresh runs (greedy), plus sampling.
 fn cachetest(model: &str) -> Result<()> {
     let mut eng = inkling_engine::Engine::load(model, 8192)?;
@@ -429,54 +417,172 @@ fn serve(model: &str, flags: &[String]) -> Result<()> {
     inkling_server::serve(model, opts)
 }
 
-/// Prompt-processing throughput of the batched prefill at several prompt lengths.
-fn benchpp(model: &str, only: Option<usize>) -> Result<()> {
-    let mut eng = inkling_engine::Engine::load(model, 16384)?;
-    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
-    let text = std::fs::read_to_string("tests/data/prompt_long.txt").unwrap_or_else(|_| "The quick brown fox jumps over the lazy dog. ".repeat(50));
-    let base = tok.encode(&text, true)?;
-    for n in only.map_or(vec![128usize, 512, 2048, 8192], |n| vec![n]) {
-        let ids: Vec<u32> = base.iter().cycle().take(n).copied().collect();
-        eng.prefill_fresh(&ids)?; // warm-up
-        eng.gpu.sync()?;
-        let reps = (4096 / n).max(1);
-        let t0 = Instant::now();
-        for _ in 0..reps {
-            eng.prefill_fresh(&ids)?;
-        }
-        eng.gpu.sync()?;
-        let s = t0.elapsed().as_secs_f64() / reps as f64;
-        println!("pp{n}: {:.0} tok/s ({:.1} ms)", n as f64 / s, s * 1e3);
-    }
-    Ok(())
+/// A KV cache spec: one type for keys and values ("q6") or K:V ("q8:q4").
+fn parse_kv_pair(s: &str) -> Result<(inkling_engine::KvType, inkling_engine::KvType)> {
+    use inkling_engine::KvType;
+    Ok(match s.split_once(':') {
+        Some((k, v)) => (KvType::parse(k)?, KvType::parse(v)?),
+        None => (KvType::parse(s)?, KvType::parse(s)?),
+    })
 }
 
-/// Throughput with the device-side loop: prompt processing + greedy decode of `n` tokens, no printing.
-fn bench(model: &str, n: usize) -> Result<()> {
-    let mut eng = inkling_engine::Engine::load(model, 4096)?;
-    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
-    let ids = tok.encode("<|message_user|><|content_text|>Write a long story about a lighthouse keeper.<|end_message|><|message_model|><|content_text|>", true)?;
-    eng.generate(&ids, 4, &inkling_engine::Sampling::greedy(), |_| true)?; // warm-up: capture the graphs
-    let t0 = Instant::now();
-    eng.generate(&ids, 1, &inkling_engine::Sampling::greedy(), |_| true)?;
-    let pre = t0.elapsed().as_secs_f64();
-    let t1 = Instant::now();
-    let out = eng.generate(&ids, n, &inkling_engine::Sampling::greedy(), |_| true)?;
-    let total = t1.elapsed().as_secs_f64();
-    let dec = (total - pre).max(1e-9);
-    let m = out.len() - 1;
-    println!("prompt {} tok: {:.1} tok/s | decode {m} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, m as f64 / dec, dec * 1e3 / m as f64);
-    if let Some((calls, us)) = eng.cpu_moe_stats() {
-        println!("CPU experts: {calls} layer visits, {us:.0} us each");
+/// A token count, plain ("131072") or with a binary suffix ("128k" = 131072, "1M" = 1048576, "1.5M").
+fn parse_tokens(s: &str) -> Result<usize> {
+    let t = s.trim().to_ascii_lowercase();
+    let (num, mul) = if let Some(n) = t.strip_suffix('k') {
+        (n, 1024.0)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 1048576.0)
+    } else {
+        (t.as_str(), 1.0)
+    };
+    let v: f64 = num.parse().map_err(|_| anyhow::anyhow!("`{s}` is not a token count (examples: 4096, 128k, 1M)"))?;
+    ensure!(v.is_finite() && v >= 0.0, "`{s}` is not a token count");
+    Ok((v * mul).round() as usize)
+}
+
+/// 131072 -> "128k", 1048576 -> "1M", other counts as plain numbers.
+fn fmt_tokens(n: usize) -> String {
+    if n >= 1 << 20 && n % (1 << 20) == 0 {
+        format!("{}M", n >> 20)
+    } else if n >= 1024 && n % 1024 == 0 {
+        format!("{}k", n >> 10)
+    } else {
+        n.to_string()
     }
-    if eng.moe_tl.is_some() {
-        for slot in [10usize, 21] {
-            let tl = eng.moe_timeline(slot)?;
-            let t0 = tl.iter().map(|r| r[0]).min().unwrap();
-            let rel = |k: usize, f: fn(u64, u64) -> u64| tl.iter().map(|r| r[k] - t0).fold(if f(0, 1) == 0 { u64::MAX } else { 0 }, f) as f64 / 1e3;
-            print!("moe timeline slot {slot} (us, min..max over blocks):");
-            for (k, name) in ["start", "staged", "A done", "barrier", "h staged", "end"].iter().enumerate() {
-                print!(" {name} {:.1}..{:.1} |", rel(k, u64::min), rel(k, u64::max));
+}
+
+/// Speed at chosen context depths, for one or more KV cache types:
+/// inkling bench <model> [--ctx N] [--fill 0,128k,512k,1M] [--kv q4,q6] [--gen N].
+/// Each KV type loads the engine once and fills the context in a single pass: prefill to the first depth, decode
+/// `gen` tokens there, continue the prefill from the cached state to the next depth, and so on. Reports the prompt
+/// speed of each prefill segment and the decode speed at each depth.
+fn bench(model: &str, flags: &[String]) -> Result<()> {
+    use inkling_engine::{KvType, Sampling};
+    let (mut ctx, mut fill, mut n_gen) = (None, vec![0usize], 128usize);
+    let mut it = flags.iter();
+    while let Some(f) = it.next() {
+        let (name, inline) = match f.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v.to_owned())),
+            _ => (f.as_str(), None),
+        };
+        let mut val = || inline.clone().or_else(|| it.next().cloned()).ok_or_else(|| anyhow::anyhow!("{name} needs a value"));
+        match name {
+            "--ctx" => ctx = Some(parse_tokens(&val()?)?),
+            "--fill" => fill = val()?.split(',').map(parse_tokens).collect::<Result<_>>()?,
+            "--gen" => n_gen = parse_tokens(&val()?)?,
+            _ => bail!("bench: unknown option `{f}` (options: --ctx N, --fill LIST, --kv LIST, --gen N, --offload MODE)"),
+        }
+    }
+    // the prompt cache continues from a snapshot only while the tokens decoded after it fit the sliding-window margin
+    ensure!((1..=2000).contains(&n_gen), "--gen must be between 1 and 2000");
+    fill.sort_unstable();
+    fill.dedup();
+    let g = inkling_core::Gguf::open(model)?;
+    let cfg = inkling_core::Config::from_gguf(&g)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&g)?;
+    drop(g);
+    let max_fill = *fill.last().unwrap();
+    let ctx = ctx.unwrap_or_else(|| (max_fill + n_gen + 1).next_multiple_of(1024).clamp(4096, cfg.context_length));
+    ensure!(ctx > n_gen + 1, "--ctx {ctx} leaves no room for --gen {n_gen}");
+    // a prompt of depth d plus the decoded tokens must fit the context: the deepest point may be a little short
+    let limit = ctx - n_gen - 1;
+    // (depth, label): rows keep the requested size as their label ("1M" even when shortened to fit)
+    let mut depths: Vec<(usize, String)> = fill.iter().map(|&d| (d.clamp(1, limit), fmt_tokens(d))).collect();
+    depths.dedup_by_key(|p| p.0);
+    if max_fill > limit {
+        println!("note: --fill {} is capped to {limit} tokens so that the {n_gen} decoded tokens fit in --ctx {ctx}", fmt_tokens(max_fill));
+    }
+    let kvs: Vec<(KvType, KvType)> = match std::env::var("INKLING_KV_LIST") {
+        Ok(list) => list.split(',').map(parse_kv_pair).collect::<Result<_>>()?,
+        Err(_) => vec![KvType::from_env()?],
+    };
+    // filler text compiled into the binary, repeated to the deepest point (speed does not depend on the content)
+    let base = tok.encode(include_str!("../../../tests/data/prompt_long.txt"), false)?;
+    let seq: Vec<u32> = base.iter().cycle().take(depths.last().unwrap().0).copied().collect();
+    let name = std::path::Path::new(model).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("{name}, context {} ({ctx} tokens), {n_gen} decoded tokens at each depth", fmt_tokens(ctx));
+    let label = |k: KvType, v: KvType| if k == v { k.name().to_owned() } else { format!("{}:{}", k.name(), v.name()) };
+    let gib = |b: f64| b / (1u64 << 30) as f64;
+    // per KV type: (label, rows of (depth, prompt tok/s of the segment ending there, decode tok/s))
+    let mut all: Vec<(String, Vec<(usize, Option<f64>, f64)>)> = Vec::new();
+    for &(k, v) in &kvs {
+        // SAFETY: single-threaded here; the previous engine (and its CPU threads) was dropped
+        unsafe {
+            std::env::set_var("INKLING_KV_K", k.name());
+            std::env::set_var("INKLING_KV_V", v.name());
+        }
+        let t = Instant::now();
+        let mut eng = inkling_engine::Engine::load(model, ctx)?;
+        let (free, total) = inkling_cuda::cudarc::driver::result::mem_get_info()?;
+        let per_tok = inkling_engine::kv_bytes_per_token(&eng.cfg, k, v);
+        println!(
+            "\nKV {}: {:.1} KiB/token, {:.2} GiB at this context | loaded in {:.1} s, VRAM in use {:.1} / {:.1} GiB ({})",
+            label(k, v), per_tok as f64 / 1024.0, gib((per_tok * ctx) as f64), t.elapsed().as_secs_f64(),
+            gib((total - free) as f64), gib(total as f64), eng.gpu.info.name
+        );
+        let greedy = Sampling::greedy();
+        eng.generate(&seq[..seq.len().min(16)], 4, &greedy, |_| true)?; // warm-up: capture the graphs
+        eng.reset()?;
+        println!("  {:>7}  {:<38}  {}", "depth", "prompt", "decode");
+        let mut rows = Vec::new();
+        let mut prev = 0;
+        let mut prev_label = String::from("0");
+        for (d, lbl) in &depths {
+            let d = *d;
+            use std::io::Write;
+            print!("  {lbl:>7}  ");
+            let _ = std::io::stdout().flush();
+            let t0 = Instant::now();
+            let mut first = None;
+            let (out, reused) = eng.generate_ex(&seq[..d], n_gen, &greedy, &mut |_| {
+                first.get_or_insert(t0.elapsed().as_secs_f64());
+                true
+            })?;
+            let total_s = t0.elapsed().as_secs_f64();
+            let ttft = first.unwrap_or(total_s);
+            let dec = (out.len() - 1) as f64 / (total_s - ttft).max(1e-9);
+            // prompt speed only for segments long enough to mean something
+            let (start, from) = if reused > 0 { (prev, prev_label.as_str()) } else { (0, "0") };
+            let pp = (d - start >= 512).then(|| (d - start) as f64 / ttft);
+            let pp_txt = pp.map_or(String::new(), |r| format!("{from}→{lbl}: {r:.0} tok/s in {ttft:.1} s"));
+            println!("{pp_txt:<38}  {dec:.1} tok/s");
+            rows.push((d, pp, dec));
+            prev = d;
+            prev_label = lbl.clone();
+        }
+        if let Some((calls, us)) = eng.cpu_moe_stats() {
+            println!("  CPU experts: {us:.0} us per layer visit ({calls} visits)");
+        }
+        if eng.moe_tl.is_some() {
+            for slot in [10usize, 21] {
+                let tl = eng.moe_timeline(slot)?;
+                let t0 = tl.iter().map(|r| r[0]).min().unwrap();
+                let rel = |k: usize, f: fn(u64, u64) -> u64| tl.iter().map(|r| r[k] - t0).fold(if f(0, 1) == 0 { u64::MAX } else { 0 }, f) as f64 / 1e3;
+                print!("moe timeline slot {slot} (us, min..max over blocks):");
+                for (k, name) in ["start", "staged", "A done", "barrier", "h staged", "end"].iter().enumerate() {
+                    print!(" {name} {:.1}..{:.1} |", rel(k, u64::min), rel(k, u64::max));
+                }
+                println!();
+            }
+        }
+        all.push((label(k, v), rows));
+    }
+    unsafe {
+        std::env::remove_var("INKLING_KV_K");
+        std::env::remove_var("INKLING_KV_V");
+    }
+    if all.len() > 1 {
+        println!("\ndecode tok/s by depth:");
+        print!("  {:>7}", "depth");
+        for (l, _) in &all {
+            print!("  {l:>8}");
+        }
+        println!();
+        for (i, (_, lbl)) in depths.iter().enumerate() {
+            print!("  {lbl:>7}");
+            for (_, rows) in &all {
+                print!("  {:>8.1}", rows[i].2);
             }
             println!();
         }
@@ -824,11 +930,7 @@ fn smoke() -> Result<()> {
 /// ring. Compares ink_attn_mma against ink_attn_split on the same inputs, then times both.
 fn attnbench(depth: usize, kv: &str, iters: usize) -> Result<()> {
     use inkling_cuda::Arg;
-    use inkling_engine::KvType;
-    let (k, v) = match kv.split_once(':') {
-        Some((a, b)) => (KvType::parse(a)?, KvType::parse(b)?),
-        None => (KvType::parse(kv)?, KvType::parse(kv)?),
-    };
+    let (k, v) = parse_kv_pair(kv)?;
     let window: usize = std::env::var("INKLING_WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let gpu = Gpu::new(0)?;
     let cap = if window > 0 { window + 2048 } else { depth + 16 };
