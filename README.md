@@ -14,7 +14,7 @@ the short convolutions and the NVFP4 experts each get fused, specialized kernels
 
 ## Performance
 
-RTX 3090 (24 GB), `Inkling-2-Mini-UD-Q4_K_XL.gguf`, single stream:
+RTX 3090 (24 GB), `Inkling-2-Mini-UD-Q4_K_XL.gguf`, single stream, Windows 11:
 
 | | llama.cpp (Unsloth b12588) | **InklingEngine** |
 |---|---|---|
@@ -24,6 +24,9 @@ RTX 3090 (24 GB), `Inkling-2-Mini-UD-Q4_K_XL.gguf`, single stream:
 | Context in 24 GB | 32k uses ~22 GB (q8_0 KV) | **262,144** (6-bit KV) |
 | Decode at 32k / 131k / 262k depth | | 97 / 68 / 45 tok/s |
 | Image encode, 1280×1280 (1,024 tokens) | | 116 ms |
+
+On Linux the same card is faster: **135 tok/s** decode and **4,880 tok/s** at a 2k-token prompt (Ubuntu 24.04 under
+WSL2). The Windows driver model adds overhead to every CUDA graph launch.
 
 ### How correctness is checked
 Logits are compared against the reference llama.cpp implementation on the same GGUF. On an 807-token prompt with
@@ -63,8 +66,9 @@ in [docs/MODEL.md](docs/MODEL.md).
   and, for images, `mmproj-F32.gguf`. Only UD-Q4_K_XL has been tested.
 - **To build:** Rust 1.85 or newer, and the CUDA Toolkit 12.x (`nvcc` on PATH or `CUDA_PATH` set).
 
-Tested on Windows 11 with an RTX 3090. The code has no Windows-specific parts, but Linux builds have not been tested
-yet. The sm_75 code paths were validated by running the compute_75 PTX on the 3090.
+Tested with an RTX 3090 on Windows 11 and on Ubuntu 24.04 under WSL2: build, generation, server and image input. The
+sm_75 code paths were validated by running the compute_75 PTX on the 3090; other GPUs have not been tested on real
+hardware yet.
 
 ## Quick start
 

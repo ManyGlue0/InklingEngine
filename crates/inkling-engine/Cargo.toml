@@ -4,6 +4,7 @@ description = "InklingEngine forward pass: weights on GPU, KV/conv state, decode
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

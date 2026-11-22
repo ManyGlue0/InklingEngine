@@ -84,7 +84,13 @@ t0 = time.time()
 first = None
 mode = None
 usage = None
-with urllib.request.urlopen(req) as r:
+try:
+    resp = urllib.request.urlopen(req)
+except urllib.error.HTTPError as e:
+    sys.exit(f"server error {e.code}: {e.read().decode('utf-8', 'replace')}")
+except urllib.error.URLError as e:
+    sys.exit(f"cannot reach {args.base} ({e.reason}). Is `inkling serve` running and done loading?")
+with resp as r:
     for raw in r:
         line = raw.decode("utf-8").strip()
         if not line.startswith("data: ") or line == "data: [DONE]":
