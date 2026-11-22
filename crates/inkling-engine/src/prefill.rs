@@ -185,6 +185,16 @@ impl Engine {
 
     /// int8 GEMM segments (weights, (xq, xd), y, rows, ldy), shared K.
     fn pre_gemm(&self, segs: &[(weights::Q8M, (u64, u64), u64, usize, usize)], k: usize, t: usize) -> Result<()> {
+        if segs.len() > 4 || segs.iter().any(|s| s.0.fmt != 0) || std::env::var_os("INKLING_GEN_DENSE").is_some() {
+            ensure!(segs.len() <= 8, "pre_gemm: too many segments");
+            let mut a = inkling_cuda::GemmGen { nseg: segs.len() as i32, t: t as i32, k: k as i32, ..Default::default() };
+            let mut tiles = 0;
+            for (i, &(w, (x, xd), y, n, ldy)) in segs.iter().enumerate() {
+                a.s[i] = inkling_cuda::GemmSegG { w: w.qs, wd: w.d, x, xd, y, n: n as i32, ldy: ldy as i32, fmt: w.fmt, pad: 0 };
+                tiles += n.div_ceil(64);
+            }
+            return self.gpu.launch("ink_gemm_gen", (tiles as u32, t.div_ceil(64) as u32), 128, &[Arg::GemmG(a)]);
+        }
         let mut a = GemmArgs { nseg: segs.len() as i32, t: t as i32, k: k as i32, ..Default::default() };
         let mut tiles = 0;
         for (i, &(w, (x, xd), y, n, ldy)) in segs.iter().enumerate() {
@@ -330,9 +340,16 @@ impl Engine {
         let ids: Vec<i32> = tokens.iter().map(|&x| if x >= crate::EMBED_TOKEN_BASE { 0 } else { x as i32 }).collect();
         self.gpu.write(p.tokens.ptr, inkling_cuda::as_bytes(&ids))?;
         self.gpu.write(p.step.ptr, inkling_cuda::as_bytes(&[0i32, pos0 as i32, 0, 0]))?;
-        self.gpu.launch("ink_embed_b", (t as u32, 1), 256, &[
-            Arg::Ptr(self.w.token_embd), Arg::Ptr(p.tokens.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(p.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
-        ])?;
+        if self.w.token_embd_fmt == 8 {
+            self.gpu.launch("ink_embed_b", (t as u32, 1), 256, &[
+                Arg::Ptr(self.w.token_embd), Arg::Ptr(p.tokens.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(p.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
+            ])?;
+        } else {
+            self.gpu.launch("ink_embed_gen", (t as u32, 1), 256, &[
+                Arg::Ptr(self.w.token_embd), Arg::I32(self.w.token_embd_fmt), Arg::Ptr(p.tokens.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(p.x.ptr),
+                Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
+            ])?;
+        }
         // image embeddings replace their rows as they are (no embedding norm, as in the reference)
         for (epos, e) in &self.embeds {
             let (lo, hi) = ((*epos).max(pos0), (epos + e.n).min(pos0 + t));
@@ -410,11 +427,10 @@ impl Engine {
             let (iq, ik, iv) = if shared_input { (0, 0, 0) } else { (0, 1, 2) };
 
             // projections
-            self.pre_gemm(&[
-                (lw.wqrg, nqv(iq), p.qrg.ptr, qs, qs),
-                (lw.wk, nqv(ik), p.kraw.ptr, kvw, kvw),
-                (lw.wv, nqv(iv), p.vraw.ptr, kvw, kvw),
-            ], d, t)?;
+            let mut segs: Vec<_> = self.qrg_segs(&lw, nqv(iq), p.qrg.ptr).into_iter().map(|(w, x, y, n)| (w, x, y, n, qs)).collect();
+            segs.push((lw.wk, nqv(ik), p.kraw.ptr, kvw, kvw));
+            segs.push((lw.wv, nqv(iv), p.vraw.ptr, kvw, kvw));
+            self.pre_gemm(&segs, d, t)?;
             let nkc = cfg.n_head_kv * cfg.n_conv;
             let mut mb = MvB4 { k: d as i32, ..Default::default() };
             mb.s[0] = MvSegB { w: lw.wsink, x: n[iq], y: p.sink.ptr, n: cfg.n_head as i32 };

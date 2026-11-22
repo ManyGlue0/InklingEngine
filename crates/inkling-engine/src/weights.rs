@@ -37,11 +37,13 @@ impl ExpertFmt {
 /// Slack after natively stored weights: the generic kernels' unaligned 32-bit loads may read past the last block.
 pub const NATIVE_PAD: usize = 64;
 
-/// Repacked Q8 matrix (qs int8 [rows][K], d f16 [rows][K/32]).
+/// Dense weight matrix: fmt 0 = repacked Q8_0 (qs int8 [rows][K], d f16 [rows][K/32]); otherwise a ggml type id
+/// with the matrix in its GGUF block layout at qs (d unused), run by the generic kernels (quant_gen.cu).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Q8M {
     pub qs: u64,
     pub d: u64,
+    pub fmt: i32,
 }
 
 /// Repacked expert tensor [E][rows][K].
@@ -72,8 +74,10 @@ pub struct LayerW {
     pub q_norm: u64,
     pub k_norm: u64,
     pub v_norm: u64,
-    /// q (H*dh rows) | rel (H*R rows) | gate (H*dh rows), one matrix
-    pub wqrg: Q8M,
+    /// q (H*dh rows) | rel (H*R rows) | gate (H*dh rows): one fused matrix when all three are Q8_0 (nqrg = 1),
+    /// else the three matrices (nqrg = 3)
+    pub wqrg: [Q8M; 3],
+    pub nqrg: usize,
     pub wk: Q8M,
     pub wv: Q8M,
     pub wo: Q8M,
@@ -103,6 +107,8 @@ pub struct Weights {
     /// tensors kept in pinned host memory that kernels read over PCIe (token embeddings: one row per token)
     pub host_bufs: Vec<HostMapped>,
     pub token_embd: u64,
+    /// ggml type id of the embedding table (8 = Q8_0)
+    pub token_embd_fmt: i32,
     pub token_embd_norm: u64,
     pub output: Q8M,
     pub output_norm: u64,
@@ -172,7 +178,29 @@ impl Loader<'_> {
             soa.sc.extend_from_slice(&s.sc);
         }
         let key = names.join("+");
-        Ok(Q8M { qs: self.put(format!("{key}#qs"), &soa.qs)?, d: self.put(format!("{key}#d"), &soa.sc)? })
+        Ok(Q8M { qs: self.put(format!("{key}#qs"), &soa.qs)?, d: self.put(format!("{key}#d"), &soa.sc)?, fmt: 0 })
+    }
+
+    /// A 2-D weight matrix in any supported format.
+    fn mat(&mut self, name: &str) -> Result<Q8M> {
+        let t = self.g.require(name)?;
+        ensure!(t.dims.len() == 2, "{name}: expected a 2-D matrix");
+        match t.ty {
+            GgmlType::Q8_0 => self.q8(&[name.to_owned()]),
+            ty if crate::codecs::supported(ty.id()) => {
+                Ok(Q8M { qs: self.put_padded(format!("{name}#native"), self.g.data(t))?, d: 0, fmt: ty.id() as i32 })
+            }
+            ty => bail!("{name}: matrix type {} is not supported yet", ty.name()),
+        }
+    }
+
+    /// Matrices that share an input: fused into one when all are Q8_0, else loaded one by one.
+    fn mats3(&mut self, names: [String; 3]) -> Result<([Q8M; 3], usize)> {
+        if names.iter().all(|n| self.g.tensor(n).is_some_and(|t| t.ty == GgmlType::Q8_0)) {
+            Ok(([self.q8(&names)?, Q8M::default(), Q8M::default()], 1))
+        } else {
+            Ok(([self.mat(&names[0])?, self.mat(&names[1])?, self.mat(&names[2])?], 3))
+        }
     }
 
     fn experts(&mut self, name: &str, scale: &str) -> Result<ExpM> {
@@ -279,16 +307,18 @@ impl Weights {
                 cpu.push(None);
                 (l.experts(&n("ffn_gate_up_exps.weight"), &n("ffn_gate_up_exps.scale"))?, l.experts(&n("ffn_down_exps.weight"), &n("ffn_down_exps.scale"))?)
             };
+            let (wqrg, nqrg) = l.mats3([n("attn_q.weight"), n("attn_rel.weight"), n("attn_gate.weight")])?;
             layers.push(LayerW {
                 is_swa: cfg.is_swa[i],
                 attn_norm: l.raw_opt(&n("attn_norm.weight"))?,
                 q_norm: l.raw_opt(&n("attn_q_inp_norm.weight"))?,
                 k_norm: l.raw_opt(&n("attn_k_inp_norm.weight"))?,
                 v_norm: l.raw_opt(&n("attn_v_inp_norm.weight"))?,
-                wqrg: l.q8(&[n("attn_q.weight"), n("attn_rel.weight"), n("attn_gate.weight")])?,
-                wk: l.q8(&[n("attn_k.weight")])?,
-                wv: l.q8(&[n("attn_v.weight")])?,
-                wo: l.q8(&[n("attn_output.weight")])?,
+                wqrg,
+                nqrg,
+                wk: l.mat(&n("attn_k.weight"))?,
+                wv: l.mat(&n("attn_v.weight"))?,
+                wo: l.mat(&n("attn_output.weight"))?,
                 wsink: l.raw(&n("attn_sink_proj.weight"))?,
                 kconv_proj: l.raw_opt(&n("attn_k_conv_proj.weight"))?,
                 vconv_proj: l.raw_opt(&n("attn_v_conv_proj.weight"))?,
@@ -311,21 +341,23 @@ impl Weights {
         }
         // the token embedding table is only gathered (one row per token): keep it in host memory, readable by the GPU
         // over PCIe, and save ~0.5 GB of VRAM (INKLING_EMBED_GPU=1 keeps it on the GPU)
+        let te = g.require("token_embd.weight")?;
+        let token_embd_fmt = te.ty.id() as i32;
+        ensure!(te.ty == GgmlType::Q8_0 || crate::codecs::supported(te.ty.id()), "token_embd: type {} is not supported yet", te.ty.name());
         let token_embd = if embed_on_host() {
-            let t = g.require("token_embd.weight")?;
-            let mut h = gpu.alloc_host_mapped(t.n_bytes)?;
-            h.as_mut_slice().copy_from_slice(g.data(t));
+            let mut h = gpu.alloc_host_mapped(te.n_bytes + NATIVE_PAD)?;
+            h.as_mut_slice()[..te.n_bytes].copy_from_slice(g.data(te));
             let p = h.dev;
             host_bufs.push(h);
             p
         } else {
-            l.raw("token_embd.weight")?
+            l.put_padded("token_embd.weight".to_owned(), g.data(te))?
         };
         let token_embd_norm = l.raw("token_embd_norm.weight")?;
-        let output = l.q8(&["output.weight".to_owned()])?;
+        let output = l.mat("output.weight")?;
         let output_norm = l.raw("output_norm.weight")?;
         let output_res_query = l.raw("output_res_query.weight")?;
-        Ok(Self { host_bufs, token_embd, token_embd_norm, output, output_norm, output_res_query, layers, cpu, bytes: l.bytes, bufs: l.bufs })
+        Ok(Self { host_bufs, token_embd, token_embd_fmt, token_embd_norm, output, output_norm, output_res_query, layers, cpu, bytes: l.bytes, bufs: l.bufs })
     }
 }
 

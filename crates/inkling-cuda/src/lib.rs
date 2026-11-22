@@ -154,6 +154,48 @@ pub struct GemmArgs {
     pub t: i32,
     pub k: i32,
 }
+/// Generic matvec segment (quant_gen.cu): fmt 0 = repacked Q8_0 (w + wd), else a ggml type id (w only).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvSegG {
+    pub w: u64,
+    pub wd: u64,
+    pub xq: u64,
+    pub xd: u64,
+    pub y: u64,
+    pub n: i32,
+    pub fmt: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvGen {
+    pub s: [MvSegG; 8],
+    pub nseg: i32,
+    pub k: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GemmSegG {
+    pub w: u64,
+    pub wd: u64,
+    pub x: u64,
+    pub xd: u64,
+    pub y: u64,
+    pub n: i32,
+    pub ldy: i32,
+    pub fmt: i32,
+    pub pad: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GemmGen {
+    pub s: [GemmSegG; 8],
+    pub nseg: i32,
+    pub t: i32,
+    pub k: i32,
+}
+unsafe impl DeviceRepr for MvGen {}
+unsafe impl DeviceRepr for GemmGen {}
 unsafe impl DeviceRepr for GemmArgs {}
 unsafe impl DeviceRepr for MvQ4 {}
 unsafe impl DeviceRepr for MixArgsQ {}
@@ -180,6 +222,8 @@ pub enum Arg {
     MixQ(MixArgsQ),
     NormQ(NormQ4),
     Gemm(GemmArgs),
+    MvG(MvGen),
+    GemmG(GemmGen),
 }
 
 impl From<&DevBuf> for Arg {
@@ -416,6 +460,8 @@ impl Gpu {
                 Arg::MixQ(v) => l.arg(v),
                 Arg::NormQ(v) => l.arg(v),
                 Arg::Gemm(v) => l.arg(v),
+                Arg::MvG(v) => l.arg(v),
+                Arg::GemmG(v) => l.arg(v),
             };
         }
         let cfg = LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 };

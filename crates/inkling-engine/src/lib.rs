@@ -4,6 +4,7 @@
 //! Activations feeding the quantized matvecs are int8 (q8_1 blocks of 32, as llama.cpp's mmvq), produced by the
 //! kernel that computes them (depth-attention mix, norms, attention output, expert gate_up).
 
+mod codec_tables;
 pub mod codecs;
 pub mod cpu_moe;
 pub mod offload;
@@ -484,7 +485,8 @@ impl Engine {
         let outs = [nq, kvw, kvw];
         let yg: Vec<DevBuf> = outs.iter().map(|&n| self.gpu.alloc(t * n * F32)).collect::<Result<_>>()?;
         let ym: Vec<DevBuf> = outs.iter().map(|&n| self.gpu.alloc(t * n * F32)).collect::<Result<_>>()?;
-        let ws = [lw.wqrg, lw.wk, lw.wv];
+        ensure!(lw.nqrg == 1, "gemmtest needs a Q8_0 model");
+        let ws = [lw.wqrg[0], lw.wk, lw.wv];
         let mut a = GemmArgs { nseg: 3, t: t as i32, k: d as i32, ..Default::default() };
         for j in 0..3 {
             a.s[j] = GemmSeg { w: ws[j].qs, wd: ws[j].d, x: bx.ptr, xd: bxd.ptr, y: yg[j].ptr, n: outs[j] as i32, ldy: outs[j] as i32 };
@@ -664,8 +666,29 @@ impl Engine {
         self.gpu.launch("ink_rmsnorm_q2", (items.len() as u32, 1), 768, &[Arg::NormQ(a), Arg::I32(self.cfg.n_embd as i32), Arg::F32(self.cfg.rms_eps)])
     }
 
-    /// Q8 matvecs on q8_1 activations: segments (weights, (xq, xd), y, rows), all with K inputs.
+    /// The q | rel | gate projection as matvec segments writing the contiguous qrg row at `y`.
+    fn qrg_segs(&self, lw: &LayerW, x: (u64, u64), y: u64) -> Vec<(weights::Q8M, (u64, u64), u64, usize)> {
+        let (qd, nr) = (self.cfg.n_head * self.cfg.head_dim, self.cfg.n_head * self.cfg.n_rel);
+        if lw.nqrg == 1 {
+            vec![(lw.wqrg[0], x, y, 2 * qd + nr)]
+        } else {
+            vec![(lw.wqrg[0], x, y, qd), (lw.wqrg[1], x, y + (qd * F32) as u64, nr), (lw.wqrg[2], x, y + ((qd + nr) * F32) as u64, qd)]
+        }
+    }
+
+    /// Matvecs on q8_1 activations: segments (weights, (xq, xd), y, rows), all with K inputs. All-Q8_0 calls use the
+    /// tuned kernel, others the generic one.
     fn mv(&self, segs: &[(weights::Q8M, (u64, u64), u64, usize)], k: usize) -> Result<()> {
+        if segs.len() > 4 || segs.iter().any(|s| s.0.fmt != 0) || std::env::var_os("INKLING_GEN_DENSE").is_some() {
+            ensure!(segs.len() <= 8, "mv: too many segments");
+            let mut a = inkling_cuda::MvGen { nseg: segs.len() as i32, k: k as i32, ..Default::default() };
+            let mut rows = 0;
+            for (i, &(w, (xq, xd), y, n)) in segs.iter().enumerate() {
+                a.s[i] = inkling_cuda::MvSegG { w: w.qs, wd: w.d, xq, xd, y, n: n as i32, fmt: w.fmt };
+                rows += n;
+            }
+            return self.gpu.launch("ink_mv_gen", (rows.div_ceil(8) as u32, 1), 256, &[Arg::MvG(a)]);
+        }
         let mut a = MvQ4 { nseg: segs.len() as i32, k: k as i32, ..Default::default() };
         let mut rows = 0;
         for (i, &(w, (xq, xd), y, n)) in segs.iter().enumerate() {
@@ -738,9 +761,16 @@ impl Engine {
         let row = |j: usize| j * d * F32;
         let nqv = |j: usize| a.nq.at(j, d);
 
-        self.gpu.launch("ink_embed", (1, 1), 256, &[
-            Arg::Ptr(self.w.token_embd), Arg::Ptr(a.step.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(a.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
-        ])?;
+        if self.w.token_embd_fmt == 8 {
+            self.gpu.launch("ink_embed", (1, 1), 256, &[
+                Arg::Ptr(self.w.token_embd), Arg::Ptr(a.step.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(a.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
+            ])?;
+        } else {
+            self.gpu.launch("ink_embed_gen", (1, 1), 256, &[
+                Arg::Ptr(self.w.token_embd), Arg::I32(self.w.token_embd_fmt), Arg::Ptr(a.step.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(a.x.ptr),
+                Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
+            ])?;
+        }
 
         let mut blocks: Vec<u64> = Vec::new();
         let mut prelude_blocks: Vec<u64> = Vec::new();
@@ -810,11 +840,10 @@ impl Engine {
             let (iq, ik, iv) = if shared_input { (0, 0, 0) } else { (0, 1, 2) };
 
             // projections
-            self.mv(&[
-                (lw.wqrg, nqv(iq), a.qrg.ptr, 2 * qd + cfg.n_head * cfg.n_rel),
-                (lw.wk, nqv(ik), a.kraw.ptr, kvw),
-                (lw.wv, nqv(iv), a.vraw.ptr, kvw),
-            ], d)?;
+            let mut segs = self.qrg_segs(&lw, nqv(iq), a.qrg.ptr);
+            segs.push((lw.wk, nqv(ik), a.kraw.ptr, kvw));
+            segs.push((lw.wv, nqv(iv), a.vraw.ptr, kvw));
+            self.mv(&segs, d)?;
             let (dk, dv) = if lw.is_swa {
                 self.mv_bf16(&[(lw.wsink, n[iq], sink_ptr, cfg.n_head)], d)?;
                 (0, 0)

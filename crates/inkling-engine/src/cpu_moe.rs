@@ -220,7 +220,8 @@ mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn g32(id: u32, row: *const u8, g: usize, k: usize) -> (__m256i, f32, f32, f32) {
-        use crate::codecs::{Q4_K, Q5_K, Q6_K};
+        use crate::codec_tables::*;
+        use crate::codecs::{IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K};
         let m4 = _mm256_set1_epi8(0x0F);
         let j = g % 8;
         match id {
@@ -255,12 +256,145 @@ mod avx2 {
                 let sc = b.add(192 + 8 * h + 2 * jj) as *const i8;
                 (q, d * *sc as f32, d * *sc.add(1) as f32, 0.0)
             }
+            Q3_K => {
+                let b = row.add(g / 8 * 110);
+                let (n, jj) = (j / 4, j % 4);
+                let qs = _mm256_loadu_si256(b.add(32 + 32 * n) as *const __m256i);
+                let hm = _mm256_loadu_si256(b as *const __m256i);
+                let v = _mm256_and_si256(_mm256_srl_epi16(qs, _mm_cvtsi32_si128(2 * jj as i32)), _mm256_set1_epi8(3));
+                let h = _mm256_and_si256(_mm256_srl_epi16(hm, _mm_cvtsi32_si128((4 * n + jj) as i32)), _mm256_set1_epi8(1));
+                let q = _mm256_sub_epi8(v, _mm256_slli_epi16(_mm256_xor_si256(h, _mm256_set1_epi8(1)), 2));
+                let rd = |o: usize| (b.add(o) as *const u32).read_unaligned();
+                let (a0, a1, tmp) = (rd(96), rd(100), rd(104));
+                let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+                let aux = [(a0 & k2) | ((tmp & k1) << 4), (a1 & k2) | (((tmp >> 2) & k1) << 4), ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4), ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4)];
+                let sc = |i: usize| ((aux[i / 4] >> (8 * (i % 4))) & 0xff) as i32 - 32;
+                let d = f16(b.add(108));
+                (q, d * sc(8 * n + 2 * jj) as f32, d * sc(8 * n + 2 * jj + 1) as f32, 0.0)
+            }
+            IQ2_XXS => {
+                let b = row.add(g / 8 * 66);
+                let a0 = (b.add(2 + 8 * j) as *const u32).read_unaligned();
+                let a1 = (b.add(6 + 8 * j) as *const u32).read_unaligned();
+                let gr = |l: u32| IQ2XXS_GRID[((a0 >> (8 * l)) & 255) as usize];
+                let sg = |l: u32| KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize];
+                let s = f16(b) * (0.5 + (a1 >> 28) as f32) * 0.25;
+                (signed32([gr(0), gr(1), gr(2), gr(3)], [sg(0), sg(1), sg(2), sg(3)]), s, s, 0.0)
+            }
+            IQ2_XS => {
+                let b = row.add(g / 8 * 74);
+                let v = |l: usize| (b.add(2 + 8 * j + 2 * l) as *const u16).read_unaligned();
+                let gr = |l: usize| IQ2XS_GRID[(v(l) & 511) as usize];
+                let sg = |l: usize| KSIGNS_IQ2XS[(v(l) >> 9) as usize];
+                let (d, sc) = (f16(b), *b.add(66 + j));
+                (signed32([gr(0), gr(1), gr(2), gr(3)], [sg(0), sg(1), sg(2), sg(3)]), d * (0.5 + (sc & 15) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25, 0.0)
+            }
+            IQ2_S => {
+                let b = row.add(g / 8 * 82);
+                let qh = *b.add(66 + j) as usize;
+                let gr = |l: usize| IQ2S_GRID[*b.add(2 + 4 * j + l) as usize | ((qh << (8 - 2 * l)) & 0x300)];
+                let sg = |l: usize| *b.add(34 + 4 * j + l);
+                let (d, sc) = (f16(b), *b.add(74 + j));
+                (signed32([gr(0), gr(1), gr(2), gr(3)], [sg(0), sg(1), sg(2), sg(3)]), d * (0.5 + (sc & 15) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25, 0.0)
+            }
+            IQ3_XXS => {
+                let b = row.add(g / 8 * 98);
+                let aux = (b.add(66 + 4 * j) as *const u32).read_unaligned();
+                let gr = |l: usize| IQ3XXS_GRID[*b.add(2 + 8 * j + 2 * l) as usize] as u64 | ((IQ3XXS_GRID[*b.add(3 + 8 * j + 2 * l) as usize] as u64) << 32);
+                let sg = |l: u32| KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                let s = f16(b) * (0.5 + (aux >> 28) as f32) * 0.5;
+                (signed32([gr(0), gr(1), gr(2), gr(3)], [sg(0), sg(1), sg(2), sg(3)]), s, s, 0.0)
+            }
+            IQ3_S => {
+                let b = row.add(g / 8 * 110);
+                let qh = *b.add(66 + j) as usize;
+                let gr = |l: usize| {
+                    let i1 = *b.add(2 + 8 * j + 2 * l) as usize | ((qh << (8 - 2 * l)) & 256);
+                    let i2 = *b.add(3 + 8 * j + 2 * l) as usize | ((qh << (7 - 2 * l)) & 256);
+                    IQ3S_GRID[i1] as u64 | ((IQ3S_GRID[i2] as u64) << 32)
+                };
+                let sg = |l: usize| *b.add(74 + 4 * j + l);
+                let sc = (*b.add(106 + j / 2) >> (4 * (j & 1))) & 15;
+                let s = f16(b) * (1 + 2 * sc as i32) as f32;
+                (signed32([gr(0), gr(1), gr(2), gr(3)], [sg(0), sg(1), sg(2), sg(3)]), s, s, 0.0)
+            }
+            IQ1_S => {
+                let b = row.add(g / 8 * 50);
+                let qh = (b.add(34 + 2 * j) as *const u16).read_unaligned() as usize;
+                let gr = |l: usize| IQ1S_GRID[*b.add(2 + 4 * j + l) as usize | (((qh >> (3 * l)) & 7) << 8)] as i64;
+                let q = _mm256_set_epi64x(gr(3), gr(2), gr(1), gr(0));
+                let dl = f16(b) * (2 * ((qh >> 12) & 7) + 1) as f32;
+                (q, dl, dl, -dl * if qh & 0x8000 != 0 { -0.125 } else { 0.125 })
+            }
+            IQ4_NL | MXFP4 | IQ4_XS => {
+                let (qs, s) = match id {
+                    IQ4_NL => {
+                        let b = row.add(g * 18);
+                        (b.add(2), f16(b))
+                    }
+                    MXFP4 => {
+                        let b = row.add(g * 17);
+                        let e = *b as u32;
+                        (b.add(1), f32::from_bits(if e < 2 { 0x0020_0000u32 << e } else { (e - 1) << 23 }))
+                    }
+                    _ => {
+                        let b = row.add(g / 8 * 136);
+                        let sh = (b.add(2) as *const u16).read_unaligned() as u32;
+                        let ls = ((*b.add(4 + j / 2) as u32 >> (4 * (j % 2))) & 15) | (((sh >> (2 * j)) & 3) << 4);
+                        (b.add(8 + 16 * j), f16(b) * (ls as i32 - 32) as f32)
+                    }
+                };
+                let t = if id == MXFP4 { &KVALUES_FP4 } else { &KVALUES_IQ4NL };
+                let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
+                let v = _mm_loadu_si128(qs as *const __m128i);
+                let m4 = _mm_set1_epi8(0x0F);
+                let idx = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(v, 4), m4), _mm_and_si128(v, m4));
+                (_mm256_shuffle_epi8(lut, idx), s, s, 0.0)
+            }
+            Q2_0 => {
+                let b = row.add(g / 2 * 18);
+                let qs = b.add(2 + 8 * (g % 2));
+                let idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs as *const __m128i));
+                let q = _mm256_i32gather_epi32::<4>(Q2_0_LUT.as_ptr() as *const i32, idx);
+                let s = f16(b);
+                (q, s, s, 0.0)
+            }
             _ => {
                 let r = crate::codecs::g32(id, std::slice::from_raw_parts(row, crate::codecs::row_bytes(id, k)), g);
                 (_mm256_loadu_si256(r.q.as_ptr() as *const __m256i), r.s0, r.s1, r.m)
             }
         }
     }
+
+    /// 4 x 8 grid bytes, negated where the matching sign byte has a bit set (bit i -> value i of the 8)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn signed32(grid: [u64; 4], signs: [u8; 4]) -> __m256i {
+        let gv = _mm256_set_epi64x(grid[3] as i64, grid[2] as i64, grid[1] as i64, grid[0] as i64);
+        let rep = |s: u8| (s as u64 * 0x0101_0101_0101_0101) as i64;
+        let sb = _mm256_set_epi64x(rep(signs[3]), rep(signs[2]), rep(signs[1]), rep(signs[0]));
+        let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let m = _mm256_cmpeq_epi8(_mm256_and_si256(sb, bits), bits);
+        _mm256_sub_epi8(_mm256_xor_si256(gv, m), m)
+    }
+
+    /// Q2_0: byte -> its four 2-bit values minus 1, as one little-endian u32 of int8
+    static Q2_0_LUT: [u32; 256] = {
+        let mut t = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut w = 0u32;
+            let mut k = 0;
+            while k < 4 {
+                let v = ((i >> (2 * k)) & 3) as i32 - 1;
+                w |= ((v as u8) as u32) << (8 * k);
+                k += 1;
+            }
+            t[i] = w;
+            i += 1;
+        }
+        t
+    };
 
     /// Native formats: per group, int8 dot of the decoded values with the activations (|q| x sign-adjusted x),
     /// scales per 16, offsets through the per-16 activation sums.
