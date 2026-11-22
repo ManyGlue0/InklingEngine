@@ -144,9 +144,14 @@ cd inkling-<version>-linux-x64
 ```
 
 - **Prerequisites:** only the NVIDIA driver (under WSL2, the Windows driver provides the GPU).
-- **Distribution:** built on Ubuntu 24.04, so it needs glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+).
-  On older distributions, build from source.
+- **Distribution:** needs glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, Fedora 35+, RHEL 9+). On older
+  distributions, build from source.
 - **What's inside:** the same files as the Windows zip, with `inkling` in place of `inkling.exe`.
+- **WSL2 and CPU offload:**
+  - WSL2 gives Linux only half of the PC's RAM by default, which limits how many layers can be offloaded. Raise it
+    with `memory=` in `%USERPROFILE%\.wslconfig`.
+  - Each handoff between GPU and CPU costs more under WSL2 than on Windows or native Linux. For example, with
+    16 GB of VRAM: 40 tok/s under WSL2, 59 tok/s on Windows.
 
 ### Any OS: build from source
 
