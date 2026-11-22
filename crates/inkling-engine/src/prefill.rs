@@ -382,8 +382,9 @@ impl Engine {
             self.conv_state(p.vraw.ptr, conv_v, kvw, t)?;
             let window = if lw.is_swa { cfg.n_swa as i32 } else { 0 };
             let (oq, od) = p.attq.at(0);
-if std::env::var("INKLING_PRE_ATTN").as_deref() == Ok("split") {
-                            self.gpu.launch3("ink_attn_split", (cfg.n_head_kv as u32, PRE_SPLITS as u32, t as u32), 128, &[
+let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
+            if let Some(k @ ("split" | "mma")) = pre_attn.as_deref() {
+                            self.gpu.launch3(if k == "mma" { "ink_attn_mma" } else { "ink_attn_split" }, (cfg.n_head_kv as u32, PRE_SPLITS as u32, t as u32), 128, &[
                 Arg::Ptr(p.qrg.ptr), Arg::Ptr(p.qrg.at(qd * F32)), Arg::Ptr(p.sink.ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr),
                 Arg::Ptr(lw.rel_bias), Arg::Ptr(p.qrg.at((qd + cfg.n_head * cfg.n_rel) * F32)), Arg::Ptr(p.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                 Arg::Ptr(p.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),

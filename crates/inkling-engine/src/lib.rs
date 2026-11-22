@@ -264,7 +264,6 @@ impl Engine {
             slot_phys[p.slot] = p.phys;
         }
         let (kv_k, kv_v) = KvType::from_env()?;
-        let kv_quant = kv_k != KvType::F16 || kv_v != KvType::F16;
         // refuse to start when the model does not fit in free VRAM: on Windows the driver would otherwise page the
         // overflow (and other applications' GPU memory) into system RAM until the machine stalls
         let kv_bytes: usize = (0..cfg.n_slots())
@@ -353,14 +352,10 @@ impl Engine {
             override_.unwrap_or_else(|| (fit / 2..=fit).rev().find(|&b| even(b)).unwrap_or(fit))
         };
         ensure!(std::env::var("INKLING_MOE").as_deref() == Ok("7") || moe_blocks > 0, "persistent MoE kernel does not fit on this GPU");
-        let attn_splits = if std::env::var("INKLING_ATTN").as_deref() == Ok("old") {
-            ensure!(!kv_quant, "INKLING_ATTN=old needs INKLING_KV=f16");
-            0
-        } else if n_ctx <= 32768 {
-            32
-        } else {
-            ATTN_SPLITS_MAX as u32
-        };
+        // decode attention: one full wave of blocks (8 kv heads x splits), so no partial last wave; measured best at
+        // every depth (fewer splits also mean a cheaper merge)
+        let attn_slots = gpu.max_blocks_per_sm("ink_attn_mma", 128)? * gpu.info.sm_count as u32;
+        let attn_splits = std::env::var("INKLING_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(attn_slots / cfg.n_head_kv as u32).clamp(4, ATTN_SPLITS_MAX as u32);
         let pre = Some(prefill::PrefillBufs::new(&gpu, &cfg)?);
         let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
         if std::env::var_os("INKLING_VRAM_DEBUG").is_some() {
@@ -668,20 +663,14 @@ impl Engine {
             ])?;
             let window = if lw.is_swa { cfg.n_swa as i32 } else { 0 };
             let (oq, od) = a.attq.at(0, qd);
-if self.attn_splits > 0 {
-                self.gpu.launch("ink_attn_split", (cfg.n_head_kv as u32, self.attn_splits), 128, &[
-                    Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
-                    Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
-                    Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
-                    Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr), Arg::I32((2 * qd + cfg.n_head * cfg.n_rel) as i32), Arg::I32(0), Arg::I32(slot.kv_fmt),
-                ])?;
-            } else {
-                            self.gpu.launch("ink_attn_decode2", (cfg.n_head as u32, 1), 128, &[
+            // tensor-core decode attention (INKLING_ATTN=split: the previous CUDA-core kernel, for A/B checks)
+            let attn_kernel = if std::env::var("INKLING_ATTN").as_deref() == Ok("split") { "ink_attn_split" } else { "ink_attn_mma" };
+            self.gpu.launch(attn_kernel, (cfg.n_head_kv as u32, self.attn_splits), 128, &[
                 Arg::Ptr(q_ptr), Arg::Ptr(r_ptr), Arg::Ptr(sink_ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::Ptr(lw.rel_bias),
                 Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                 Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
+                Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr), Arg::I32((2 * qd + cfg.n_head * cfg.n_rel) as i32), Arg::I32(0), Arg::I32(slot.kv_fmt),
             ])?;
-            }
             self.mv(&[(lw.wo, (oq, od), a.proj.ptr, d)], qd)?;
 
             // post conv fused with the residual: block boundary starts a new stream (x = attn), else x += attn

@@ -77,7 +77,7 @@ INK_EXTERN void ink_attn_prep_b(float* __restrict__ qrg, int qs, int roff, const
         float f;
         if (isk) f = fminf(1.0f, qk_clip / (sqrtf(sum128(o * o)) + 1e-6f));
         else f = rsqrtf(sum128(o * o) / 128.0f + eps);
-        kv_store(isk ? Kc : Vc, isk ? kv_kfmt(kvfmt) : kv_vfmt(kvfmt), (size_t)(pos % kv_cap), h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
+        kv_store(isk ? Kc : Vc, isk ? kv_kfmt(kvfmt) : kv_vfmt(kvfmt), kv_cap, (size_t)(pos % kv_cap), h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
     } else {
         const int h = task - 40;
         const float y = tid < 16 ? r[h * 16 + tid] * rclip[h * 16 + tid] : 0.0f;

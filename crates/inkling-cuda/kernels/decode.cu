@@ -851,35 +851,53 @@ __device__ __forceinline__ float kv_fakequant(float v, int bits) {
     return fminf(fmaxf(rintf(v / s), -qmax), qmax) * s;
 }
 
-// KV cache formats (per row and kv head of 128 channels; quant groups of 32 channels with an f16 scale):
-//   0 f16: [row][8 heads x 128] halves.
-//   1 q6 (104 B): ql[64] (low 4 bits, channel c in byte c/2, nibble c&1) | qh[32] (high 2 bits, byte c/4, bits 2(c&3)) |
-//      4 f16 scales; values q - 32, q in 1..63 (symmetric).
-//   2 q4 (72 B): q[64] (channel c in byte c/2, nibble c&1) | 4 f16 scales; values q - 8, q in 0..15 (as ggml q4_0: the
-//      scale is the signed extreme / -8, so the largest-magnitude value maps to -8 exactly).
-//   3 q8 (136 B): int8 q[128] | 4 f16 scales; values in -127..127 (symmetric).
-// Kernels take a packed format: K format in bits 0..3, V format in bits 4..7.
+// KV cache layout. A slot's K (or V) buffer holds `cap` rows (positions) for each of the 8 kv heads, head-major:
+// head h owns bytes [h * cap * HB, (h + 1) * cap * HB) with HB = kv_head_bytes(fmt), split into planes that are
+// contiguous along positions (so a warp walking positions of one head streams memory):
+//   0 f16 (HB 256): [row][128] halves.
+//   1 q6 (HB 104):  lo [row][64] (channel c: byte c/2, nibble c&1) | hi [row][32] | scales [row][4] f16.
+//      hi: 4 bytes per 16-channel chunk k (bytes 4k..4k+3); channel i of the chunk has its 2 high bits in byte
+//      (i & 7) >> 1 at bit 2 * (i & 1) + 4 * (i >> 3), i.e. byte j holds channels 2j, 2j+1, 2j+8, 2j+9 in bits
+//      0-1, 2-3, 4-5, 6-7. Values q - 32 with q in 1..63 (symmetric).
+//   2 q4 (HB 72):   lo [row][64] (as q6) | scales [row][4] f16. Values q - 8 with q in 0..15 (as ggml q4_0: the scale
+//      is the signed extreme / -8, so the largest-magnitude value maps to -8 exactly).
+//   3 q8 (HB 136):  q [row][128] int8 | scales [row][4] f16. Values in -127..127 (symmetric).
+// Quant groups are 32 channels with one f16 scale. Kernels take a packed format: K in bits 0..3, V in bits 4..7.
 constexpr int KVQ6_HEAD = 104, KVQ4_HEAD = 72, KVQ8_HEAD = 136;
 __host__ __device__ constexpr int kv_head_bytes(int fmt) { return fmt == 1 ? KVQ6_HEAD : fmt == 2 ? KVQ4_HEAD : fmt == 3 ? KVQ8_HEAD : 256; }
 __device__ __forceinline__ int kv_kfmt(int packed) { return packed & 15; }
 __device__ __forceinline__ int kv_vfmt(int packed) { return (packed >> 4) & 15; }
 
+struct KvPlanes {
+    uint8_t* q;   // f16 rows / lo nibbles / int8 values
+    uint8_t* hi;  // q6 high bits
+    __half* sc;   // scales [row][4]
+};
+__device__ __forceinline__ KvPlanes kv_planes(const void* cache, int fmt, int cap, int h) {
+    uint8_t* base = reinterpret_cast<uint8_t*>(const_cast<void*>(cache)) + (size_t)h * cap * kv_head_bytes(fmt);
+    const size_t qb = fmt == 3 ? 128 : 64;  // bytes per row of the first plane (f16 has no other plane)
+    KvPlanes p;
+    p.q = base;
+    p.hi = base + (size_t)cap * 64;
+    p.sc = reinterpret_cast<__half*>(base + (size_t)cap * (fmt == 1 ? 96 : qb));
+    return p;
+}
+
 // Store channel c (= 32 * warp + lane, one quant group per warp) of kv head h at cache row `row`.
-__device__ __forceinline__ void kv_store(void* cache, int fmt, size_t row, int h, int c, float v) {
+__device__ __forceinline__ void kv_store(void* cache, int fmt, int cap, size_t row, int h, int c, float v) {
+    const KvPlanes P = kv_planes(cache, fmt, cap, h);
     if (fmt == 0) {
-        reinterpret_cast<__half*>(cache)[row * 1024 + h * 128 + c] = __float2half(v);
+        reinterpret_cast<__half*>(P.q)[row * 128 + c] = __float2half(v);
         return;
     }
-    const int hb = kv_head_bytes(fmt);
-    uint8_t* b = reinterpret_cast<uint8_t*>(cache) + row * (8 * hb) + h * hb;
     const int lane = threadIdx.x & 31;
     const float amax = warp_max(fabsf(v));
     if (fmt == 3) {
         const __half sh = __float2half(amax / 127.0f);
         const float s = __half2float(sh);
         const int q = s == 0.0f ? 0 : (int)fminf(fmaxf(rintf(v / s), -127.0f), 127.0f);
-        reinterpret_cast<int8_t*>(b)[c] = (int8_t)q;
-        if (lane == 0) reinterpret_cast<__half*>(b + 128)[c >> 5] = sh;
+        reinterpret_cast<int8_t*>(P.q)[row * 128 + c] = (int8_t)q;
+        if (lane == 0) P.sc[row * 4 + (c >> 5)] = sh;
         return;
     }
     if (fmt == 2) {
@@ -890,60 +908,53 @@ __device__ __forceinline__ void kv_store(void* cache, int fmt, size_t row, int h
         const float s = __half2float(sh);
         const int q = s == 0.0f ? 8 : (int)fminf(fmaxf(rintf(v / s) + 8.0f, 0.0f), 15.0f);
         const int q1 = __shfl_down_sync(0xffffffffu, q, 1);
-        if ((c & 1) == 0) b[c >> 1] = (uint8_t)(q | (q1 << 4));
-        if (lane == 0) reinterpret_cast<__half*>(b + 64)[c >> 5] = sh;
+        if ((c & 1) == 0) P.q[row * 64 + (c >> 1)] = (uint8_t)(q | (q1 << 4));
+        if (lane == 0) P.sc[row * 4 + (c >> 5)] = sh;
         return;
     }
     const __half sh = __float2half(amax / 31.0f);
     const float s = __half2float(sh);
     const int q = (s == 0.0f ? 0 : (int)fminf(fmaxf(rintf(v / s), -31.0f), 31.0f)) + 32;
-    const int q1 = __shfl_down_sync(0xffffffffu, q, 1), q2 = __shfl_down_sync(0xffffffffu, q, 2), q3 = __shfl_down_sync(0xffffffffu, q, 3);
-    if ((c & 1) == 0) b[c >> 1] = (uint8_t)((q & 15) | ((q1 & 15) << 4));
-    if ((c & 3) == 0) b[64 + (c >> 2)] = (uint8_t)((q >> 4) | ((q1 >> 4) << 2) | ((q2 >> 4) << 4) | ((q3 >> 4) << 6));
-    if (lane == 0) reinterpret_cast<__half*>(b + 96)[c >> 5] = sh;
+    const int q1 = __shfl_down_sync(0xffffffffu, q, 1), q8 = __shfl_down_sync(0xffffffffu, q, 8), q9 = __shfl_down_sync(0xffffffffu, q, 9);
+    if ((c & 1) == 0) P.q[row * 64 + (c >> 1)] = (uint8_t)((q & 15) | ((q1 & 15) << 4));
+    const int i = c & 15;  // channel within its 16-channel chunk
+    if ((i & 1) == 0 && i < 8)
+        P.hi[row * 32 + 4 * (c >> 4) + (i >> 1)] = (uint8_t)((q >> 4) | ((q1 >> 4) << 2) | ((q8 >> 4) << 4) | ((q9 >> 4) << 6));
+    if (lane == 0) P.sc[row * 4 + (c >> 5)] = sh;
 }
 
 // Dequantize channels 16p .. 16p+15 of kv head h at cache row `row` into dst (16 halves, 16-byte aligned).
-__device__ __forceinline__ void kv_load16(const void* cache, int fmt, size_t row, int h, int p, __half* dst) {
+__device__ __forceinline__ void kv_load16(const void* cache, int fmt, int cap, size_t row, int h, int p, __half* dst) {
+    const KvPlanes P = kv_planes(cache, fmt, cap, h);
     if (fmt == 0) {
-        const uint4* s = reinterpret_cast<const uint4*>(reinterpret_cast<const __half*>(cache) + row * 1024 + h * 128 + 16 * p);
+        const uint4* s = reinterpret_cast<const uint4*>(P.q + row * 256 + 32 * p);
         reinterpret_cast<uint4*>(dst)[0] = s[0];
         reinterpret_cast<uint4*>(dst)[1] = s[1];
         return;
     }
-    const int hb = kv_head_bytes(fmt);
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(cache) + row * (8 * hb) + h * hb;
     __align__(16) __half2 out[8];
     if (fmt == 3) {
-        const uint2 q0 = *reinterpret_cast<const uint2*>(b + 16 * p), q1 = *reinterpret_cast<const uint2*>(b + 16 * p + 8);
-        const __half2 s2 = __half2half2(reinterpret_cast<const __half*>(b + 128)[p >> 1]);
-        const uint32_t w[4] = {q0.x, q0.y, q1.x, q1.y};
+        const uint4 qv = *reinterpret_cast<const uint4*>(P.q + row * 128 + 16 * p);
+        const __half2 s2 = __half2half2(P.sc[row * 4 + (p >> 1)]);
+        const uint32_t w[4] = {qv.x, qv.y, qv.z, qv.w};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int8_t* c = reinterpret_cast<const int8_t*>(&w[i]);
             out[2 * i] = __hmul2(__floats2half2_rn((float)c[0], (float)c[1]), s2);
             out[2 * i + 1] = __hmul2(__floats2half2_rn((float)c[2], (float)c[3]), s2);
         }
-    } else if (fmt == 2) {
-        const uint2 lo = *reinterpret_cast<const uint2*>(b + 8 * p);
-        const float s = __half2float(reinterpret_cast<const __half*>(b + 64)[p >> 1]);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const uint32_t lw = i < 4 ? lo.x : lo.y;
-            const int sh = 8 * (i & 3);
-            out[i] = __floats2half2_rn((float)((int)((lw >> sh) & 15) - 8) * s, (float)((int)((lw >> (sh + 4)) & 15) - 8) * s);
-        }
     } else {
-        const uint2 lo = *reinterpret_cast<const uint2*>(b + 8 * p);
-        const uint32_t hi = *reinterpret_cast<const uint32_t*>(b + 64 + 4 * p);
-        const float s = __half2float(reinterpret_cast<const __half*>(b + 96)[p >> 1]);
+        const uint2 lo = *reinterpret_cast<const uint2*>(P.q + row * 64 + 8 * p);
+        const uint32_t hi = fmt == 1 ? *reinterpret_cast<const uint32_t*>(P.hi + row * 32 + 4 * p) : 0u;
+        const float s = __half2float(P.sc[row * 4 + (p >> 1)]);
+        const int off = fmt == 1 ? 32 : 8;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const uint32_t lw = i < 4 ? lo.x : lo.y;
-            const int e = 2 * i, o = 2 * i + 1;
-            const int ve = (((lw >> (4 * (e & 7))) & 15) | (((hi >> (2 * e)) & 3) << 4)) - 32;
-            const int vo = (((lw >> (4 * (o & 7))) & 15) | (((hi >> (2 * o)) & 3) << 4)) - 32;
-            out[i] = __floats2half2_rn((float)ve * s, (float)vo * s);
+        for (int k = 0; k < 8; ++k) {  // channels 2k, 2k+1
+            const uint32_t lw = k < 4 ? lo.x : lo.y;
+            const int e = 2 * k, o = 2 * k + 1;
+            const int he = (hi >> (8 * ((e & 7) >> 1) + 4 * (e >> 3))) & 3, ho = (hi >> (8 * ((o & 7) >> 1) + 2 + 4 * (o >> 3))) & 3;
+            const int ve = (int)((lw >> (8 * (k & 3))) & 15) | (he << 4), vo = (int)((lw >> (8 * (k & 3) + 4)) & 15) | (ho << 4);
+            out[k] = __floats2half2_rn((float)(ve - off) * s, (float)(vo - off) * s);
         }
     }
     reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(out)[0];
@@ -998,71 +1009,13 @@ INK_EXTERN void ink_attn_prep2(float* __restrict__ q, const float* __restrict__ 
         float f;
         if (isk) f = fminf(1.0f, qk_clip / (sqrtf(sum128(o * o)) + 1e-6f));
         else f = rsqrtf(sum128(o * o) / 128.0f + eps);
-        kv_store(isk ? Kc : Vc, isk ? kv_kfmt(kvfmt) : kv_vfmt(kvfmt), row, h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
+        kv_store(isk ? Kc : Vc, isk ? kv_kfmt(kvfmt) : kv_vfmt(kvfmt), kv_cap, row, h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
     } else {
         const int h = task - 40;
         const float y = tid < 16 ? r[h * 16 + tid] * rclip[h * 16 + tid] : 0.0f;
         const float f = fminf(1.0f, rel_clip / (sqrtf(sum128(y * y)) + 1e-6f)) * tau;
         if (tid < 16) r[h * 16 + tid] = y * f;
     }
-}
-
-// Decode attention (as ink_attn_decode) with the sigmoid output gate fused and q8_1 output for the wo projection.
-INK_EXTERN void ink_attn_decode2(const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
-                                 const __half* __restrict__ Kc, const __half* __restrict__ Vc, const float* __restrict__ relbias,
-                                 const float* __restrict__ gate, float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od,
-                                 const int* __restrict__ step, int kv_cap, int window, int extent) {
-    __shared__ float rs[16];
-    __shared__ float wm[4], wl[4], wacc[4][128];
-    const int h = blockIdx.x, kvh = h / 3;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int pos = step[1];
-    if (threadIdx.x < 16) rs[threadIdx.x] = r[h * 16 + threadIdx.x];
-    __syncthreads();
-    float qv[4];
-    for (int j = 0; j < 4; ++j) qv[j] = q[h * 128 + lane * 4 + j];
-    const int j0 = window ? max(0, pos - window + 1) : 0;
-    float m = -INFINITY, l = 0.0f, acc[4] = {0, 0, 0, 0};
-    const float scale = rsqrtf(128.0f);
-    for (int j = j0 + warp; j <= pos; j += 4) {
-        const int row = j % kv_cap;
-        const uint2 kr = *reinterpret_cast<const uint2*>(Kc + (size_t)row * 1024 + kvh * 128 + lane * 4);
-        const float2 k01 = __half22float2(*reinterpret_cast<const __half2*>(&kr.x));
-        const float2 k23 = __half22float2(*reinterpret_cast<const __half2*>(&kr.y));
-        float d = warp_sum(qv[0] * k01.x + qv[1] * k01.y + qv[2] * k23.x + qv[3] * k23.y) * scale;
-        const int dist = pos - j;
-        if (dist < extent) d += warp_sum(lane < 16 ? rs[lane] * relbias[dist * 16 + lane] : 0.0f);
-        const float mn = fmaxf(m, d);
-        const float corr = __expf(m - mn), p = __expf(d - mn);
-        l = l * corr + p;
-        const uint2 vr = *reinterpret_cast<const uint2*>(Vc + (size_t)row * 1024 + kvh * 128 + lane * 4);
-        const float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&vr.x));
-        const float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&vr.y));
-        acc[0] = acc[0] * corr + p * v01.x;
-        acc[1] = acc[1] * corr + p * v01.y;
-        acc[2] = acc[2] * corr + p * v23.x;
-        acc[3] = acc[3] * corr + p * v23.y;
-        m = mn;
-    }
-    if (lane == 0) { wm[warp] = m; wl[warp] = l; }
-    for (int t = 0; t < 4; ++t) wacc[warp][lane * 4 + t] = acc[t];
-    __syncthreads();
-    // 128 threads: one output dim each
-    const int dim = threadIdx.x;
-    const float s = sink[h];
-    float M = s;
-    for (int w = 0; w < 4; ++w) M = fmaxf(M, wm[w]);
-    float L = __expf(s - M), o = 0.0f;
-    for (int w = 0; w < 4; ++w) {
-        if (wm[w] == -INFINITY) continue;
-        const float e = __expf(wm[w] - M);
-        L += wl[w] * e;
-        o += wacc[w][dim] * e;
-    }
-    const float g = gate[h * 128 + dim];
-    o = o / L * (1.0f / (1.0f + __expf(-g)));
-    out[h * 128 + dim] = o;
-    warp_quant32(o, oq + h * 128 + warp * 32, od + h * 4 + warp);
 }
 
 // Router: logits = W x (F32 rows, one warp each, multi-block); the last block to finish does the top-k.

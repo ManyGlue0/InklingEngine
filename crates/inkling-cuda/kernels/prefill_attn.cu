@@ -105,8 +105,8 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_prefill(const float* 
             const int idx = threadIdx.x + 128 * i, rr = idx >> 3, pp = idx & 7;
             const int j = k0 + rr;
             if (j <= jhi) {
-                kv_load16(Kc, kv_kfmt(kvfmt), (size_t)(j % kv_cap), kvh, pp, ks + rr * KS + pp * 16);
-                kv_load16(Vc, kv_vfmt(kvfmt), (size_t)(j % kv_cap), kvh, pp, vs + rr * KS + pp * 16);
+                kv_load16(Kc, kv_kfmt(kvfmt), kv_cap, (size_t)(j % kv_cap), kvh, pp, ks + rr * KS + pp * 16);
+                kv_load16(Vc, kv_vfmt(kvfmt), kv_cap, (size_t)(j % kv_cap), kvh, pp, vs + rr * KS + pp * 16);
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
                 reinterpret_cast<uint4*>(ks + rr * KS + pp * 16)[0] = z;

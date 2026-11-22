@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         Some("kvstudy") if args.len() > 1 => kvstudy(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32768)),
         Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
         Some("cachetest") if args.len() > 1 => cachetest(&args[1]),
+        Some("attnbench") if args.len() > 1 => attnbench(args[1].parse()?, args.get(2).map(String::as_str).unwrap_or("q6"), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200)),
         Some("rendertest") if args.len() > 1 => rendertest(&args[1]),
         Some("visiontest") if args.len() > 2 => visiontest(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(400)),
         Some("serve") if args.len() > 1 => serve(&args[1], &args[2..]),
@@ -737,6 +738,77 @@ fn smoke() -> Result<()> {
             best = best.min(t.elapsed().as_secs_f64() / n as f64);
         }
         println!("  ink_pattern_bw8s scales {}: {:.1} us = {:.0} GB/s", if mode == 1 { "separate" } else { "after row" }, best * 1e6, total as f64 / best / 1e9);
+    }
+    Ok(())
+}
+
+/// Decode attention microbenchmark on a synthetic cache (no model needed):
+/// inkling attnbench <depth> [kv type: q6 | q8:q4 | ...] [iterations]. INKLING_WINDOW=1024 tests a sliding-window
+/// ring. Compares ink_attn_mma against ink_attn_split on the same inputs, then times both.
+fn attnbench(depth: usize, kv: &str, iters: usize) -> Result<()> {
+    use inkling_cuda::Arg;
+    use inkling_engine::KvType;
+    let (k, v) = match kv.split_once(':') {
+        Some((a, b)) => (KvType::parse(a)?, KvType::parse(b)?),
+        None => (KvType::parse(kv)?, KvType::parse(kv)?),
+    };
+    let window: usize = std::env::var("INKLING_WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let gpu = Gpu::new(0)?;
+    let cap = if window > 0 { window + 2048 } else { depth + 16 };
+    let rows = depth.min(cap);
+    let kc = gpu.alloc(cap * 8 * k.head_bytes())?;
+    let vc = gpu.alloc(cap * 8 * v.head_bytes())?;
+    gpu.launch("ink_kv_fill", (rows as u32, 8), 128, &[Arg::Ptr(kc.ptr), Arg::I32(k as i32), Arg::I32(cap as i32), Arg::I32(rows as i32), Arg::I32(1), Arg::F32(2.0)])?;
+    gpu.launch("ink_kv_fill", (rows as u32, 8), 128, &[Arg::Ptr(vc.ptr), Arg::I32(v as i32), Arg::I32(cap as i32), Arg::I32(rows as i32), Arg::I32(2), Arg::F32(1.0)])?;
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let mut rnd = move |a: f32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * a
+    };
+    let q: Vec<f32> = (0..24 * 128).map(|_| rnd(3.0)).collect();
+    let r: Vec<f32> = (0..24 * 16).map(|_| rnd(0.5)).collect();
+    let gate: Vec<f32> = (0..24 * 128).map(|_| rnd(2.0)).collect();
+    let sink: Vec<f32> = (0..24).map(|_| rnd(2.0)).collect();
+    let relbias: Vec<f32> = (0..1024 * 16).map(|_| rnd(0.5)).collect();
+    let (qb, rb, gb, sb, relb) = (gpu.upload_f32(&q)?, gpu.upload_f32(&r)?, gpu.upload_f32(&gate)?, gpu.upload_f32(&sink)?, gpu.upload_f32(&relbias)?);
+    let step = gpu.upload(inkling_cuda::as_bytes(&[0i32, depth as i32 - 1, 0, 0]))?;
+    let out = gpu.alloc(24 * 128 * 4)?;
+    let oq = gpu.alloc(24 * 128)?;
+    let od = gpu.alloc(24 * 4 * 4)?;
+    let part = gpu.alloc(8 * 64 * 3 * 130 * 4)?;
+    let cnt = gpu.alloc(8 * 4)?;
+    let fmt = k as i32 | (v as i32) << 4;
+    let ns: u32 = std::env::var("INKLING_SPLITS").ok().and_then(|s| s.parse().ok()).unwrap_or(if depth <= 32768 { 32 } else { 64 });
+    let launch = |name: &str| {
+        gpu.launch(name, (8, ns), 128, &[
+            Arg::Ptr(qb.ptr), Arg::Ptr(rb.ptr), Arg::Ptr(sb.ptr), Arg::Ptr(kc.ptr), Arg::Ptr(vc.ptr), Arg::Ptr(relb.ptr), Arg::Ptr(gb.ptr),
+            Arg::Ptr(out.ptr), Arg::Ptr(oq.ptr), Arg::Ptr(od.ptr), Arg::Ptr(step.ptr), Arg::I32(cap as i32), Arg::I32(window as i32), Arg::I32(1024),
+            Arg::Ptr(part.ptr), Arg::Ptr(cnt.ptr), Arg::I32(0), Arg::I32(0), Arg::I32(fmt),
+        ])
+    };
+    launch("ink_attn_split")?;
+    let a = gpu.read_f32(out.ptr, 24 * 128)?;
+    launch("ink_attn_mma")?;
+    let b = gpu.read_f32(out.ptr, 24 * 128)?;
+    let mag = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let err = a.iter().zip(&b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    let nan = b.iter().any(|x| !x.is_finite());
+    println!("depth {depth}, K {} V {}, window {window}: max |mma - split| = {err:.2e} (max |out| {mag:.3}){}", k.name(), v.name(), if nan { "  NON-FINITE OUTPUT" } else { "" });
+    let bytes = window.max(0).min(depth).max(if window > 0 { 0 } else { depth }) as f64 * 8.0 * (k.head_bytes() + v.head_bytes()) as f64;
+    for name in ["ink_attn_split", "ink_attn_mma"] {
+        for _ in 0..3 {
+            launch(name)?;
+        }
+        gpu.sync()?;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch(name)?;
+        }
+        gpu.sync()?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("  {name:<15} {us:8.1} us  {:6.0} GB/s", bytes / us / 1e3);
     }
     Ok(())
 }
