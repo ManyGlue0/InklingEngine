@@ -179,7 +179,7 @@ If you would rather not install it, run `cargo build --release` instead and call
 **Download the model** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth):
 `Inkling-2-Mini-UD-Q4_K_XL.gguf`, plus `mmproj-F32.gguf` if you want image input.
 
-**Run it** (from an unzipped release, type `.inkling.exe` on Windows or `./inkling` on Linux instead of `inkling`):
+**Run it** (from an unzipped release, type `.\inkling.exe` on Windows or `./inkling` on Linux instead of `inkling`):
 
 ```sh
 # OpenAI-compatible server at http://127.0.0.1:8080/v1 (point any OpenAI client or chat UI at it)
