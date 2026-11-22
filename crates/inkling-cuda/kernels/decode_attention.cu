@@ -78,8 +78,8 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_split(const float* __
             const int idx = lane + 32 * i, rr = idx >> 3, pp = idx & 7;
             const int j = t0 + rr;
             if (j < s1) {
-                kv_load16(Kc, kvfmt, (size_t)(j % kv_cap), kvh, pp, kt + rr * KSTRIDE + pp * 16);
-                kv_load16(Vc, kvfmt, (size_t)(j % kv_cap), kvh, pp, vt + rr * HD + pp * 16);
+                kv_load16(Kc, kv_kfmt(kvfmt), (size_t)(j % kv_cap), kvh, pp, kt + rr * KSTRIDE + pp * 16);
+                kv_load16(Vc, kv_vfmt(kvfmt), (size_t)(j % kv_cap), kvh, pp, vt + rr * HD + pp * 16);
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
                 reinterpret_cast<uint4*>(kt + rr * KSTRIDE + pp * 16)[0] = z;

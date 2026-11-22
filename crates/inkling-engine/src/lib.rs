@@ -46,12 +46,63 @@ pub(crate) fn check_vram(free: usize, need: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// KV cache format of the full-attention slots (the sliding-window rings are always f16). Quantized formats use
+/// groups of 32 channels with an f16 scale; see `kv_store` in decode.cu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvType {
+    F16 = 0,
+    Q6 = 1,
+    Q4 = 2,
+    Q8 = 3,
+}
+
+impl KvType {
+    /// bytes per position and kv head (128 channels)
+    pub fn head_bytes(self) -> usize {
+        match self {
+            KvType::F16 => 256,
+            KvType::Q6 => 104,
+            KvType::Q4 => 72,
+            KvType::Q8 => 136,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            KvType::F16 => "f16",
+            KvType::Q6 => "q6",
+            KvType::Q4 => "q4",
+            KvType::Q8 => "q8",
+        }
+    }
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "f16" | "fp16" | "16" => KvType::F16,
+            "q8" | "q8_0" | "8" => KvType::Q8,
+            "q6" | "6" => KvType::Q6,
+            "q4" | "q4_0" | "4" => KvType::Q4,
+            _ => anyhow::bail!("unknown KV cache type `{s}` (expected q4, q6, q8 or f16)"),
+        })
+    }
+    /// K and V types from INKLING_KV (both), INKLING_KV_K / INKLING_KV_V (each); default q6
+    pub fn from_env() -> Result<(Self, Self)> {
+        let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| Self::parse(&v)).transpose();
+        let both = get("INKLING_KV")?.unwrap_or(KvType::Q6);
+        Ok((get("INKLING_KV_K")?.unwrap_or(both), get("INKLING_KV_V")?.unwrap_or(both)))
+    }
+}
+
+/// KV cache bytes per context position over all full-attention slots (what grows with --ctx).
+pub fn kv_bytes_per_token(cfg: &Config, k: KvType, v: KvType) -> usize {
+    let n_full = cfg.schedule().iter().filter(|p| !cfg.is_swa[p.phys]).count();
+    n_full * cfg.n_head_kv * (k.head_bytes() + v.head_bytes())
+}
+
 /// Per-slot recurrent state: KV cache + short-conv histories.
 struct Slot {
     k: DevBuf,
     v: DevBuf,
     kv_cap: usize,
-    /// cache format: 0 = f16, 1 = q6 (6-bit + f16 scale per 32 channels)
+    /// packed cache format for the kernels: K type in bits 0..3, V type in bits 4..7 (KvType values)
     kv_fmt: i32,
     conv: DevBuf, // [k: 3x1024][v: 3x1024][attn: 3xD][ffn: 3xD] floats
 }
@@ -204,6 +255,7 @@ impl Engine {
                 && cfg.n_head == 24 && cfg.n_head_kv == 8 && cfg.n_rel == 16,
             "unsupported model dimensions"
         );
+        ensure!(n_ctx >= 1 && n_ctx <= cfg.context_length, "--ctx {n_ctx} is outside the model's range (1 to {})", cfg.context_length);
         let gpu = Gpu::new(0)?;
         let d = cfg.n_embd;
         let kvw = cfg.n_head_kv * cfg.head_dim;
@@ -211,18 +263,15 @@ impl Engine {
         for p in cfg.schedule() {
             slot_phys[p.slot] = p.phys;
         }
-        let kv_q6 = match std::env::var("INKLING_KV").as_deref() {
-            Ok("f16") => false,
-            Ok("q6") | Err(_) => true,
-            Ok(other) => anyhow::bail!("INKLING_KV={other}: expected f16 or q6"),
-        };
+        let (kv_k, kv_v) = KvType::from_env()?;
+        let kv_quant = kv_k != KvType::F16 || kv_v != KvType::F16;
         // refuse to start when the model does not fit in free VRAM: on Windows the driver would otherwise page the
         // overflow (and other applications' GPU memory) into system RAM until the machine stalls
         let kv_bytes: usize = (0..cfg.n_slots())
             .map(|s| {
                 let swa = cfg.is_swa[slot_phys[s]];
                 let cap = if swa { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
-                2 * cap * if !swa && kv_q6 { 8 * 104 } else { kvw * 2 }
+                if swa { 2 * cap * kvw * 2 } else { cap * cfg.n_head_kv * (kv_k.head_bytes() + kv_v.head_bytes()) }
             })
             .sum();
         let weight_bytes: usize = g.tensors.iter().map(|t| t.n_bytes).sum();
@@ -235,13 +284,13 @@ impl Engine {
             // sliding-window ring: a prefill chunk writes its K/V before attending, so window + chunk - 1 must fit
             let swa = cfg.is_swa[slot_phys[s]];
             let cap = if swa { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
-            // full-attention slots grow with the context: 6-bit cache (KV study: ~q8 quality); sliding-window
-            // rings stay f16 (fixed size)
-            let kv_fmt = if !swa && kv_q6 { 1 } else { 0 };
-            let row_bytes = if kv_fmt == 1 { 8 * 104 } else { kvw * 2 };
+            // full-attention slots grow with the context and use the chosen format (default q6, KV study: ~q8
+            // quality); sliding-window rings stay f16 (fixed size)
+            let (fk, fv) = if swa { (KvType::F16, KvType::F16) } else { (kv_k, kv_v) };
+            let kv_fmt = fk as i32 | (fv as i32) << 4;
             slots.push(Slot {
-                k: gpu.alloc(cap * row_bytes)?,
-                v: gpu.alloc(cap * row_bytes)?,
+                k: gpu.alloc(cap * cfg.n_head_kv * fk.head_bytes())?,
+                v: gpu.alloc(cap * cfg.n_head_kv * fv.head_bytes())?,
                 kv_cap: cap,
                 kv_fmt,
                 conv: gpu.alloc(3 * (2 * kvw + 2 * d) * F32)?,
@@ -305,7 +354,7 @@ impl Engine {
         };
         ensure!(std::env::var("INKLING_MOE").as_deref() == Ok("7") || moe_blocks > 0, "persistent MoE kernel does not fit on this GPU");
         let attn_splits = if std::env::var("INKLING_ATTN").as_deref() == Ok("old") {
-            ensure!(!kv_q6, "INKLING_ATTN=old needs INKLING_KV=f16");
+            ensure!(!kv_quant, "INKLING_ATTN=old needs INKLING_KV=f16");
             0
         } else if n_ctx <= 32768 {
             32

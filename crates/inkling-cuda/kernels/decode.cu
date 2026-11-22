@@ -851,10 +851,18 @@ __device__ __forceinline__ float kv_fakequant(float v, int bits) {
     return fminf(fmaxf(rintf(v / s), -qmax), qmax) * s;
 }
 
-// KV cache formats. fmt 0: f16 [row][8 heads x 128]. fmt 1 (q6): per row and kv head 104 bytes =
-// ql[64] (low 4 bits, channel c in byte c/2, nibble c&1) | qh[32] (high 2 bits, byte c/4, bits 2(c&3)) |
-// 4 f16 scales (one per 32 channels); values are q - 32 with q in 1..63 (symmetric 6-bit).
-constexpr int KVQ6_HEAD = 104, KVQ6_ROW = 8 * KVQ6_HEAD;
+// KV cache formats (per row and kv head of 128 channels; quant groups of 32 channels with an f16 scale):
+//   0 f16: [row][8 heads x 128] halves.
+//   1 q6 (104 B): ql[64] (low 4 bits, channel c in byte c/2, nibble c&1) | qh[32] (high 2 bits, byte c/4, bits 2(c&3)) |
+//      4 f16 scales; values q - 32, q in 1..63 (symmetric).
+//   2 q4 (72 B): q[64] (channel c in byte c/2, nibble c&1) | 4 f16 scales; values q - 8, q in 0..15 (as ggml q4_0: the
+//      scale is the signed extreme / -8, so the largest-magnitude value maps to -8 exactly).
+//   3 q8 (136 B): int8 q[128] | 4 f16 scales; values in -127..127 (symmetric).
+// Kernels take a packed format: K format in bits 0..3, V format in bits 4..7.
+constexpr int KVQ6_HEAD = 104, KVQ4_HEAD = 72, KVQ8_HEAD = 136;
+__host__ __device__ constexpr int kv_head_bytes(int fmt) { return fmt == 1 ? KVQ6_HEAD : fmt == 2 ? KVQ4_HEAD : fmt == 3 ? KVQ8_HEAD : 256; }
+__device__ __forceinline__ int kv_kfmt(int packed) { return packed & 15; }
+__device__ __forceinline__ int kv_vfmt(int packed) { return (packed >> 4) & 15; }
 
 // Store channel c (= 32 * warp + lane, one quant group per warp) of kv head h at cache row `row`.
 __device__ __forceinline__ void kv_store(void* cache, int fmt, size_t row, int h, int c, float v) {
@@ -862,13 +870,34 @@ __device__ __forceinline__ void kv_store(void* cache, int fmt, size_t row, int h
         reinterpret_cast<__half*>(cache)[row * 1024 + h * 128 + c] = __float2half(v);
         return;
     }
-    uint8_t* b = reinterpret_cast<uint8_t*>(cache) + row * KVQ6_ROW + h * KVQ6_HEAD;
+    const int hb = kv_head_bytes(fmt);
+    uint8_t* b = reinterpret_cast<uint8_t*>(cache) + row * (8 * hb) + h * hb;
+    const int lane = threadIdx.x & 31;
     const float amax = warp_max(fabsf(v));
+    if (fmt == 3) {
+        const __half sh = __float2half(amax / 127.0f);
+        const float s = __half2float(sh);
+        const int q = s == 0.0f ? 0 : (int)fminf(fmaxf(rintf(v / s), -127.0f), 127.0f);
+        reinterpret_cast<int8_t*>(b)[c] = (int8_t)q;
+        if (lane == 0) reinterpret_cast<__half*>(b + 128)[c >> 5] = sh;
+        return;
+    }
+    if (fmt == 2) {
+        // signed extreme of the group (first lane holding the largest magnitude)
+        const unsigned m = __ballot_sync(0xffffffffu, fabsf(v) == amax);
+        const float ext = __shfl_sync(0xffffffffu, v, __ffs(m) - 1);
+        const __half sh = __float2half(ext / -8.0f);
+        const float s = __half2float(sh);
+        const int q = s == 0.0f ? 8 : (int)fminf(fmaxf(rintf(v / s) + 8.0f, 0.0f), 15.0f);
+        const int q1 = __shfl_down_sync(0xffffffffu, q, 1);
+        if ((c & 1) == 0) b[c >> 1] = (uint8_t)(q | (q1 << 4));
+        if (lane == 0) reinterpret_cast<__half*>(b + 64)[c >> 5] = sh;
+        return;
+    }
     const __half sh = __float2half(amax / 31.0f);
     const float s = __half2float(sh);
     const int q = (s == 0.0f ? 0 : (int)fminf(fmaxf(rintf(v / s), -31.0f), 31.0f)) + 32;
     const int q1 = __shfl_down_sync(0xffffffffu, q, 1), q2 = __shfl_down_sync(0xffffffffu, q, 2), q3 = __shfl_down_sync(0xffffffffu, q, 3);
-    const int lane = threadIdx.x & 31;
     if ((c & 1) == 0) b[c >> 1] = (uint8_t)((q & 15) | ((q1 & 15) << 4));
     if ((c & 3) == 0) b[64 + (c >> 2)] = (uint8_t)((q >> 4) | ((q1 >> 4) << 2) | ((q2 >> 4) << 4) | ((q3 >> 4) << 6));
     if (lane == 0) reinterpret_cast<__half*>(b + 96)[c >> 5] = sh;
@@ -882,17 +911,40 @@ __device__ __forceinline__ void kv_load16(const void* cache, int fmt, size_t row
         reinterpret_cast<uint4*>(dst)[1] = s[1];
         return;
     }
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(cache) + row * KVQ6_ROW + h * KVQ6_HEAD;
-    const uint2 lo = *reinterpret_cast<const uint2*>(b + 8 * p);
-    const uint32_t hi = *reinterpret_cast<const uint32_t*>(b + 64 + 4 * p);
-    const float s = __half2float(reinterpret_cast<const __half*>(b + 96)[p >> 1]);
-    __align__(16) __half out[16];
+    const int hb = kv_head_bytes(fmt);
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(cache) + row * (8 * hb) + h * hb;
+    __align__(16) __half2 out[8];
+    if (fmt == 3) {
+        const uint2 q0 = *reinterpret_cast<const uint2*>(b + 16 * p), q1 = *reinterpret_cast<const uint2*>(b + 16 * p + 8);
+        const __half2 s2 = __half2half2(reinterpret_cast<const __half*>(b + 128)[p >> 1]);
+        const uint32_t w[4] = {q0.x, q0.y, q1.x, q1.y};
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const uint32_t lw = i < 8 ? lo.x : lo.y;
-        const int low = (lw >> (4 * (i & 7))) & 15;
-        const int high = (hi >> (2 * i)) & 3;
-        out[i] = __float2half((float)((low | (high << 4)) - 32) * s);
+        for (int i = 0; i < 4; ++i) {
+            const int8_t* c = reinterpret_cast<const int8_t*>(&w[i]);
+            out[2 * i] = __hmul2(__floats2half2_rn((float)c[0], (float)c[1]), s2);
+            out[2 * i + 1] = __hmul2(__floats2half2_rn((float)c[2], (float)c[3]), s2);
+        }
+    } else if (fmt == 2) {
+        const uint2 lo = *reinterpret_cast<const uint2*>(b + 8 * p);
+        const float s = __half2float(reinterpret_cast<const __half*>(b + 64)[p >> 1]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t lw = i < 4 ? lo.x : lo.y;
+            const int sh = 8 * (i & 3);
+            out[i] = __floats2half2_rn((float)((int)((lw >> sh) & 15) - 8) * s, (float)((int)((lw >> (sh + 4)) & 15) - 8) * s);
+        }
+    } else {
+        const uint2 lo = *reinterpret_cast<const uint2*>(b + 8 * p);
+        const uint32_t hi = *reinterpret_cast<const uint32_t*>(b + 64 + 4 * p);
+        const float s = __half2float(reinterpret_cast<const __half*>(b + 96)[p >> 1]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t lw = i < 4 ? lo.x : lo.y;
+            const int e = 2 * i, o = 2 * i + 1;
+            const int ve = (((lw >> (4 * (e & 7))) & 15) | (((hi >> (2 * e)) & 3) << 4)) - 32;
+            const int vo = (((lw >> (4 * (o & 7))) & 15) | (((hi >> (2 * o)) & 3) << 4)) - 32;
+            out[i] = __floats2half2_rn((float)ve * s, (float)vo * s);
+        }
     }
     reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(out)[0];
     reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(out)[1];
@@ -946,7 +998,7 @@ INK_EXTERN void ink_attn_prep2(float* __restrict__ q, const float* __restrict__ 
         float f;
         if (isk) f = fminf(1.0f, qk_clip / (sqrtf(sum128(o * o)) + 1e-6f));
         else f = rsqrtf(sum128(o * o) / 128.0f + eps);
-        kv_store(isk ? Kc : Vc, kvfmt, row, h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
+        kv_store(isk ? Kc : Vc, isk ? kv_kfmt(kvfmt) : kv_vfmt(kvfmt), row, h, tid, kv_fakequant(o * f, isk ? kbits : vbits));
     } else {
         const int h = task - 40;
         const float y = tid < 16 ? r[h * 16 + tid] * rclip[h * 16 + tid] : 0.0f;

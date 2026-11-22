@@ -148,13 +148,19 @@ impl Engine {
     /// Prefill a fresh sequence and return the (soft-capped) logits of every position, row-major [n][vocab].
     /// Validation / perplexity path.
     pub fn prefill_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.reset()?;
-        let nv = self.cfg.n_vocab_unpadded;
-        let mut out = Vec::with_capacity(tokens.len() * nv);
-        for (i, ch) in tokens.chunks(PREFILL_CHUNK).enumerate() {
-            self.prefill_chunk(ch, i * PREFILL_CHUNK, Some(&mut out))?;
-        }
+        let mut out = Vec::with_capacity(tokens.len() * self.cfg.n_vocab_unpadded);
+        self.prefill_each(tokens, &mut |_, row| out.extend_from_slice(row))?;
         Ok(out)
+    }
+
+    /// Prefill a fresh sequence and call `f(position, logits)` for every position (long-context evaluation without
+    /// holding all logits in memory).
+    pub fn prefill_each(&mut self, tokens: &[u32], f: &mut dyn FnMut(usize, &[f32])) -> Result<()> {
+        self.reset()?;
+        for (i, ch) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+            self.prefill_chunk(ch, i * PREFILL_CHUNK, Some(&mut *f))?;
+        }
+        Ok(())
     }
 
     fn pre_mix(&self, states: &[u64], q: u64, nq: usize, out: u64, outn: u64, nw: [u64; 4], xq: (u64, u64), t: usize) -> Result<()> {
@@ -250,7 +256,7 @@ impl Engine {
         Ok(())
     }
 
-    fn prefill_chunk(&mut self, tokens: &[u32], pos0: usize, logits_out: Option<&mut Vec<f32>>) -> Result<()> {
+    fn prefill_chunk(&mut self, tokens: &[u32], pos0: usize, logits_out: Option<&mut dyn FnMut(usize, &[f32])>) -> Result<()> {
         let t = tokens.len();
         ensure!(t > 0 && t <= PREFILL_CHUNK, "bad chunk length");
         ensure!(pos0 + t <= self.n_ctx, "prompt exceeds the context ({})", self.n_ctx);
@@ -455,8 +461,12 @@ if std::env::var("INKLING_PRE_ATTN").as_deref() == Ok("split") {
                 let (xq, xd) = p.fq.at(r0 * d);
                 self.pre_gemm(&[(self.w.output, (xq, xd), lg.ptr, nv, nv)], d, rows)?;
                 let v = self.gpu.read_f32(lg.ptr, rows * nv)?;
+                let mut row = vec![0f32; nvu];
                 for rr in 0..rows {
-                    out.extend(v[rr * nv..rr * nv + nvu].iter().map(|&z| cap * (z / cap).tanh()));
+                    for (o, &z) in row.iter_mut().zip(&v[rr * nv..rr * nv + nvu]) {
+                        *o = cap * (z / cap).tanh();
+                    }
+                    out(pos0 + r0 + rr, &row);
                 }
             }
         }

@@ -4,8 +4,26 @@ use anyhow::{Result, bail, ensure};
 use inkling_cuda::Gpu;
 use inkling_cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
 
+/// Engine-wide flags accepted by every command; they are forwarded as the INKLING_* variables the engine reads.
+const ENGINE_FLAGS: &[(&str, &str)] = &[("--kv", "INKLING_KV"), ("--kv-k", "INKLING_KV_K"), ("--kv-v", "INKLING_KV_V")];
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(v.to_owned())),
+            _ => (a.clone(), None),
+        };
+        if let Some(&(_, var)) = ENGINE_FLAGS.iter().find(|(f, _)| *f == name) {
+            let Some(v) = inline.or_else(|| it.next()) else { bail!("{name} needs a value") };
+            inkling_engine::KvType::parse(&v)?;
+            // SAFETY: single-threaded at this point, before any engine or server thread starts
+            unsafe { std::env::set_var(var, v) };
+        } else {
+            args.push(a);
+        }
+    }
     match args.first().map(String::as_str) {
         Some("smoke") => smoke(),
         Some("vraminfo") => {
@@ -19,7 +37,7 @@ fn main() -> Result<()> {
         Some("validate") if args.len() > 2 && args.iter().any(|a| a == "--prefill") => validate_prefill(&args[1], &args[2]),
         Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
         Some("gemmtest") if args.len() > 1 => gemmtest(&args[1]),
-        Some("kvstudy") if args.len() > 1 => kvstudy(&args[1]),
+        Some("kvstudy") if args.len() > 1 => kvstudy(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32768)),
         Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
         Some("cachetest") if args.len() > 1 => cachetest(&args[1]),
         Some("rendertest") if args.len() > 1 => rendertest(&args[1]),
@@ -38,6 +56,8 @@ fn main() -> Result<()> {
              \x20 inkling serve <model.gguf> [--mmproj FILE] [--ctx N] [--host H] [--port P] [--api-key KEY] [--model-id NAME]\n\
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
+             \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6),\n\
+             \x20 or --kv-k / --kv-v to set keys and values separately\n\
              \x20 inkling bench <model.gguf> [n] | benchpp <model.gguf> [n] | benchctx <model.gguf> <n>\n\
              \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | vraminfo | smoke | --version\n\n\
              developer checks: validate, kvstudy, cachetest, rendertest, gemmtest, visiontest (see README)",
@@ -127,57 +147,98 @@ fn gemmtest(model: &str) -> Result<()> {
     Ok(())
 }
 
-/// KV-cache format study: KL / top-1 of fake-quantized K/V caches against the f16 cache, on the long chat
-/// dump prompt and on ~8k tokens of repository text (docs + sources).
-fn kvstudy(model: &str) -> Result<()> {
-    let mut eng = inkling_engine::Engine::load(model, 16384)?;
+/// KV-cache format study: KL / top-1 of each cache type (K and V) against the f16 cache, over `n` tokens of
+/// llama.cpp docs and sources (reference/ checkout). Loads the engine once per type.
+fn kvstudy(model: &str, n: usize) -> Result<()> {
+    use inkling_engine::KvType::{self, *};
     let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
-    let nv = eng.cfg.n_vocab_unpadded;
-    let mut texts: Vec<(&str, Vec<u32>)> = Vec::new();
-    texts.push(("chat 807", tok.encode(&std::fs::read_to_string("tests/data/prompt_long.txt")?, true)?));
-    let mut src = String::new();
-    for f in ["docs/MODEL.md", "README.md", "crates/inkling-engine/src/prefill.rs", "crates/inkling-cuda/kernels/prefill_attn.cu", "crates/inkling-core/src/config.rs"] {
-        src.push_str(&std::fs::read_to_string(f).unwrap_or_default());
-        src.push_str("
-
-");
-    }
-    let mut ids = tok.encode(&src, false)?;
-    ids.truncate(8192);
-    texts.push(("repo 8k", ids));
-    let configs: &[(&str, &str, &str, bool)] = &[
-        ("K8 V8", "8", "8", false), ("K6 V6", "6", "6", false), ("K5 V5", "5", "5", false), ("K4 V4", "4", "4", false),
-        ("K8 V4", "8", "4", false), ("K4 V8", "4", "8", false), ("K6 V4", "6", "4", false),
-        ("K8 V8 all", "8", "8", true), ("K6 V6 all", "6", "6", true), ("K4 V4 all", "4", "4", true),
-    ];
-    let set = |k: &str, v: &str, all: bool| unsafe {
-        std::env::set_var("INKLING_KQ", k);
-        std::env::set_var("INKLING_VQ", v);
-        if all { std::env::set_var("INKLING_KV_ALL", "1") } else { std::env::remove_var("INKLING_KV_ALL") }
-    };
-    for (name, ids) in &texts {
-        set("0", "0", false);
-        let base = eng.prefill_logits(ids)?;
-        let n = ids.len();
-        println!("== {name} ({n} tokens), against the f16 cache (sliding-window layers f16 unless 'all')");
-        for &(cname, k, v, all) in configs {
-            set(k, v, all);
-            let lg = eng.prefill_logits(ids)?;
-            let mut kls: Vec<f64> = Vec::with_capacity(n);
-            let mut agree = 0;
-            for t in 0..n {
-                let (kl, top1) = kl_top1(&lg[t * nv..(t + 1) * nv], &base[t * nv..(t + 1) * nv]);
-                kls.push(kl);
-                agree += top1 as usize;
+    // evaluation text: llama.cpp docs (prose) then its core sources (code), from the git-ignored reference checkout
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in ["reference/src/docs", "reference/src/src"] {
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        let mut found = Vec::new();
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d)?.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "md" || x == "cpp" || x == "h") {
+                    found.push(p);
+                }
             }
-            let mean = kls.iter().sum::<f64>() / n as f64;
-            let late = kls[n / 2..].iter().sum::<f64>() / (n - n / 2) as f64;
-            kls.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!("  {cname:<10} mean KL {mean:.5} (2nd half {late:.5})  median {:.6}  p99 {:.4}  top-1 {:.2}%",
-                kls[n / 2], kls[n * 99 / 100], 100.0 * agree as f64 / n as f64);
+        }
+        found.sort();
+        files.extend(found);
+    }
+    let mut ids = Vec::new();
+    for f in &files {
+        ids.extend(tok.encode(&(std::fs::read_to_string(f).unwrap_or_default() + "\n\n"), false)?);
+        if ids.len() >= n {
+            break;
         }
     }
-    set("0", "0", false);
+    ensure!(ids.len() >= n, "only {} tokens of evaluation text (needs the reference/ checkout)", ids.len());
+    ids.truncate(n);
+    // KL at ~2048 sampled positions (the baseline logits of all positions would not fit in RAM at long context)
+    let stride = (n / 2048).max(1);
+    let keep = |pos: usize| pos % stride == stride - 1;
+    let set = |k: KvType, v: KvType| unsafe {
+        std::env::set_var("INKLING_KV_K", k.name());
+        std::env::set_var("INKLING_KV_V", v.name());
+    };
+    set(F16, F16);
+    let mut base: Vec<Vec<f32>> = Vec::new();
+    {
+        let mut eng = inkling_engine::Engine::load(model, n)?;
+        eng.prefill_each(&ids, &mut |pos, row| {
+            if keep(pos) {
+                base.push(row.to_vec());
+            }
+        })?;
+    }
+    println!("== {n} tokens of llama.cpp docs + sources, KL against the f16 cache at {} positions", base.len());
+    // INKLING_KVSTUDY_FAKE=bits: also fake-quantize K/V to `bits` on top of each cache (sensitivity floor check)
+    if let Ok(b) = std::env::var("INKLING_KVSTUDY_FAKE") {
+        unsafe {
+            std::env::set_var("INKLING_KQ", &b);
+            std::env::set_var("INKLING_VQ", &b);
+        }
+    }
+    // INKLING_KVSTUDY=k:v,k:v,... overrides the list of cache types
+    let mut list = vec![(F16, F16), (Q8, Q8), (Q6, Q6), (Q4, Q4), (Q8, Q6), (Q8, Q4), (Q6, Q4), (Q4, Q6)];
+    if let Ok(spec) = std::env::var("INKLING_KVSTUDY") {
+        list.clear();
+        for kv in spec.split(',') {
+            let (k, v) = kv.split_once(':').unwrap_or((kv, kv));
+            list.push((KvType::parse(k)?, KvType::parse(v)?));
+        }
+    }
+    for (k, v) in list {
+        set(k, v);
+        let mut eng = inkling_engine::Engine::load(model, n)?;
+        let (mut kls, mut agree, mut i) = (Vec::with_capacity(base.len()), 0usize, 0usize);
+        eng.prefill_each(&ids, &mut |pos, row| {
+            if keep(pos) {
+                let (kl, top1) = kl_top1(row, &base[i]);
+                kls.push(kl);
+                agree += top1 as usize;
+                i += 1;
+            }
+        })?;
+        let m = kls.len();
+        let mean = kls.iter().sum::<f64>() / m as f64;
+        let late = kls[3 * m / 4..].iter().sum::<f64>() / (m - 3 * m / 4) as f64;
+        kls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let per_tok = inkling_engine::kv_bytes_per_token(&eng.cfg, k, v);
+        println!(
+            "  K {:<3} V {:<3} {:>6.2} KB/token  mean KL {mean:.5} (last quarter {late:.5})  p99 {:.4}  top-1 {:.2}%",
+            k.name(), v.name(), per_tok as f64 / 1024.0, kls[m * 99 / 100], 100.0 * agree as f64 / m as f64
+        );
+    }
+    unsafe {
+        std::env::remove_var("INKLING_KV_K");
+        std::env::remove_var("INKLING_KV_V");
+    }
     Ok(())
 }
 
