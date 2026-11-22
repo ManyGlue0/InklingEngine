@@ -130,6 +130,7 @@ struct ExpW {
     const uint8_t* sc;  // fp4: [E][rows][K/16]; q8: half [E][rows][K/32]
     const float* scale; // per-expert scale or null
     int fmt;            // 0 = q8, 1 = nvfp4
+    int erange;         // prefill grouped GEMMs: experts lo | hi << 16 only (0 = all)
 };
 
 __device__ __forceinline__ float exp_row_dot(const ExpW& w, size_t row, const float* x, int K, const float* lut) {
@@ -361,6 +362,19 @@ INK_EXTERN void ink_moe_down4(ExpW w, const float* __restrict__ h, const int* __
         const float v = exp_row_dot_v3<F>(w, (size_t)e * D + n, hs, &L);
         if ((threadIdx.x & 31) == 0) part[t * D + n] = sw * v;
     }
+}
+
+// CPU-offloaded MoE layer: copy the router output and the q8_1 FFN input into the host-mapped exchange block
+// (layout of cpu_moe::MoeIo: xq i8[D] | xd f32[D/32] | sel i32[8] | wts f32[8] | y f32[D]). One block.
+INK_EXTERN void ink_moe_export(const int8_t* __restrict__ xq, const float* __restrict__ xd, const int* __restrict__ sel,
+                               const float* __restrict__ wts, uint8_t* __restrict__ io, int D) {
+    int* q4 = reinterpret_cast<int*>(io);
+    for (int i = threadIdx.x; i < D / 4; i += blockDim.x) q4[i] = reinterpret_cast<const int*>(xq)[i];
+    float* od = reinterpret_cast<float*>(io + D);
+    for (int i = threadIdx.x; i < D / 32; i += blockDim.x) od[i] = xd[i];
+    int* os = reinterpret_cast<int*>(io + D + D / 8);
+    if (threadIdx.x < 8) os[threadIdx.x] = sel[threadIdx.x];
+    else if (threadIdx.x < 16) reinterpret_cast<float*>(os + 8)[threadIdx.x - 8] = wts[threadIdx.x - 8];
 }
 
 // Short conv + residual: xin = sum of nparts inputs (stride apart), o = (xin + conv(xin)) / sqrt(5);

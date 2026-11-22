@@ -5,6 +5,7 @@
 //! kernel that computes them (depth-attention mix, norms, attention output, expert gate_up).
 
 pub mod cpu_moe;
+pub mod offload;
 mod prefill;
 pub mod repack;
 pub mod vision;
@@ -39,8 +40,8 @@ pub(crate) fn check_vram(free: usize, need: usize, what: &str) -> Result<()> {
     ensure!(
         free >= need + VRAM_MARGIN,
         "not enough free GPU memory: {:.1} GiB free, about {:.1} GiB needed for {what}. Is another InklingEngine \
-         instance (or another GPU-heavy app) running? Close it, or use a smaller --ctx. (INKLING_SKIP_VRAM_CHECK=1 \
-         skips this check.)",
+         instance (or another GPU-heavy app) running? Close it, use a smaller --ctx, or let part of \
+         the model run on the CPU (--offload auto). (INKLING_SKIP_VRAM_CHECK=1 skips this check.)",
         gib(free),
         gib(need + VRAM_MARGIN)
     );
@@ -160,6 +161,20 @@ struct PromptCache {
     snap_tokens: Option<Vec<u32>>,
 }
 
+/// CPU offload state: the expert executor, the host-mapped exchange block, one host-node context per layer, and
+/// the prefill streaming buffers.
+struct CpuOffload {
+    moe: Box<cpu_moe::CpuMoe>,
+    io: HostMapped,
+    cbs: Vec<Box<cpu_moe::HostCb>>,
+    /// two expert-group buffers (gate_up qs | gate_up sc | down qs | down sc), alternating
+    bufs: [DevBuf; 2],
+    copy_stream: std::sync::Arc<inkling_cuda::cudarc::driver::CudaStream>,
+    plan: offload::Plan,
+}
+
+unsafe impl Send for CpuOffload {}
+
 /// Upper bound of the decode attention splits (sizes the partials buffer).
 const ATTN_SPLITS_MAX: usize = 64;
 
@@ -241,6 +256,8 @@ pub struct Engine {
     vision: Option<Vision>,
     /// image embeddings of the current request: (absolute position of the first row, rows)
     embeds: Vec<(usize, ImageEmbed)>,
+    /// MoE layers running on the CPU (declared last: dropped after the graphs that reference it)
+    cpu: Option<CpuOffload>,
 }
 
 /// Optional per-pass hook, called after each layer pass with (slot, engine); use `Engine::debug_buf` to read state.
@@ -276,10 +293,26 @@ impl Engine {
             .sum();
         let weight_bytes: usize =
             g.tensors.iter().filter(|t| !(weights::embed_on_host() && t.name == "token_embd.weight")).map(|t| t.n_bytes).sum();
-        let need = weight_bytes + kv_bytes + VRAM_FIXED;
+        let base_need = weight_bytes + kv_bytes + VRAM_FIXED;
         let free_at_start = gpu.free_vram()?;
-        check_vram(free_at_start, need, &format!("this model at context {n_ctx}"))?;
-        let w = Weights::load(&gpu, &g, &cfg)?;
+        // INKLING_VRAM_LIMIT simulates a smaller card; the planner moves MoE layers to the CPU until the rest fits
+        // (and checks that system RAM can hold them)
+        let vram_free = offload::effective_free_vram(free_at_start, gpu.total_vram()?)?;
+        let plan = offload::plan(&g, &cfg, base_need, vram_free, VRAM_MARGIN, n_ctx)?;
+        let need = plan.vram_need;
+        check_vram(vram_free, need, &format!("this model at context {n_ctx}"))?;
+        let mut w = Weights::load(&gpu, &g, &cfg, &plan.on_cpu)?;
+        let cpu = if plan.n_cpu() > 0 {
+            let threads = std::env::var("INKLING_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(cpu_moe::default_threads);
+            let moe = Box::new(cpu_moe::CpuMoe::new(std::mem::take(&mut w.cpu), d, cfg.n_ff_exp, cfg.situ_beta, cfg.situ_linear_beta, threads));
+            let io = gpu.alloc_host_mapped(std::mem::size_of::<cpu_moe::MoeIo>())?;
+            let cbs = (0..cfg.n_phys).map(|layer| Box::new(cpu_moe::HostCb { moe: &*moe, io: io.host_ptr() as *mut cpu_moe::MoeIo, layer })).collect();
+            let bufs = [gpu.alloc(plan.group_bytes)?, gpu.alloc(plan.group_bytes)?];
+            let copy_stream = gpu.ctx.new_stream()?;
+            Some(CpuOffload { moe, io, cbs, bufs, copy_stream, plan: plan.clone() })
+        } else {
+            None
+        };
         let mut slots = Vec::with_capacity(cfg.n_slots());
         for s in 0..cfg.n_slots() {
             // sliding-window ring: a prefill chunk writes its K/V before attending, so window + chunk - 1 must fit
@@ -364,7 +397,48 @@ impl Engine {
             let free_now = gpu.free_vram()?;
             eprintln!("vram: estimated {need} B (fixed part {VRAM_FIXED}), used by load {} B", free_at_start.saturating_sub(free_now));
         }
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default(), vision: None, embeds: Vec::new() })
+        if let Some(c) = &cpu {
+            let layers: Vec<String> = (0..cfg.n_phys).filter(|&i| c.plan.on_cpu[i]).map(|i| i.to_string()).collect();
+            eprintln!(
+                "CPU offload: {} of {} MoE layers run on the CPU ({:.1} GiB of experts in system RAM: layers {}; {} threads, {})",
+                c.plan.n_cpu(),
+                cfg.n_phys,
+                c.plan.host_bytes as f64 / (1u64 << 30) as f64,
+                layers.join(","),
+                c.moe.threads(),
+                c.moe.simd()
+            );
+        }
+        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default(), vision: None, embeds: Vec::new(), cpu })
+    }
+
+    /// One-line description of the CPU offload (None when everything runs on the GPU).
+    pub fn offload_summary(&self) -> Option<String> {
+        let c = self.cpu.as_ref()?;
+        let layers: Vec<String> = (0..self.cfg.n_phys).filter(|&i| c.plan.on_cpu[i]).map(|i| i.to_string()).collect();
+        Some(format!(
+            "CPU offload: {} of {} MoE layers in system RAM ({:.1} GiB; layers {}), {} threads, {}",
+            c.plan.n_cpu(),
+            self.cfg.n_phys,
+            c.plan.host_bytes as f64 / (1u64 << 30) as f64,
+            layers.join(","),
+            c.moe.threads(),
+            c.moe.simd()
+        ))
+    }
+
+    /// CPU expert visits run so far and their mean time (us).
+    pub fn cpu_moe_stats(&self) -> Option<(u64, f64)> {
+        let c = self.cpu.as_ref()?;
+        let n = c.moe.calls.load(std::sync::atomic::Ordering::Relaxed);
+        Some((n, c.moe.nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / n.max(1) as f64 / 1e3))
+    }
+
+    fn check_cpu(&self) -> Result<()> {
+        if let Some(c) = &self.cpu {
+            ensure!(!c.moe.failed.swap(false, std::sync::atomic::Ordering::AcqRel), "the CPU expert executor failed (see the panic message above)");
+        }
+        Ok(())
     }
 
     /// Zero all KV caches and conv states (start a new sequence).
@@ -438,6 +512,83 @@ impl Engine {
             }
         }
         Ok((err, mag, ms))
+    }
+
+    /// CPU expert executor microbenchmark of offloaded layer `li` (see CpuMoe::bench).
+    pub fn bench_cpu_moe(&self, li: usize, iters: usize) -> Result<(f64, f64, f64)> {
+        let c = self.cpu.as_ref().context("no layer is offloaded")?;
+        ensure!(c.plan.on_cpu[li], "layer {li} is not offloaded");
+        Ok(c.moe.bench(li, iters))
+    }
+
+    /// Self-test of the CPU expert executor against the GPU kernel (ink_moe8 reading the same pinned weights over
+    /// PCIe) on random q8_1 inputs and random routing, for every offloaded layer. Returns per layer
+    /// (layer, relative RMS error, max |y|).
+    pub fn test_cpu_moe(&self, trials: usize) -> Result<Vec<(usize, f32, f32)>> {
+        let c = self.cpu.as_ref().context("no layer is offloaded (use --offload N)")?;
+        ensure!(self.moe_blocks > 0, "needs the persistent MoE kernel");
+        let (d, f, k) = (self.cfg.n_embd, self.cfg.n_ff_exp, self.cfg.n_expert_used);
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut out = Vec::new();
+        for li in (0..self.cfg.n_phys).filter(|&i| c.plan.on_cpu[i]) {
+            let lw = self.w.layers[li];
+            let (mut num, mut den, mut mag) = (0f64, 0f64, 0f32);
+            for _ in 0..trials {
+                let mut io: Box<cpu_moe::MoeIo> = Box::new(unsafe { std::mem::zeroed() });
+                // activations with a realistic spread: gaussian-ish values, a few large channels
+                let x: Vec<f32> = (0..d).map(|i| ((rnd() + rnd() + rnd() - 1.5) * if i % 97 == 0 { 8.0 } else { 1.0 }) as f32).collect();
+                for b in 0..d / 32 {
+                    let amax = x[32 * b..32 * b + 32].iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let s = amax / 127.0;
+                    io.xd[b] = s;
+                    for i in 0..32 {
+                        io.xq[32 * b + i] = if s == 0.0 { 0 } else { (x[32 * b + i] / s).round() as i8 };
+                    }
+                }
+                let mut sel: Vec<i32> = Vec::new();
+                while sel.len() < k {
+                    let e = (rnd() * self.cfg.n_expert as f64) as i32;
+                    if !sel.contains(&e) {
+                        sel.push(e);
+                    }
+                }
+                io.sel.copy_from_slice(&sel);
+                for t in 0..k {
+                    io.wts[t] = (0.05 + rnd() * 0.3) as f32;
+                }
+                // GPU: ink_moe8 with zero conv weights / state / residual -> x = y / sqrt(5)
+                let xq = self.gpu.upload(inkling_cuda::as_bytes(&io.xq))?;
+                let xd = self.gpu.upload_f32(&io.xd)?;
+                let selb = self.gpu.upload(inkling_cuda::as_bytes(&io.sel))?;
+                let wts = self.gpu.upload_f32(&io.wts)?;
+                let h = self.gpu.alloc(k * f * F32)?;
+                let cw = self.gpu.alloc(4 * d * F32)?;
+                let st = self.gpu.alloc(3 * d * F32)?;
+                let xo = self.gpu.alloc(d * F32)?;
+                let bar = self.gpu.alloc(2 * F32)?;
+                let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32, erange: 0 };
+                self.gpu.launch("ink_moe8", (self.moe_blocks, 1), 256, &[
+                    Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(xq.ptr), Arg::Ptr(xd.ptr), Arg::Ptr(selb.ptr), Arg::Ptr(wts.ptr),
+                    Arg::Ptr(h.ptr), Arg::Ptr(cw.ptr), Arg::Ptr(st.ptr), Arg::Ptr(xo.ptr), Arg::Ptr(0), Arg::Ptr(bar.ptr),
+                    Arg::F32(self.cfg.situ_beta), Arg::F32(self.cfg.situ_linear_beta), Arg::Ptr(0),
+                ])?;
+                let yg: Vec<f32> = self.gpu.read_f32(xo.ptr, d)?.iter().map(|v| v * 5f32.sqrt()).collect();
+                c.moe.run(li, &mut io);
+                for (a, b) in io.y.iter().zip(&yg) {
+                    num += ((a - b) as f64).powi(2);
+                    den += (*b as f64).powi(2);
+                    mag = mag.max(b.abs());
+                }
+            }
+            out.push((li, (num / den.max(1e-30)).sqrt() as f32, mag));
+        }
+        Ok(out)
     }
 
     /// KV format study (INKLING_KQ / INKLING_VQ = bits, INKLING_KV_ALL = also sliding-window layers): bits the
@@ -699,8 +850,18 @@ impl Engine {
                 Arg::Ptr(a.fnorm.ptr), Arg::Ptr(lw.router), Arg::Ptr(lw.probs_bias), Arg::Ptr(a.rlog.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
                 Arg::Ptr(a.counter.ptr), Arg::I32(d as i32), Arg::I32(cfg.n_expert as i32), Arg::I32(k as i32), Arg::F32(cfg.expert_weights_scale),
             ])?;
-            let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32 };
-            if self.moe_blocks > 0 {
+            let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32, erange: 0 };
+            if let Some(c) = self.cpu.as_ref().filter(|c| c.plan.on_cpu[p.phys]) {
+                // experts on the CPU: export the FFN input and routing to mapped memory, run them in a host node, then
+                // the post conv + residual reads the weighted expert sum back over PCIe
+                self.gpu.launch("ink_moe_export", (1, 1), 256, &[
+                    Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr), Arg::Ptr(c.io.dev), Arg::I32(d as i32),
+                ])?;
+                let cb: *const cpu_moe::HostCb = &*c.cbs[p.phys];
+                self.gpu.launch_host(cpu_moe::host_cb, cb as *mut std::ffi::c_void)?;
+                let y = c.io.dev + std::mem::offset_of!(cpu_moe::MoeIo, y) as u64;
+                self.conv_res(y, 1, lw.ffn_post_conv, conv_ffn, a.x.ptr, a.ffn_out.ptr, true)?;
+            } else if self.moe_blocks > 0 {
                 // gate_up + down + expert sum + post conv + residual, one persistent kernel
                 self.gpu.launch("ink_moe8", (self.moe_blocks, 1), 256, &[
                     Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
@@ -889,6 +1050,7 @@ impl Engine {
             }
         }
         self.gpu.sync()?;
+        self.check_cpu()?;
         // the device fed the last prompt token and every sampled token but the last launched one
         let mut fed = prompt.to_vec();
         fed.extend((0..launched - 1).map(|i| self.act.hist.read_i32(i) as u32));

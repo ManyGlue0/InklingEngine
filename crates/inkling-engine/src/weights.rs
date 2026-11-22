@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use inkling_core::{Config, GgmlType, Gguf};
 use inkling_cuda::{DevBuf, Gpu, HostMapped};
 
+use crate::cpu_moe::{CpuExp, CpuLayer};
 use crate::repack::{self, Soa};
 
 /// Expert weight format code passed to kernels.
@@ -86,6 +87,8 @@ pub struct Weights {
     pub output_norm: u64,
     pub output_res_query: u64,
     pub layers: Vec<LayerW>,
+    /// CPU-offloaded MoE layers (expert planes in `host_bufs`), by physical layer
+    pub cpu: Vec<Option<CpuLayer>>,
     pub bytes: usize,
 }
 
@@ -157,11 +160,41 @@ impl Loader<'_> {
         let scale = self.raw_opt(scale)?;
         Ok(ExpM { qs, sc, scale, fmt })
     }
+
+    /// Expert tensor repacked into pinned host memory (CPU offload). The returned ExpM points at the mapped planes
+    /// (a GPU kernel can still read them over PCIe); the per-expert scales are also uploaded.
+    fn experts_host(&mut self, name: &str, scale: &str, host: &mut Vec<HostMapped>) -> Result<(ExpM, CpuExp, Option<Vec<f32>>)> {
+        let t = self.g.require(name)?;
+        ensure!(t.dims.len() == 3, "{name}: expected 3-D expert tensor");
+        let (k, rows, e) = (t.dims[0] as usize, t.dims[1] as usize, t.dims[2] as usize);
+        let fmt = match t.ty {
+            GgmlType::NVFP4 => ExpertFmt::Nvfp4,
+            GgmlType::Q8_0 => ExpertFmt::Q8_0,
+            ty => bail!("{name}: unsupported expert type {ty:?}"),
+        };
+        let qb = if fmt == ExpertFmt::Nvfp4 { rows * e * k / 2 } else { rows * e * k };
+        let mut hq = self.gpu.alloc_host_mapped_uninit(qb).with_context(|| format!("pinning {} MiB of system RAM for {name}", qb >> 20))?;
+        let mut hs = self.gpu.alloc_host_mapped_uninit(rows * e * k / 16).with_context(|| format!("pinning system RAM for {name}"))?;
+        match fmt {
+            ExpertFmt::Nvfp4 => repack::nvfp4_soa_into(self.g.data(t), rows * e, k, hq.as_mut_slice(), hs.as_mut_slice())?,
+            ExpertFmt::Q8_0 => repack::q8_soa_into(self.g.data(t), rows * e, k, hq.as_mut_slice(), hs.as_mut_slice())?,
+        }
+        let scale_dev = self.raw_opt(scale)?;
+        let scale_host = if self.g.tensor(scale).is_some() { Some(f32_rows(self.g, scale)?) } else { None };
+        let m = ExpM { qs: hq.dev, sc: hs.dev, scale: scale_dev, fmt };
+        let c = CpuExp { qs: hq.host_ptr(), sc: hs.host_ptr(), fmt, rows, k };
+        host.push(hq);
+        host.push(hs);
+        Ok((m, c, scale_host))
+    }
 }
 
 impl Weights {
-    pub fn load(gpu: &Gpu, g: &Gguf, cfg: &Config) -> Result<Self> {
+    /// Upload the model; layers with `on_cpu[i]` keep their experts in pinned system RAM instead.
+    pub fn load(gpu: &Gpu, g: &Gguf, cfg: &Config, on_cpu: &[bool]) -> Result<Self> {
         let mut l = Loader { gpu, g, bufs: HashMap::new(), bytes: 0 };
+        let mut host_bufs = Vec::new();
+        let mut cpu = Vec::with_capacity(cfg.n_phys);
         let d = cfg.n_embd;
         let res = f32_rows(g, "loop_res_query.weight")?;
         let kv = f32_rows(g, "loop_kv_res_query.weight")?;
@@ -189,6 +222,15 @@ impl Weights {
             } else {
                 None
             };
+            let (gate_up, down) = if on_cpu.get(i).copied().unwrap_or(false) {
+                let (gu, cgu, sgu) = l.experts_host(&n("ffn_gate_up_exps.weight"), &n("ffn_gate_up_exps.scale"), &mut host_bufs)?;
+                let (dn, cdn, sdn) = l.experts_host(&n("ffn_down_exps.weight"), &n("ffn_down_exps.scale"), &mut host_bufs)?;
+                cpu.push(Some(CpuLayer { gate_up: cgu, down: cdn, gu_scale: sgu, down_scale: sdn }));
+                (gu, dn)
+            } else {
+                cpu.push(None);
+                (l.experts(&n("ffn_gate_up_exps.weight"), &n("ffn_gate_up_exps.scale"))?, l.experts(&n("ffn_down_exps.weight"), &n("ffn_down_exps.scale"))?)
+            };
             layers.push(LayerW {
                 is_swa: cfg.is_swa[i],
                 attn_norm: l.raw_opt(&n("attn_norm.weight"))?,
@@ -214,14 +256,13 @@ impl Weights {
                 ffn_norm: l.raw(&n("ffn_norm.weight"))?,
                 router: l.raw(&n("ffn_gate_inp.weight"))?,
                 probs_bias: l.raw_opt(&n("exp_probs_b.bias"))?,
-                gate_up: l.experts(&n("ffn_gate_up_exps.weight"), &n("ffn_gate_up_exps.scale"))?,
-                down: l.experts(&n("ffn_down_exps.weight"), &n("ffn_down_exps.scale"))?,
+                gate_up,
+                down,
                 lp,
             });
         }
         // the token embedding table is only gathered (one row per token): keep it in host memory, readable by the GPU
         // over PCIe, and save ~0.5 GB of VRAM (INKLING_EMBED_GPU=1 keeps it on the GPU)
-        let mut host_bufs = Vec::new();
         let token_embd = if embed_on_host() {
             let t = g.require("token_embd.weight")?;
             let mut h = gpu.alloc_host_mapped(t.n_bytes)?;
@@ -236,7 +277,7 @@ impl Weights {
         let output = l.q8(&["output.weight".to_owned()])?;
         let output_norm = l.raw("output_norm.weight")?;
         let output_res_query = l.raw("output_res_query.weight")?;
-        Ok(Self { host_bufs, token_embd, token_embd_norm, output, output_norm, output_res_query, layers, bytes: l.bytes, bufs: l.bufs })
+        Ok(Self { host_bufs, token_embd, token_embd_norm, output, output_norm, output_res_query, layers, cpu, bytes: l.bytes, bufs: l.bufs })
     }
 }
 

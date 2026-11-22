@@ -231,6 +231,7 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
     if ((int)blockIdx.y >= ntiles[0]) return;
     const int4 tl = tiles[blockIdx.y];
     const int e = tl.x, p0 = tl.y, cnt = tl.z;
+    if (W.erange && (e < (W.erange & 0xffff) || e >= (W.erange >> 16))) return;  // expert group streamed in
     const bool fp4 = W.fmt == 1;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tig = lane & 3;
     const int wm = warp >> 1, wn = warp & 1;

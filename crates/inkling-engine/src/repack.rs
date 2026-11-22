@@ -29,10 +29,17 @@ unsafe impl Sync for Out {}
 unsafe impl Send for Out {}
 
 pub fn q8_soa(src: &[u8], rows: usize, k: usize) -> Result<Soa> {
-    ensure!(k % 32 == 0 && src.len() == rows * k / 32 * 34, "q8_soa: bad shape");
-    let nb = k / 32;
     let mut qs = vec![0u8; rows * k];
-    let mut sc = vec![0u8; rows * nb * 2];
+    let mut sc = vec![0u8; rows * k / 16];
+    q8_soa_into(src, rows, k, &mut qs, &mut sc)?;
+    Ok(Soa { qs, sc })
+}
+
+/// Q8_0 rows into caller-provided planes (qs: rows * k bytes, sc: rows * k / 16 bytes).
+pub fn q8_soa_into(src: &[u8], rows: usize, k: usize, qs: &mut [u8], sc: &mut [u8]) -> Result<()> {
+    ensure!(k % 32 == 0 && src.len() == rows * k / 32 * 34, "q8_soa: bad shape");
+    ensure!(qs.len() == rows * k && sc.len() == rows * k / 16, "q8_soa: bad output size");
+    let nb = k / 32;
     let (oq, os) = (Out(qs.as_mut_ptr()), Out(sc.as_mut_ptr()));
     par_rows(rows, |r| {
         let (oq, os) = (&oq, &os);
@@ -46,14 +53,21 @@ pub fn q8_soa(src: &[u8], rows: usize, k: usize) -> Result<Soa> {
             }
         }
     });
-    Ok(Soa { qs, sc })
+    Ok(())
 }
 
 pub fn nvfp4_soa(src: &[u8], rows: usize, k: usize) -> Result<Soa> {
-    ensure!(k % 64 == 0 && src.len() == rows * k / 64 * 36, "nvfp4_soa: bad shape");
-    let nb = k / 64;
     let mut qs = vec![0u8; rows * k / 2];
     let mut sc = vec![0u8; rows * k / 16];
+    nvfp4_soa_into(src, rows, k, &mut qs, &mut sc)?;
+    Ok(Soa { qs, sc })
+}
+
+/// NVFP4 rows into caller-provided planes (qs: rows * k / 2 bytes, sc: rows * k / 16 bytes).
+pub fn nvfp4_soa_into(src: &[u8], rows: usize, k: usize, qs: &mut [u8], sc: &mut [u8]) -> Result<()> {
+    ensure!(k % 64 == 0 && src.len() == rows * k / 64 * 36, "nvfp4_soa: bad shape");
+    ensure!(qs.len() == rows * k / 2 && sc.len() == rows * k / 16, "nvfp4_soa: bad output size");
+    let nb = k / 64;
     let (oq, os) = (Out(qs.as_mut_ptr()), Out(sc.as_mut_ptr()));
     par_rows(rows, |r| {
         let (oq, os) = (&oq, &os);
@@ -72,5 +86,5 @@ pub fn nvfp4_soa(src: &[u8], rows: usize, k: usize) -> Result<Soa> {
         sc.iter().all(|&b| b & 0x78 != 0 && b & 0x80 == 0),
         "nvfp4_soa: subnormal/zero/negative block scales are not supported by the fast expert kernels"
     );
-    Ok(Soa { qs, sc })
+    Ok(())
 }

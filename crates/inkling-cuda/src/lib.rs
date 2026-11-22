@@ -73,6 +73,8 @@ pub struct ExpW {
     pub sc: u64,
     pub scale: u64,
     pub fmt: i32,
+    /// prefill grouped GEMMs: only experts in [lo, hi) (erange = lo | hi << 16; 0 = all)
+    pub erange: i32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -210,6 +212,7 @@ pub struct HostMapped {
 }
 
 unsafe impl Send for HostMapped {}
+unsafe impl Sync for HostMapped {}
 
 impl HostMapped {
     pub fn read_i32(&self, idx: usize) -> i32 {
@@ -224,6 +227,10 @@ impl HostMapped {
 
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.host, self.bytes) }
+    }
+
+    pub fn host_ptr(&self) -> *mut u8 {
+        self.host
     }
 }
 
@@ -254,6 +261,27 @@ impl Gpu {
         let pci = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
         let nv_free = if r == cudarc::driver::sys::CUresult::CUDA_SUCCESS { nvml::free_bytes(&pci) } else { None };
         Ok(nv_free.map_or(cu_free, |n| cu_free.min(n as usize)))
+    }
+
+    /// Total VRAM of the device.
+    pub fn total_vram(&self) -> Result<usize> {
+        Ok(cudarc::driver::result::mem_get_info()?.1)
+    }
+
+    /// Enqueue a host function on the stream (capturable into a graph as a host node). `f` must stay valid for
+    /// as long as any graph containing the node can run, must not call CUDA, and must not unwind.
+    pub fn launch_host(&self, f: unsafe extern "C" fn(*mut std::ffi::c_void), data: *mut std::ffi::c_void) -> Result<()> {
+        unsafe { cudarc::driver::sys::cuLaunchHostFunc(self.stream.cu_stream(), Some(f), data) }.result()?;
+        Ok(())
+    }
+
+    /// Asynchronous host -> device copy from raw host memory (pinned for a true async DMA).
+    ///
+    /// # Safety
+    /// `src` must point to `bytes` readable bytes that stay valid until the copy has run.
+    pub unsafe fn copy_htod_raw(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+        unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src as *const std::ffi::c_void, bytes, self.stream.cu_stream()) }.result()?;
+        Ok(())
     }
 
     pub fn new(ordinal: usize) -> Result<Self> {
@@ -315,6 +343,15 @@ impl Gpu {
         const DEVICEMAP: u32 = 0x02;
         let host = unsafe { cudarc::driver::result::malloc_host(bytes.max(4), PORTABLE | DEVICEMAP) }? as *mut u8;
         unsafe { std::ptr::write_bytes(host, 0, bytes.max(4)) };
+        let mut dev: cudarc::driver::sys::CUdeviceptr = 0;
+        unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut std::ffi::c_void, 0) }.result()?;
+        Ok(HostMapped { host, dev, bytes })
+    }
+
+    /// Allocate host-mapped pinned memory without zeroing it (large buffers the caller fills entirely).
+    pub fn alloc_host_mapped_uninit(&self, bytes: usize) -> Result<HostMapped> {
+        self.ctx.bind_to_thread()?;
+        let host = unsafe { cudarc::driver::result::malloc_host(bytes.max(4), 0x01 | 0x02) }? as *mut u8;
         let mut dev: cudarc::driver::sys::CUdeviceptr = 0;
         unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev, host as *mut std::ffi::c_void, 0) }.result()?;
         Ok(HostMapped { host, dev, bytes })

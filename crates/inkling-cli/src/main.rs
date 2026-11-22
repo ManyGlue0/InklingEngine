@@ -5,7 +5,8 @@ use inkling_cuda::Gpu;
 use inkling_cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
 
 /// Engine-wide flags accepted by every command; they are forwarded as the INKLING_* variables the engine reads.
-const ENGINE_FLAGS: &[(&str, &str)] = &[("--kv", "INKLING_KV"), ("--kv-k", "INKLING_KV_K"), ("--kv-v", "INKLING_KV_V")];
+const ENGINE_FLAGS: &[(&str, &str)] =
+    &[("--kv", "INKLING_KV"), ("--kv-k", "INKLING_KV_K"), ("--kv-v", "INKLING_KV_V"), ("--offload", "INKLING_OFFLOAD")];
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = Vec::new();
@@ -17,7 +18,12 @@ fn main() -> Result<()> {
         };
         if let Some(&(_, var)) = ENGINE_FLAGS.iter().find(|(f, _)| *f == name) {
             let Some(v) = inline.or_else(|| it.next()) else { bail!("{name} needs a value") };
-            inkling_engine::KvType::parse(&v)?;
+            if var == "INKLING_OFFLOAD" {
+                let ok = matches!(v.to_ascii_lowercase().as_str(), "auto" | "off" | "none" | "all") || v.parse::<usize>().is_ok();
+                ensure!(ok, "--offload: expected auto, off, all or a number of layers, got `{v}`");
+            } else {
+                inkling_engine::KvType::parse(&v)?;
+            }
             // SAFETY: single-threaded at this point, before any engine or server thread starts
             unsafe { std::env::set_var(var, v) };
         } else {
@@ -37,6 +43,7 @@ fn main() -> Result<()> {
         Some("validate") if args.len() > 2 && args.iter().any(|a| a == "--prefill") => validate_prefill(&args[1], &args[2]),
         Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
         Some("gemmtest") if args.len() > 1 => gemmtest(&args[1]),
+        Some("cpumoetest") if args.len() > 1 => cpumoetest(&args[1]),
         Some("kvstudy") if args.len() > 1 => kvstudy(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32768)),
         Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
         Some("cachetest") if args.len() > 1 => cachetest(&args[1]),
@@ -58,7 +65,8 @@ fn main() -> Result<()> {
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
              \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6),\n\
-             \x20 or --kv-k / --kv-v to set keys and values separately\n\
+             \x20 or --kv-k / --kv-v to set keys and values separately, and --offload auto|off|all|N (MoE layers\n\
+             \x20 kept in system RAM and run on the CPU when the GPU is too small; default auto)\n\
              \x20 inkling bench <model.gguf> [n] | benchpp <model.gguf> [n] | benchctx <model.gguf> <n>\n\
              \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | vraminfo | smoke | --version\n\n\
              developer checks: validate, kvstudy, cachetest, rendertest, gemmtest, visiontest (see README)",
@@ -138,6 +146,24 @@ fn visiontest(model: &str, mmproj: &str, n: usize) -> Result<()> {
 }
 
 /// Prefill GEMM self-test vs the decode matvec, plus GEMM throughput.
+/// CPU expert executor vs the GPU kernel on the same weights and inputs, for every offloaded layer
+/// (INKLING_OFFLOAD=all by default).
+fn cpumoetest(model: &str) -> Result<()> {
+    if std::env::var_os("INKLING_OFFLOAD").is_none() {
+        // SAFETY: single-threaded, before the engine starts
+        unsafe { std::env::set_var("INKLING_OFFLOAD", "all") };
+    }
+    let eng = inkling_engine::Engine::load(model, 4096)?;
+    for (li, rel, mag) in eng.test_cpu_moe(4)? {
+        println!("layer {li:2}: relative RMS |cpu - gpu| = {rel:.2e} (max |y| {mag:.3})");
+    }
+    for li in [0usize, 23] {
+        let (us, gbs, raw) = eng.bench_cpu_moe(li, 200)?;
+        println!("layer {li:2}: {us:.0} us per visit, {gbs:.1} GB/s of expert weights (plain parallel read: {raw:.1} GB/s)");
+    }
+    Ok(())
+}
+
 fn gemmtest(model: &str) -> Result<()> {
     let eng = inkling_engine::Engine::load(model, 4096)?;
     for t in [1usize, 37, 64, 512] {
@@ -392,6 +418,9 @@ fn bench(model: &str, n: usize) -> Result<()> {
     let dec = (total - pre).max(1e-9);
     let m = out.len() - 1;
     println!("prompt {} tok: {:.1} tok/s | decode {m} tok: {:.1} tok/s ({:.2} ms/tok)", ids.len(), ids.len() as f64 / pre, m as f64 / dec, dec * 1e3 / m as f64);
+    if let Some((calls, us)) = eng.cpu_moe_stats() {
+        println!("CPU experts: {calls} layer visits, {us:.0} us each");
+    }
     if eng.moe_tl.is_some() {
         for slot in [10usize, 21] {
             let tl = eng.moe_timeline(slot)?;

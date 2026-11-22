@@ -1,25 +1,27 @@
 //! CPU expert FFN for MoE layers offloaded to system RAM (decode path).
 //!
-//! The expert weights stay in the memory-mapped GGUF file in their native block formats (no copy):
-//!   NVFP4: 36-byte blocks of 64 values, UE4M3 scales d[4] (one per 16 values) then qs[32]; sub-block s uses bytes
-//!          8s..8s+7, byte j holding value 16s + j (low nibble) and 16s + j + 8 (high nibble). Plus an F32 scale per
-//!          expert.
-//!   Q8_0:  34-byte blocks of 32 values (f16 d, int8 q[32]).
+//! The expert weights live in pinned host memory in the GPU's repacked layout (repack.rs), so the same copy also
+//! streams to the GPU for batched prompt processing:
+//!   NVFP4: qs [E][rows][K/2] + sc [E][rows][K/16]. Per 64-value block: 32 qs bytes, sub-block s uses bytes
+//!          8s..8s+7, byte j holding value 16s + j (low nibble) and 16s + j + 8 (high nibble); 4 UE4M3 scales (one
+//!          per 16 values). Plus an F32 scale per expert.
+//!   Q8_0:  qs int8 [E][rows][K] + d f16 [E][rows][K/32].
 //! The math matches the GPU kernels (experts.cu): q8_1 activations, E2M1 values doubled to integers with a halved
 //! block scale, int8 dot products, SiTU gating, the hidden vector quantized to int8 per 16 features, and the
 //! weighted sum over the selected experts. Work runs on a persistent thread pool in two phases (gate_up + hidden,
 //! then down), AVX2 when available with a scalar fallback.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::weights::ExpertFmt;
 
-/// One offloaded expert tensor [E][rows][K] inside the mapped GGUF.
+/// One offloaded expert tensor [E][rows][K] (repacked planes in host memory).
 #[derive(Clone, Copy)]
 pub struct CpuExp {
-    pub data: *const u8,
+    pub qs: *const u8,
+    pub sc: *const u8,
     pub fmt: ExpertFmt,
     pub rows: usize,
     pub k: usize,
@@ -29,14 +31,18 @@ unsafe impl Send for CpuExp {}
 unsafe impl Sync for CpuExp {}
 
 impl CpuExp {
-    pub fn row_bytes(&self) -> usize {
+    /// bytes per row of the (qs, sc) planes
+    pub fn row_bytes(&self) -> (usize, usize) {
         match self.fmt {
-            ExpertFmt::Nvfp4 => self.k / 64 * 36,
-            ExpertFmt::Q8_0 => self.k / 32 * 34,
+            ExpertFmt::Nvfp4 => (self.k / 2, self.k / 16),
+            ExpertFmt::Q8_0 => (self.k, self.k / 16),
         }
     }
-    fn row(&self, e: usize, r: usize) -> *const u8 {
-        unsafe { self.data.add((e * self.rows + r) * self.row_bytes()) }
+    /// (qs, sc) of row r of expert e
+    fn row(&self, e: usize, r: usize) -> (*const u8, *const u8) {
+        let (q, s) = self.row_bytes();
+        let i = e * self.rows + r;
+        unsafe { (self.qs.add(i * q), self.sc.add(i * s)) }
     }
 }
 
@@ -56,6 +62,20 @@ struct Acts {
 }
 
 /// `x` (int8, quantized in groups of `g` values with scales `xs`) arranged for rows of format `fmt` and length k.
+/// AVX2 NVFP4 path: a UE4M3 byte shifted left by 20 is an f32 of value 2^(e-127) (1 + m/8), 2^-119 times the
+/// kernels' (halved) scale for normal numbers (load time guarantees no subnormal, zero or negative scales); the
+/// activation lane scales carry the 2^119.
+const FP4_FAST_MUL: f32 = 6.646139978924579e35; // 2^119
+
+/// `x` (int8, quantized in groups of `g` values with scales `xs`) arranged for rows of format `fmt` and length k;
+/// lane scales multiplied by `mul`.
+fn prep_acts_mul(x: &[i8], xs: &[f32], g: usize, fmt: ExpertFmt, k: usize, mul: f32, out: &mut Acts) {
+    prep_acts(x, xs, g, fmt, k, out);
+    if mul != 1.0 {
+        out.s8.iter_mut().for_each(|v| *v *= mul);
+    }
+}
+
 fn prep_acts(x: &[i8], xs: &[f32], g: usize, fmt: ExpertFmt, k: usize, out: &mut Acts) {
     out.q.clear();
     out.s8.clear();
@@ -101,32 +121,33 @@ fn ue4m3(x: u8) -> f32 {
 
 const E2M1: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-fn dot_scalar(w: CpuExp, row: *const u8, a: &Acts) -> f32 {
+fn dot_scalar(w: CpuExp, row: (*const u8, *const u8), a: &Acts) -> f32 {
     let mut acc = 0f32;
     match w.fmt {
         ExpertFmt::Nvfp4 => {
             for b in 0..w.k / 64 {
-                let blk = unsafe { std::slice::from_raw_parts(row.add(36 * b), 36) };
+                let qs = unsafe { std::slice::from_raw_parts(row.0.add(32 * b), 32) };
+                let sc = unsafe { std::slice::from_raw_parts(row.1.add(4 * b), 4) };
                 let xq = &a.q[64 * b..64 * b + 64];
                 let mut lanes = [0i32; 8];
                 for p in 0..32 {
-                    let q = blk[4 + p];
+                    let q = qs[p];
                     lanes[p / 4] += E2M1[(q & 15) as usize] as i32 * xq[p] as i32 + E2M1[(q >> 4) as usize] as i32 * xq[32 + p] as i32;
                 }
                 for (lane, &v) in lanes.iter().enumerate() {
-                    acc += v as f32 * ue4m3(blk[lane / 2]) * a.s8[8 * b + lane];
+                    acc += v as f32 * ue4m3(sc[lane / 2]) * a.s8[8 * b + lane];
                 }
             }
         }
         ExpertFmt::Q8_0 => {
             for b in 0..w.k / 32 {
-                let blk = unsafe { std::slice::from_raw_parts(row.add(34 * b), 34) };
-                let d = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+                let qs = unsafe { std::slice::from_raw_parts(row.0.add(32 * b), 32) };
+                let d = half::f16::from_bits(unsafe { (row.1.add(2 * b) as *const u16).read_unaligned() }).to_f32();
                 let xq = &a.q[32 * b..32 * b + 32];
                 for lane in 0..8 {
                     let mut s = 0i32;
                     for i in 4 * lane..4 * lane + 4 {
-                        s += blk[2 + i] as i8 as i32 * xq[i] as i32;
+                        s += qs[i] as i8 as i32 * xq[i] as i32;
                     }
                     acc += s as f32 * d * a.s8[8 * b + lane];
                 }
@@ -151,32 +172,17 @@ mod avx2 {
         _mm_cvtss_f32(s)
     }
 
-    /// 4 UE4M3 bytes -> lanes [d0, d0, d1, d1, d2, d2, d3, d3] (ue4m3 semantics of the scalar path)
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn ue4m3x8(d: u32) -> __m256 {
-        let x = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(d as i32), _mm256_setr_epi32(0, 0, 8, 8, 16, 16, 24, 24)), _mm256_set1_epi32(0xFF));
-        let e = _mm256_and_si256(_mm256_srli_epi32(x, 3), _mm256_set1_epi32(15));
-        let m = _mm256_and_si256(x, _mm256_set1_epi32(7));
-        let normal = _mm256_castsi256_ps(_mm256_or_si256(_mm256_slli_epi32(_mm256_add_epi32(e, _mm256_set1_epi32(119)), 23), _mm256_slli_epi32(m, 20)));
-        let sub = _mm256_mul_ps(_mm256_cvtepi32_ps(m), _mm256_set1_ps(1.0 / 1024.0));
-        let is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(e, _mm256_setzero_si256()));
-        let v = _mm256_blendv_ps(normal, sub, is_sub);
-        let zero = _mm256_or_si256(_mm256_cmpeq_epi32(x, _mm256_setzero_si256()), _mm256_cmpeq_epi32(x, _mm256_set1_epi32(0x7F)));
-        _mm256_andnot_ps(_mm256_castsi256_ps(zero), v)
-    }
-
     #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot(w: CpuExp, row: *const u8, a: &Acts) -> f32 {
+    pub unsafe fn dot(w: CpuExp, row: (*const u8, *const u8), a: &Acts) -> f32 {
         let ones = _mm256_set1_epi16(1);
         let mut acc = _mm256_setzero_ps();
         match w.fmt {
             ExpertFmt::Nvfp4 => {
                 let lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12, 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
                 let m4 = _mm256_set1_epi8(0x0F);
+                let dup = _mm_setr_epi8(0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0);
                 for b in 0..w.k / 64 {
-                    let blk = row.add(36 * b);
-                    let q = _mm256_loadu_si256(blk.add(4) as *const __m256i);
+                    let q = _mm256_loadu_si256(row.0.add(32 * b) as *const __m256i);
                     let wl = _mm256_shuffle_epi8(lut, _mm256_and_si256(q, m4));
                     let wh = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(q, 4), m4));
                     let xl = _mm256_loadu_si256(a.q.as_ptr().add(64 * b) as *const __m256i);
@@ -185,15 +191,17 @@ mod avx2 {
                     let pl = _mm256_maddubs_epi16(_mm256_abs_epi8(wl), _mm256_sign_epi8(xl, wl));
                     let ph = _mm256_maddubs_epi16(_mm256_abs_epi8(wh), _mm256_sign_epi8(xh, wh));
                     let s = _mm256_madd_epi16(_mm256_add_epi16(pl, ph), ones);
-                    let sc = _mm256_mul_ps(ue4m3x8((blk as *const u32).read_unaligned()), _mm256_loadu_ps(a.s8.as_ptr().add(8 * b)));
+                    // [d0 d0 d1 d1 d2 d2 d3 d3] << 20 as f32 (x 2^119 in the lane scales)
+                    let d4 = _mm_cvtsi32_si128((row.1.add(4 * b) as *const i32).read_unaligned());
+                    let d8 = _mm256_cvtepu8_epi32(_mm_shuffle_epi8(d4, dup));
+                    let sc = _mm256_mul_ps(_mm256_castsi256_ps(_mm256_slli_epi32(d8, 20)), _mm256_loadu_ps(a.s8.as_ptr().add(8 * b)));
                     acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), sc, acc);
                 }
             }
             ExpertFmt::Q8_0 => {
                 for b in 0..w.k / 32 {
-                    let blk = row.add(34 * b);
-                    let d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((blk as *const u16).read_unaligned() as i32)));
-                    let wv = _mm256_loadu_si256(blk.add(2) as *const __m256i);
+                    let d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((row.1.add(2 * b) as *const u16).read_unaligned() as i32)));
+                    let wv = _mm256_loadu_si256(row.0.add(32 * b) as *const __m256i);
                     let xv = _mm256_loadu_si256(a.q.as_ptr().add(32 * b) as *const __m256i);
                     // int8 x int8 via |w| and sign-adjusted x; |w| <= 127 can reach 2 * 127 * 128 > i16::MAX only
                     // for w = -128, which Q8_0 never stores (symmetric quantization)
@@ -319,6 +327,8 @@ pub struct MoeIo {
     pub y: [f32; 2304],
 }
 
+pub static PHASE_DEBUG: AtomicBool = AtomicBool::new(false);
+
 /// CPU expert executor: layers, pool and scratch.
 pub struct CpuMoe {
     pub layers: Vec<Option<CpuLayer>>,
@@ -329,6 +339,46 @@ pub struct CpuMoe {
     beta: f32,
     lb: f32,
     scratch: Mutex<Scratch>,
+    /// set when a host callback panicked (its output was zeroed); checked by the engine after each request
+    pub failed: AtomicBool,
+    /// layer visits run and their total time (ns)
+    pub calls: AtomicU64,
+    pub nanos: AtomicU64,
+}
+
+/// User data of the host-function node that runs one offloaded layer inside the decode graph.
+pub struct HostCb {
+    pub moe: *const CpuMoe,
+    pub io: *mut MoeIo,
+    pub layer: usize,
+}
+
+unsafe impl Send for HostCb {}
+unsafe impl Sync for HostCb {}
+
+/// Default worker count: the physical cores (half the logical CPUs on SMT machines), at most 16. The expert dot
+/// products are bound by memory bandwidth, which that many cores saturate.
+pub fn default_threads() -> usize {
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    (logical / 2).clamp(1, 16)
+}
+
+/// CUDA host function: run the experts of `HostCb::layer` on the exchange block. Never unwinds into the driver.
+///
+/// # Safety
+/// `p` must point to a live HostCb whose pointers are valid, and no other code may touch the exchange block while
+/// the callback runs.
+pub unsafe extern "C" fn host_cb(p: *mut std::ffi::c_void) {
+    let cb = unsafe { &*(p as *const HostCb) };
+    let moe = unsafe { &*cb.moe };
+    let io = unsafe { &mut *cb.io };
+    let t0 = Instant::now();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| moe.run(cb.layer, io))).is_err() {
+        io.y.fill(0.0);
+        moe.failed.store(true, Ordering::Release);
+    }
+    moe.nanos.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    moe.calls.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Default)]
@@ -349,7 +399,19 @@ impl CpuMoe {
         let avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("f16c");
         #[cfg(not(target_arch = "x86_64"))]
         let avx2 = false;
-        Self { layers, pool: Pool::new(threads), avx2, d, f, beta, lb, scratch: Mutex::new(Scratch::default()) }
+        Self {
+            layers,
+            pool: Pool::new(threads),
+            avx2,
+            d,
+            f,
+            beta,
+            lb,
+            scratch: Mutex::new(Scratch::default()),
+            failed: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+        }
     }
 
     pub fn threads(&self) -> usize {
@@ -360,13 +422,74 @@ impl CpuMoe {
         if self.avx2 { "AVX2" } else { "scalar" }
     }
 
+    /// lane-scale multiplier the dot product of format `fmt` expects
+    fn fp4_mul(&self, fmt: ExpertFmt) -> f32 {
+        if self.avx2 && fmt == ExpertFmt::Nvfp4 { FP4_FAST_MUL } else { 1.0 }
+    }
+
     #[inline]
-    fn dot(&self, w: CpuExp, row: *const u8, a: &Acts) -> f32 {
+    fn dot(&self, w: CpuExp, row: (*const u8, *const u8), a: &Acts) -> f32 {
         #[cfg(target_arch = "x86_64")]
         if self.avx2 {
             return unsafe { avx2::dot(w, row, a) };
         }
         dot_scalar(w, row, a)
+    }
+
+    /// Microbenchmark: (us per run of layer `li` with random routing, GB/s of expert weights read, GB/s of a
+    /// plain parallel read of the same layer's planes = the memory ceiling).
+    pub fn bench(&self, li: usize, iters: usize) -> (f64, f64, f64) {
+        let layer = self.layers[li].as_ref().expect("layer not offloaded");
+        let mut io: Box<MoeIo> = Box::new(unsafe { std::mem::zeroed() });
+        for (i, v) in io.xq.iter_mut().enumerate() {
+            *v = ((i * 37) % 255) as i8;
+        }
+        io.xd.fill(0.01);
+        io.wts.fill(0.1);
+        let (gq, gs) = layer.gate_up.row_bytes();
+        let (dq, ds) = layer.down.row_bytes();
+        let per_e = (gq + gs) * layer.gate_up.rows + (dq + ds) * layer.down.rows;
+        let mut seed = 12345u64;
+        let t0 = Instant::now();
+        for it in 0..iters {
+            for t in 0..8 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                io.sel[t] = ((t * 16 + (seed >> 33) as usize % 16 + it) % 128) as i32;
+            }
+            self.run(li, &mut io);
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        if std::env::var_os("INKLING_CPU_PHASES").is_some() {
+            PHASE_DEBUG.store(true, Ordering::Relaxed);
+            for _ in 0..5 {
+                self.run(li, &mut io);
+            }
+            PHASE_DEBUG.store(false, Ordering::Relaxed);
+        }
+        let gbs = 8.0 * per_e as f64 / us / 1e3;
+        // ceiling: every thread sums a disjoint slice of the gate_up qs plane (8 experts' worth per iteration)
+        let ne = 8;
+        let bytes = gq * layer.gate_up.rows * ne;
+        let nt = self.pool.threads();
+        let base = SPtr(layer.gate_up.qs as *mut u8);
+        let sink = AtomicU64::new(0);
+        let t1 = Instant::now();
+        for it in 0..iters {
+            let off = (it % 16) * bytes; // a different 8-expert window each time (beyond the L3)
+            self.pool.run(&|ti| {
+                let base = base;
+                let (lo, hi) = (ti * bytes / nt / 64 * 64, (ti + 1) * bytes / nt / 64 * 64);
+                let mut acc = 0u64;
+                let mut p = lo;
+                while p < hi {
+                    acc = acc.wrapping_add(unsafe { (base.0.add(off + p) as *const u64).read_volatile() });
+                    p += 64;
+                }
+                sink.fetch_add(acc, Ordering::Relaxed);
+            });
+        }
+        let raw = bytes as f64 * iters as f64 / t1.elapsed().as_secs_f64() / 1e9;
+        (us, gbs, raw)
     }
 
     /// Expert FFN of offloaded layer `li` for the exported inputs; writes io.y.
@@ -378,12 +501,13 @@ impl CpuMoe {
         sc.hq.resize(k * f, 0);
         sc.hd.resize(k * f / 16, 0.0);
         let mut ax = Acts { q: Vec::with_capacity(d), s8: Vec::with_capacity(d / 4) };
-        prep_acts(&io.xq, &io.xd, 32, layer.gate_up.fmt, d, &mut ax);
+        prep_acts_mul(&io.xq, &io.xd, 32, layer.gate_up.fmt, d, self.fp4_mul(layer.gate_up.fmt), &mut ax);
         let (hq, hd) = (SPtr(sc.hq.as_mut_ptr()), SPtr(sc.hd.as_mut_ptr()));
         let sel: Vec<usize> = io.sel.iter().map(|&e| e as usize).collect();
         let nt = self.pool.threads();
         // phase 1: units of (expert slot, 16 features): 16 gate + 16 up rows -> 16 quantized hidden values
         let units = k * (f / 16);
+        let tp = Instant::now();
         self.pool.run(&|ti| {
             let (hq, hd) = (hq, hd);
             for u in (ti * units / nt)..((ti + 1) * units / nt) {
@@ -398,21 +522,23 @@ impl CpuMoe {
                     let a = self.beta * (g / self.beta).tanh() / (1.0 + (-g).exp());
                     *hv = a * (self.lb * (up / self.lb).tanh());
                 }
+                // as the GPU: v * (127 / amax) rounded half to even
                 let amax = h.iter().fold(0f32, |m, v| m.max(v.abs()));
-                let dq = amax / 127.0;
+                let id = if amax == 0.0 { 0.0 } else { 127.0 / amax };
                 unsafe {
                     for (i, &v) in h.iter().enumerate() {
-                        *hq.0.add(t * f + 16 * fg + i) = if amax == 0.0 { 0 } else { (v / dq).round() as i8 };
+                        *hq.0.add(t * f + 16 * fg + i) = (v * id).round_ties_even() as i8;
                     }
-                    *hd.0.add(t * (f / 16) + fg) = dq;
+                    *hd.0.add(t * (f / 16) + fg) = amax / 127.0;
                 }
             }
         });
+        let t_p1 = tp.elapsed();
         // phase 2: output rows n: y_n = sum_t wts_t s_e (W_e[n] . h_t)
         let hacts: Vec<Acts> = (0..k)
             .map(|t| {
                 let mut a = Acts { q: Vec::with_capacity(f), s8: Vec::with_capacity(f / 4) };
-                prep_acts(&sc.hq[t * f..(t + 1) * f], &sc.hd[t * (f / 16)..(t + 1) * (f / 16)], 16, layer.down.fmt, f, &mut a);
+                prep_acts_mul(&sc.hq[t * f..(t + 1) * f], &sc.hd[t * (f / 16)..(t + 1) * (f / 16)], 16, layer.down.fmt, f, self.fp4_mul(layer.down.fmt), &mut a);
                 a
             })
             .collect();
@@ -420,15 +546,23 @@ impl CpuMoe {
         let wts = io.wts;
         self.pool.run(&|ti| {
             let y = y;
-            for n in (ti * d / nt)..((ti + 1) * d / nt) {
-                let mut acc = 0f32;
-                for t in 0..k {
-                    let e = sel[t];
-                    let s = layer.down_scale.as_ref().map_or(1.0, |v| v[e]);
-                    acc += wts[t] * s * self.dot(layer.down, layer.down.row(e, n), &hacts[t]);
+            // one expert at a time: each thread streams a contiguous run of rows per expert (fewer concurrent
+            // streams for the hardware prefetchers than interleaving the 8 experts row by row)
+            let (n0, n1) = (ti * d / nt, (ti + 1) * d / nt);
+            let mut acc = vec![0f32; n1 - n0];
+            for t in 0..k {
+                let e = sel[t];
+                let sw = wts[t] * layer.down_scale.as_ref().map_or(1.0, |v| v[e]);
+                for (i, n) in (n0..n1).enumerate() {
+                    acc[i] += sw * self.dot(layer.down, layer.down.row(e, n), &hacts[t]);
                 }
-                unsafe { *y.0.add(n) = acc };
+            }
+            for (i, v) in acc.into_iter().enumerate() {
+                unsafe { *y.0.add(n0 + i) = v };
             }
         });
+        if PHASE_DEBUG.load(Ordering::Relaxed) {
+            eprintln!("cpu moe layer {li}: phase 1 {:.0} us, total {:.0} us", t_p1.as_secs_f64() * 1e6, tp.elapsed().as_secs_f64() * 1e6);
+        }
     }
 }

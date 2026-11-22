@@ -256,6 +256,60 @@ impl Engine {
         Ok(())
     }
 
+    /// Grouped expert GEMMs of one layer: directly when its experts are in VRAM; for a CPU-offloaded layer, the
+    /// pinned host copy streams in groups of `offload::STREAM_GROUP` experts into two alternating VRAM buffers on
+    /// the copy stream, each group's GEMMs (restricted to its expert range) overlapping the next group's copy.
+    fn pre_experts(&self, phys: usize, lw: &weights::LayerW, run: &dyn Fn(ExpW, ExpW) -> Result<()>) -> Result<()> {
+        let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32, erange: 0 };
+        let Some(c) = self.cpu.as_ref().filter(|c| c.plan.on_cpu[phys]) else {
+            return run(ew(lw.gate_up), ew(lw.down));
+        };
+        let cl = c.moe.layers[phys].as_ref().expect("offloaded layer");
+        let (gq, gs) = cl.gate_up.row_bytes();
+        let (dq, ds) = cl.down.row_bytes();
+        // bytes per expert of each plane, and the planes' offsets inside a group buffer
+        let per = [gq * cl.gate_up.rows, gs * cl.gate_up.rows, dq * cl.down.rows, ds * cl.down.rows];
+        let src = [cl.gate_up.qs, cl.gate_up.sc, cl.down.qs, cl.down.sc];
+        let gsz = crate::offload::STREAM_GROUP;
+        let mut off = [0usize; 4];
+        for i in 1..4 {
+            off[i] = off[i - 1] + gsz * per[i - 1];
+        }
+        ensure!(off[3] + gsz * per[3] <= c.bufs[0].bytes, "prefill streaming buffer too small");
+        let ne = self.cfg.n_expert;
+        let cs = &c.copy_stream;
+        // the buffers may still be in use by the previous offloaded layer's GEMMs
+        cs.wait(&self.gpu.stream.record_event(None)?)?;
+        let mut done: [Option<inkling_cuda::cudarc::driver::CudaEvent>; 2] = [None, None];
+        for (j, e0) in (0..ne).step_by(gsz).enumerate() {
+            let e1 = (e0 + gsz).min(ne);
+            let b = &c.bufs[j % 2];
+            if let Some(ev) = done[j % 2].take() {
+                cs.wait(&ev)?;
+            }
+            for i in 0..4 {
+                let r = unsafe {
+                    inkling_cuda::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        b.at(off[i]),
+                        src[i].add(e0 * per[i]) as *const std::ffi::c_void,
+                        (e1 - e0) * per[i],
+                        cs.cu_stream(),
+                    )
+                };
+                r.result()?;
+            }
+            self.gpu.stream.wait(&cs.record_event(None)?)?;
+            // base pointers shifted so expert e0 lands at the start of its plane (only experts in [e0, e1) are read)
+            let base = |i: usize| b.at(off[i]).wrapping_sub((e0 * per[i]) as u64);
+            let erange = (e0 | e1 << 16) as i32;
+            let gu = ExpW { qs: base(0), sc: base(1), scale: lw.gate_up.scale, fmt: lw.gate_up.fmt as i32, erange };
+            let dn = ExpW { qs: base(2), sc: base(3), scale: lw.down.scale, fmt: lw.down.fmt as i32, erange };
+            run(gu, dn)?;
+            done[j % 2] = Some(self.gpu.stream.record_event(None)?);
+        }
+        Ok(())
+    }
+
     fn prefill_chunk(&mut self, tokens: &[u32], pos0: usize, logits_out: Option<&mut dyn FnMut(usize, &[f32])>) -> Result<()> {
         let t = tokens.len();
         ensure!(t > 0 && t <= PREFILL_CHUNK, "bad chunk length");
@@ -428,15 +482,17 @@ let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
                 Arg::Ptr(p.sel.ptr), Arg::I32(na as i32), Arg::Ptr(p.alist.ptr), Arg::Ptr(p.inv.ptr), Arg::Ptr(p.tiles.ptr), Arg::Ptr(p.ntiles.ptr),
             ])?;
             let max_tiles = (na / 64 + cfg.n_expert) as u32;
-            let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32 };
             let (hq, hd) = p.hq.at(0);
-            self.gpu.launch("ink_moe_gate_up_g", ((cfg.n_ff_exp / 32) as u32, max_tiles), 128, &[
-                Arg::Exp(ew(lw.gate_up)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(p.alist.ptr), Arg::Ptr(p.tiles.ptr), Arg::Ptr(p.ntiles.ptr),
-                Arg::Ptr(hq), Arg::Ptr(hd), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
-            ])?;
-            self.gpu.launch("ink_moe_down_g", ((d / 64) as u32, max_tiles), 128, &[
-                Arg::Exp(ew(lw.down)), Arg::Ptr(hq), Arg::Ptr(hd), Arg::Ptr(p.tiles.ptr), Arg::Ptr(p.ntiles.ptr), Arg::Ptr(p.ya.ptr),
-            ])?;
+            let experts = |gu: ExpW, dn: ExpW| -> Result<()> {
+                self.gpu.launch("ink_moe_gate_up_g", ((cfg.n_ff_exp / 32) as u32, max_tiles), 128, &[
+                    Arg::Exp(gu), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(p.alist.ptr), Arg::Ptr(p.tiles.ptr), Arg::Ptr(p.ntiles.ptr),
+                    Arg::Ptr(hq), Arg::Ptr(hd), Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
+                ])?;
+                self.gpu.launch("ink_moe_down_g", ((d / 64) as u32, max_tiles), 128, &[
+                    Arg::Exp(dn), Arg::Ptr(hq), Arg::Ptr(hd), Arg::Ptr(p.tiles.ptr), Arg::Ptr(p.ntiles.ptr), Arg::Ptr(p.ya.ptr),
+                ])
+            };
+            self.pre_experts(ps.phys, &lw, &experts)?;
             self.gpu.launch("ink_moe_combine", (d.div_ceil(256) as u32, t as u32), 256, &[
                 Arg::Ptr(p.ya.ptr), Arg::Ptr(p.inv.ptr), Arg::Ptr(p.sel.ptr), Arg::Ptr(p.wts.ptr), Arg::Ptr(lw.down.scale), Arg::Ptr(p.ysum.ptr), Arg::I32(d as i32),
             ])?;
