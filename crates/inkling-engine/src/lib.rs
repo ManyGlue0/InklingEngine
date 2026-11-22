@@ -4,6 +4,7 @@
 //! Activations feeding the quantized matvecs are int8 (q8_1 blocks of 32, as llama.cpp's mmvq), produced by the
 //! kernel that computes them (depth-attention mix, norms, attention output, expert gate_up).
 
+pub mod codecs;
 pub mod cpu_moe;
 pub mod offload;
 mod prefill;
@@ -526,7 +527,6 @@ impl Engine {
     /// (layer, relative RMS error, max |y|).
     pub fn test_cpu_moe(&self, trials: usize) -> Result<Vec<(usize, f32, f32)>> {
         let c = self.cpu.as_ref().context("no layer is offloaded (use --offload N)")?;
-        ensure!(self.moe_blocks > 0, "needs the persistent MoE kernel");
         let (d, f, k) = (self.cfg.n_embd, self.cfg.n_ff_exp, self.cfg.n_expert_used);
         let mut seed = 0x9E3779B97F4A7C15u64;
         let mut rnd = move || {
@@ -572,12 +572,28 @@ impl Engine {
                 let st = self.gpu.alloc(3 * d * F32)?;
                 let xo = self.gpu.alloc(d * F32)?;
                 let bar = self.gpu.alloc(2 * F32)?;
-                let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32, erange: 0 };
-                self.gpu.launch("ink_moe8", (self.moe_blocks, 1), 256, &[
-                    Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(xq.ptr), Arg::Ptr(xd.ptr), Arg::Ptr(selb.ptr), Arg::Ptr(wts.ptr),
-                    Arg::Ptr(h.ptr), Arg::Ptr(cw.ptr), Arg::Ptr(st.ptr), Arg::Ptr(xo.ptr), Arg::Ptr(0), Arg::Ptr(bar.ptr),
-                    Arg::F32(self.cfg.situ_beta), Arg::F32(self.cfg.situ_linear_beta), Arg::Ptr(0),
-                ])?;
+                let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt.code(), erange: 0 };
+                if lw.gate_up.fmt.tuned() && lw.down.fmt.tuned() {
+                    self.gpu.launch("ink_moe8", (self.moe_blocks, 1), 256, &[
+                        Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(xq.ptr), Arg::Ptr(xd.ptr), Arg::Ptr(selb.ptr), Arg::Ptr(wts.ptr),
+                        Arg::Ptr(h.ptr), Arg::Ptr(cw.ptr), Arg::Ptr(st.ptr), Arg::Ptr(xo.ptr), Arg::Ptr(0), Arg::Ptr(bar.ptr),
+                        Arg::F32(self.cfg.situ_beta), Arg::F32(self.cfg.situ_linear_beta), Arg::Ptr(0),
+                    ])?;
+                } else {
+                    // the decode path for layers with a natively stored tensor: two kernels via hq / hd
+                    let hq = self.gpu.alloc(k * f)?;
+                    let hd = self.gpu.alloc(k * f / 16 * F32)?;
+                    let gu = if lw.gate_up.fmt.tuned() { "ink_moe_gate_up7" } else { "ink_moe_gate_up_gen" };
+                    let dn = if lw.down.fmt.tuned() { "ink_moe_down7" } else { "ink_moe_down_gen" };
+                    self.gpu.launch(gu, ((f / 16) as u32, k as u32), 256, &[
+                        Arg::Exp(ew(lw.gate_up)), Arg::Ptr(xq.ptr), Arg::Ptr(xd.ptr), Arg::Ptr(selb.ptr), Arg::Ptr(hq.ptr), Arg::Ptr(hd.ptr),
+                        Arg::F32(self.cfg.situ_beta), Arg::F32(self.cfg.situ_linear_beta),
+                    ])?;
+                    self.gpu.launch(dn, ((d / 8) as u32, 1), 256, &[
+                        Arg::Exp(ew(lw.down)), Arg::Ptr(hq.ptr), Arg::Ptr(hd.ptr), Arg::Ptr(selb.ptr), Arg::Ptr(wts.ptr),
+                        Arg::Ptr(cw.ptr), Arg::Ptr(st.ptr), Arg::Ptr(xo.ptr), Arg::Ptr(0),
+                    ])?;
+                }
                 let yg: Vec<f32> = self.gpu.read_f32(xo.ptr, d)?.iter().map(|v| v * 5f32.sqrt()).collect();
                 c.moe.run(li, &mut io);
                 for (a, b) in io.y.iter().zip(&yg) {
@@ -850,7 +866,7 @@ impl Engine {
                 Arg::Ptr(a.fnorm.ptr), Arg::Ptr(lw.router), Arg::Ptr(lw.probs_bias), Arg::Ptr(a.rlog.ptr), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
                 Arg::Ptr(a.counter.ptr), Arg::I32(d as i32), Arg::I32(cfg.n_expert as i32), Arg::I32(k as i32), Arg::F32(cfg.expert_weights_scale),
             ])?;
-            let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32, erange: 0 };
+            let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt.code(), erange: 0 };
             if let Some(c) = self.cpu.as_ref().filter(|c| c.plan.on_cpu[p.phys]) {
                 // experts on the CPU: export the FFN input and routing to mapped memory, run them in a host node, then
                 // the post conv + residual reads the weighted expert sum back over PCIe
@@ -861,7 +877,7 @@ impl Engine {
                 self.gpu.launch_host(cpu_moe::host_cb, cb as *mut std::ffi::c_void)?;
                 let y = c.io.dev + std::mem::offset_of!(cpu_moe::MoeIo, y) as u64;
                 self.conv_res(y, 1, lw.ffn_post_conv, conv_ffn, a.x.ptr, a.ffn_out.ptr, true)?;
-            } else if self.moe_blocks > 0 {
+            } else if self.moe_blocks > 0 && lw.gate_up.fmt.tuned() && lw.down.fmt.tuned() {
                 // gate_up + down + expert sum + post conv + residual, one persistent kernel
                 self.gpu.launch("ink_moe8", (self.moe_blocks, 1), 256, &[
                     Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
@@ -870,13 +886,16 @@ impl Engine {
                     Arg::Ptr(self.moe_tl.as_ref().map_or(0, |b| b.at(p.slot * self.moe_blocks as usize * 64))),
                 ])?;
             } else {
+                // two kernels; each tensor runs on the tuned v7 kernel or the generic one for its format
                 let (hq, hd) = (a.hq.q.ptr, a.hq.d.ptr);
-                self.gpu.launch("ink_moe_gate_up7", ((cfg.n_ff_exp / 16) as u32, k as u32), 256, &[
+                let gu_kernel = if lw.gate_up.fmt.tuned() { "ink_moe_gate_up7" } else { "ink_moe_gate_up_gen" };
+                let dn_kernel = if lw.down.fmt.tuned() { "ink_moe_down7" } else { "ink_moe_down_gen" };
+                self.gpu.launch(gu_kernel, ((cfg.n_ff_exp / 16) as u32, k as u32), 256, &[
                     Arg::Exp(ew(lw.gate_up)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(a.sel.ptr), Arg::Ptr(hq), Arg::Ptr(hd),
                     Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
                 ])?;
                 // down + weighted sum over the k experts + post conv + residual
-                self.gpu.launch("ink_moe_down7", ((d / 8) as u32, 1), 256, &[
+                self.gpu.launch(dn_kernel, ((d / 8) as u32, 1), 256, &[
                     Arg::Exp(ew(lw.down)), Arg::Ptr(hq), Arg::Ptr(hd), Arg::Ptr(a.sel.ptr), Arg::Ptr(a.wts.ptr),
                     Arg::Ptr(lw.ffn_post_conv), Arg::Ptr(conv_ffn), Arg::Ptr(a.x.ptr), Arg::Ptr(a.ffn_out.ptr),
                 ])?;

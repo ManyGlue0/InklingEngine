@@ -110,7 +110,7 @@ pub fn plan(g: &Gguf, cfg: &Config, base_need: usize, vram_free: usize, margin: 
     let order = hotness_order(g, cfg);
     let group = |on: &[bool]| -> usize {
         // one streaming group of the largest offloaded layer
-        (0..cfg.n_phys).filter(|&i| on[i]).map(|i| expert_bytes(g, i) / cfg.n_expert * STREAM_GROUP).max().unwrap_or(0)
+        (0..cfg.n_phys).filter(|&i| on[i]).map(|i| expert_bytes(g, i) / cfg.n_expert * STREAM_GROUP + crate::weights::NATIVE_PAD).max().unwrap_or(0)
     };
     let evaluate = |n: usize| -> Plan {
         let mut on = vec![false; cfg.n_phys];

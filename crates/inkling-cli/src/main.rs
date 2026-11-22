@@ -43,6 +43,7 @@ fn main() -> Result<()> {
         Some("validate") if args.len() > 2 && args.iter().any(|a| a == "--prefill") => validate_prefill(&args[1], &args[2]),
         Some("validate") if args.len() > 2 => validate(&args[1], &args[2]),
         Some("gemmtest") if args.len() > 1 => gemmtest(&args[1]),
+        Some("codectest") if args.len() > 1 => codectest(&args[1], args.get(2).map(String::as_str).unwrap_or("codectest-out")),
         Some("cpumoetest") if args.len() > 1 => cpumoetest(&args[1]),
         Some("kvstudy") if args.len() > 1 => kvstudy(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32768)),
         Some("benchctx") if args.len() > 2 => benchctx(&args[1], args[2].parse()?),
@@ -146,6 +147,53 @@ fn visiontest(model: &str, mmproj: &str, n: usize) -> Result<()> {
 }
 
 /// Prefill GEMM self-test vs the decode matvec, plus GEMM throughput.
+/// Natively decoded quant formats: dequantize the first rows of up to 3 tensors per format with the Rust decoder
+/// and the CUDA decoder and compare them; the Rust rows are also written to `out` (raw f32 + index.tsv) for
+/// tools/codec_oracle.py, which checks them against gguf-py's reference dequantizers.
+fn codectest(model: &str, out: &str) -> Result<()> {
+    use inkling_cuda::Arg;
+    use inkling_engine::codecs;
+    let g = inkling_core::Gguf::open(model)?;
+    let gpu = Gpu::new(0)?;
+    std::fs::create_dir_all(out)?;
+    let mut index = String::new();
+    let mut seen = std::collections::HashMap::<u32, usize>::new();
+    let mut worst = 0f32;
+    for (i, t) in g.tensors.iter().enumerate() {
+        let id = t.ty.id();
+        if !codecs::supported(id) {
+            continue;
+        }
+        let c = seen.entry(id).or_default();
+        if *c >= 3 {
+            continue;
+        }
+        *c += 1;
+        let k = t.dims[0] as usize;
+        let rb = codecs::row_bytes(id, k);
+        let total_rows = t.n_bytes / rb;
+        let nrows = total_rows.min(4);
+        let data = &g.data(t)[..nrows * rb];
+        let rust: Vec<f32> = (0..nrows).flat_map(|r| codecs::dequant_row(id, &data[r * rb..(r + 1) * rb], k)).collect();
+        let mut padded = data.to_vec();
+        padded.resize(data.len() + 64, 0);
+        let wb = gpu.upload(&padded)?;
+        let ob = gpu.alloc(nrows * k * 4)?;
+        gpu.launch("ink_dequant_rows", (nrows as u32, 1), 128, &[Arg::Ptr(wb.ptr), Arg::I32(id as i32), Arg::I32(k as i32), Arg::Ptr(ob.ptr)])?;
+        let gv = gpu.read_f32(ob.ptr, nrows * k)?;
+        let mag = rust.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let err = rust.iter().zip(&gv).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        worst = worst.max(err / mag.max(1e-30));
+        println!("{:8} {:40} k={k:5}: max |rust - cuda| = {err:.3e} (max |w| {mag:.3e})", t.ty.name(), t.name);
+        let file = format!("{i}.bin");
+        std::fs::write(std::path::Path::new(out).join(&file), inkling_cuda::as_bytes(&rust))?;
+        index.push_str(&format!("{}\t{file}\t{nrows}\t{k}\n", t.name));
+    }
+    std::fs::write(std::path::Path::new(out).join("index.tsv"), index)?;
+    println!("worst relative |rust - cuda|: {worst:.2e}; Rust rows in {out}/ (check with tools/codec_oracle.py)");
+    Ok(())
+}
+
 /// CPU expert executor vs the GPU kernel on the same weights and inputs, for every offloaded layer
 /// (INKLING_OFFLOAD=all by default).
 fn cpumoetest(model: &str) -> Result<()> {

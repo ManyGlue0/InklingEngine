@@ -260,7 +260,7 @@ impl Engine {
     /// pinned host copy streams in groups of `offload::STREAM_GROUP` experts into two alternating VRAM buffers on
     /// the copy stream, each group's GEMMs (restricted to its expert range) overlapping the next group's copy.
     fn pre_experts(&self, phys: usize, lw: &weights::LayerW, run: &dyn Fn(ExpW, ExpW) -> Result<()>) -> Result<()> {
-        let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt as i32, erange: 0 };
+        let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt.code(), erange: 0 };
         let Some(c) = self.cpu.as_ref().filter(|c| c.plan.on_cpu[phys]) else {
             return run(ew(lw.gate_up), ew(lw.down));
         };
@@ -275,7 +275,8 @@ impl Engine {
         for i in 1..4 {
             off[i] = off[i - 1] + gsz * per[i - 1];
         }
-        ensure!(off[3] + gsz * per[3] <= c.bufs[0].bytes, "prefill streaming buffer too small");
+        // natively stored formats may read a few bytes past the last block of the group
+        ensure!(off[3] + gsz * per[3] + weights::NATIVE_PAD <= c.bufs[0].bytes, "prefill streaming buffer too small");
         let ne = self.cfg.n_expert;
         let cs = &c.copy_stream;
         // the buffers may still be in use by the previous offloaded layer's GEMMs
@@ -288,6 +289,9 @@ impl Engine {
                 cs.wait(&ev)?;
             }
             for i in 0..4 {
+                if per[i] == 0 {
+                    continue; // native formats have no scale plane
+                }
                 let r = unsafe {
                     inkling_cuda::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                         b.at(off[i]),
@@ -302,8 +306,8 @@ impl Engine {
             // base pointers shifted so expert e0 lands at the start of its plane (only experts in [e0, e1) are read)
             let base = |i: usize| b.at(off[i]).wrapping_sub((e0 * per[i]) as u64);
             let erange = (e0 | e1 << 16) as i32;
-            let gu = ExpW { qs: base(0), sc: base(1), scale: lw.gate_up.scale, fmt: lw.gate_up.fmt as i32, erange };
-            let dn = ExpW { qs: base(2), sc: base(3), scale: lw.down.scale, fmt: lw.down.fmt as i32, erange };
+            let gu = ExpW { qs: base(0), sc: base(1), scale: lw.gate_up.scale, fmt: lw.gate_up.fmt.code(), erange };
+            let dn = ExpW { qs: base(2), sc: base(3), scale: lw.down.scale, fmt: lw.down.fmt.code(), erange };
             run(gu, dn)?;
             done[j % 2] = Some(self.gpu.stream.record_event(None)?);
         }

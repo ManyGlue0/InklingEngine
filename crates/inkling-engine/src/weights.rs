@@ -9,12 +9,33 @@ use inkling_cuda::{DevBuf, Gpu, HostMapped};
 use crate::cpu_moe::{CpuExp, CpuLayer};
 use crate::repack::{self, Soa};
 
-/// Expert weight format code passed to kernels.
+/// Expert weight format. Q8_0 and NVFP4 are repacked for the tuned kernels; other formats stay in their GGUF
+/// block layout and run on the generic kernels (codecs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertFmt {
-    Q8_0 = 0,
-    Nvfp4 = 1,
+    Q8_0,
+    Nvfp4,
+    /// ggml type id, native layout
+    Native(u32),
 }
+
+impl ExpertFmt {
+    /// code passed to kernels (ExpW.fmt): 0 = repacked Q8_0, 1 = repacked NVFP4, else the ggml type id
+    pub fn code(self) -> i32 {
+        match self {
+            ExpertFmt::Q8_0 => 0,
+            ExpertFmt::Nvfp4 => 1,
+            ExpertFmt::Native(id) => id as i32,
+        }
+    }
+    /// runs on the tuned (repacked) kernels
+    pub fn tuned(self) -> bool {
+        !matches!(self, ExpertFmt::Native(_))
+    }
+}
+
+/// Slack after natively stored weights: the generic kernels' unaligned 32-bit loads may read past the last block.
+pub const NATIVE_PAD: usize = 64;
 
 /// Repacked Q8 matrix (qs int8 [rows][K], d f16 [rows][K/32]).
 #[derive(Debug, Clone, Copy, Default)]
@@ -100,6 +121,14 @@ struct Loader<'a> {
 }
 
 impl Loader<'_> {
+    /// Upload with NATIVE_PAD zero bytes of slack.
+    fn put_padded(&mut self, key: String, data: &[u8]) -> Result<u64> {
+        let mut v = Vec::with_capacity(data.len() + NATIVE_PAD);
+        v.extend_from_slice(data);
+        v.resize(data.len() + NATIVE_PAD, 0);
+        self.put(key, &v)
+    }
+
     fn put(&mut self, key: String, data: &[u8]) -> Result<u64> {
         let b = self.gpu.upload(data).with_context(|| format!("uploading {key}"))?;
         let p = b.ptr;
@@ -153,7 +182,13 @@ impl Loader<'_> {
         let (soa, fmt) = match t.ty {
             GgmlType::NVFP4 => (repack::nvfp4_soa(self.g.data(t), rows * e, k)?, ExpertFmt::Nvfp4),
             GgmlType::Q8_0 => (repack::q8_soa(self.g.data(t), rows * e, k)?, ExpertFmt::Q8_0),
-            ty => bail!("{name}: unsupported expert type {ty:?}"),
+            ty if crate::codecs::supported(ty.id()) => {
+                let _ = (rows, e, k);
+                let qs = self.put_padded(format!("{name}#native"), self.g.data(t))?;
+                let scale = self.raw_opt(scale)?;
+                return Ok(ExpM { qs, sc: 0, scale, fmt: ExpertFmt::Native(ty.id()) });
+            }
+            ty => bail!("{name}: expert type {} is not supported yet", ty.name()),
         };
         let qs = self.put(format!("{name}#qs"), &soa.qs)?;
         let sc = self.put(format!("{name}#sc"), &soa.sc)?;
@@ -170,14 +205,27 @@ impl Loader<'_> {
         let fmt = match t.ty {
             GgmlType::NVFP4 => ExpertFmt::Nvfp4,
             GgmlType::Q8_0 => ExpertFmt::Q8_0,
-            ty => bail!("{name}: unsupported expert type {ty:?}"),
+            ty if crate::codecs::supported(ty.id()) => ExpertFmt::Native(ty.id()),
+            ty => bail!("{name}: expert type {} is not supported yet", ty.name()),
         };
+        if let ExpertFmt::Native(_) = fmt {
+            // native layout: one plane, a pinned copy of the file's blocks (plus slack)
+            let mut hq = self.gpu.alloc_host_mapped(t.n_bytes + NATIVE_PAD).with_context(|| format!("pinning {} MiB of system RAM for {name}", t.n_bytes >> 20))?;
+            hq.as_mut_slice()[..t.n_bytes].copy_from_slice(self.g.data(t));
+            let scale_dev = self.raw_opt(scale)?;
+            let scale_host = if self.g.tensor(scale).is_some() { Some(f32_rows(self.g, scale)?) } else { None };
+            let m = ExpM { qs: hq.dev, sc: 0, scale: scale_dev, fmt };
+            let c = CpuExp { qs: hq.host_ptr(), sc: std::ptr::null(), fmt, rows, k };
+            host.push(hq);
+            return Ok((m, c, scale_host));
+        }
         let qb = if fmt == ExpertFmt::Nvfp4 { rows * e * k / 2 } else { rows * e * k };
         let mut hq = self.gpu.alloc_host_mapped_uninit(qb).with_context(|| format!("pinning {} MiB of system RAM for {name}", qb >> 20))?;
         let mut hs = self.gpu.alloc_host_mapped_uninit(rows * e * k / 16).with_context(|| format!("pinning system RAM for {name}"))?;
         match fmt {
             ExpertFmt::Nvfp4 => repack::nvfp4_soa_into(self.g.data(t), rows * e, k, hq.as_mut_slice(), hs.as_mut_slice())?,
             ExpertFmt::Q8_0 => repack::q8_soa_into(self.g.data(t), rows * e, k, hq.as_mut_slice(), hs.as_mut_slice())?,
+            ExpertFmt::Native(_) => unreachable!("handled above"),
         }
         let scale_dev = self.raw_opt(scale)?;
         let scale_host = if self.g.tensor(scale).is_some() { Some(f32_rows(self.g, scale)?) } else { None };

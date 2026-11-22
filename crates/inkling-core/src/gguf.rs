@@ -37,9 +37,78 @@ impl GgmlType {
             Self::F16 | Self::BF16 => (1, 2),
             Self::Q8_0 => (32, 34),  // f16 scale + 32 x i8
             Self::NVFP4 => (64, 36), // 4 x UE4M3 sub-block scales + 32 bytes packed E2M1
-            Self::Other(x) => bail!("unsupported ggml tensor type {x}"),
+            Self::Other(x) => match quant_block(x) {
+                Some(b) => b,
+                None => bail!("unsupported ggml tensor type {x}"),
+            },
         })
     }
+
+    /// ggml type id (as stored in the file).
+    pub fn id(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q8_0 => 8,
+            Self::BF16 => 30,
+            Self::NVFP4 => 40,
+            Self::Other(x) => x,
+        }
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Self::F32 => "F32".into(),
+            Self::F16 => "F16".into(),
+            Self::Q8_0 => "Q8_0".into(),
+            Self::BF16 => "BF16".into(),
+            Self::NVFP4 => "NVFP4".into(),
+            Self::Other(x) => quant_name(x).map_or_else(|| format!("type {x}"), str::to_owned),
+        }
+    }
+}
+
+/// (elements, bytes) per block of the other quantized types the engine decodes natively (ggml-common.h layouts).
+fn quant_block(id: u32) -> Option<(usize, usize)> {
+    Some(match id {
+        10 => (256, 84),  // Q2_K
+        11 => (256, 110), // Q3_K: hmask 32 | qs 64 | scales 12 | d
+        12 => (256, 144), // Q4_K: d, dmin | scales 12 | qs 128
+        13 => (256, 176), // Q5_K: d, dmin | scales 12 | qh 32 | qs 128
+        14 => (256, 210), // Q6_K: ql 128 | qh 64 | scales 16 | d
+        16 => (256, 66),  // IQ2_XXS: d | qs u16 x 32
+        17 => (256, 74),  // IQ2_XS: d | qs u16 x 32 | scales 8
+        18 => (256, 98),  // IQ3_XXS: d | qs 96
+        19 => (256, 50),  // IQ1_S: d | qs 32 | qh u16 x 8
+        20 => (32, 18),   // IQ4_NL: d | qs 16
+        21 => (256, 110), // IQ3_S: d | qs 64 | qh 8 | signs 32 | scales 4
+        22 => (256, 82),  // IQ2_S: d | qs 64 | qh 8 | scales 8
+        23 => (256, 136), // IQ4_XS: d | scales_h u16 | scales_l 4 | qs 128
+        39 => (32, 17),   // MXFP4: e8m0 | qs 16
+        42 => (64, 18),   // Q2_0 (Unsloth): d | qs 16
+        _ => return None,
+    })
+}
+
+fn quant_name(id: u32) -> Option<&'static str> {
+    Some(match id {
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        39 => "MXFP4",
+        42 => "Q2_0",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone)]

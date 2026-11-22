@@ -199,7 +199,10 @@ INK_EXTERN void ink_moe_route(const int* __restrict__ sel, int A, int* __restric
 //           -> hq [A][F], hd [A][F/32] at the sorted position p.
 //   DOWN:   K = F, rows n0.. of the expert's down matrix; X rows are hq[p]. Epilogue: y [A][D] at position p.
 // FP4 weights are decoded to int8 (E2M1 x 2) in shared memory and multiplied per 16-value sub-block (m16n8k16) so
-// each UE4M3 scale applies exactly; Q8 weights use m16n8k32 with their per-32 scale.
+// each UE4M3 scale applies exactly; Q8 weights use m16n8k32 with their per-32 scale. Natively stored formats
+// (fmt >= 2, codecs.cuh) are decoded per group of 32 straight into the int8 tile, with two scales per group and a
+// group offset m (applied as -m * sum(x) with per-token activation sums).
+#include "codecs.cuh"
 namespace moeg {
 constexpr int D = 2304, F = 1152, BT = 64, BN = 64, KC = 128, RS = 144;
 
@@ -224,7 +227,9 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
     constexpr int K = GATEUP ? D : F;
     __shared__ __align__(16) int8_t sm[2 * BT * RS];  // xs | ws, reused as the f32 output tile by GATEUP
     __shared__ float xds[BT][KC / 32];
-    __shared__ float wsc[BN][KC / 16];  // weight scale per 16 (FP4) or per 32 (Q8, first 4 used)
+    __shared__ float wsc[BN][KC / 16];  // weight scale per 16 (FP4, generic) or per 32 (Q8, first 4 used)
+    __shared__ float wmin[BN][KC / 32]; // generic formats: group offset m
+    __shared__ int xsum[BT][KC / 32];   // generic formats: sum of the int8 activations per group
     __shared__ int rowsrc[BT];
     int8_t* xs = sm;
     int8_t* ws = sm + BT * RS;
@@ -232,7 +237,8 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
     const int4 tl = tiles[blockIdx.y];
     const int e = tl.x, p0 = tl.y, cnt = tl.z;
     if (W.erange && (e < (W.erange & 0xffff) || e >= (W.erange >> 16))) return;  // expert group streamed in
-    const bool fp4 = W.fmt == 1;
+    const bool fp4 = W.fmt == 1, gen = W.fmt >= 2;
+    const size_t grb = gen ? cdc::row_bytes(W.fmt, K) : 0;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tig = lane & 3;
     const int wm = warp >> 1, wn = warp & 1;
     if (tid < BT) rowsrc[tid] = tid < cnt ? (GATEUP ? alist[p0 + tid] >> 3 : p0 + tid) : -1;
@@ -249,6 +255,7 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
     uint4 rx[4], rw[4];
     float rxd[2];
     uint32_t rws[2];
+    int k0_commit = 0;  // K offset of the tile commit() stores (generic formats decode it there)
     auto fetch = [&](int k0) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -262,7 +269,9 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
             const int src = rowsrc[r];
             rxd[i] = src >= 0 ? xd[(size_t)src * (K / 32) + k0 / 32 + c] : 0.0f;
         }
-        if (fp4) {
+        if (gen) {
+            // generic formats are decoded from global memory in commit()
+        } else if (fp4) {
             // 64 rows x 64 qs bytes = 256 uint4 (2 per thread); 64 rows x 8 scale bytes (one uint2 per thread < 64)
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
@@ -298,7 +307,31 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
             const int idx = tid + 128 * i, r = idx >> 2, c = idx & 3;
             xds[r][c] = rxd[i];
         }
-        if (fp4) {
+        if (gen) {
+            const int kg = (int)(k0_commit / 32);
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int idx = tid + 128 * i, r = idx >> 2, c = idx & 3;
+                const cdc::G32 q = cdc::g32(W.fmt, W.qs + wrow(r) * grb, kg + c);
+                int4* dst = reinterpret_cast<int4*>(ws + r * RS + 32 * c);
+                dst[0] = make_int4(q.q[0], q.q[1], q.q[2], q.q[3]);
+                dst[1] = make_int4(q.q[4], q.q[5], q.q[6], q.q[7]);
+                wsc[r][2 * c] = q.s0;
+                wsc[r][2 * c + 1] = q.s1;
+                wmin[r][c] = q.m;
+            }
+            // activation sums per (token row, group): lanes c and c ^ 1 hold the two 16-byte halves of a group
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int idx = tid + 128 * i, r = idx >> 3, c = idx & 7;
+                int sum = __dp4a((int)rx[i].x, 0x01010101, 0);
+                sum = __dp4a((int)rx[i].y, 0x01010101, sum);
+                sum = __dp4a((int)rx[i].z, 0x01010101, sum);
+                sum = __dp4a((int)rx[i].w, 0x01010101, sum);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+                if ((c & 1) == 0) xsum[r][c >> 1] = sum;
+            }
+        } else if (fp4) {
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 const int idx = tid + 128 * i, r = idx >> 2, c = idx & 3;
@@ -339,6 +372,7 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
 
     fetch(0);
     for (int k0 = 0; k0 < K; k0 += KC) {
+        k0_commit = k0;
         __syncthreads();
         commit();
         __syncthreads();
@@ -369,7 +403,21 @@ __device__ __forceinline__ void moe_gemm(const ExpW& W, const int8_t* __restrict
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
                 const int n = wn * 32 + nt * 8 + 2 * tig;
-                if (fp4) {
+                if (gen) {
+                    const float w00 = wsc[n][2 * kb], w01 = wsc[n][2 * kb + 1], w10 = wsc[n + 1][2 * kb], w11 = wsc[n + 1][2 * kb + 1];
+                    const float m0 = wmin[n][kb], m1 = wmin[n + 1][kb];
+#pragma unroll
+                    for (int mt = 0; mt < 2; ++mt) {
+                        int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
+                        mma_s8_k16(c0, af[mt][0], af[mt][1], bf[nt][0]);
+                        mma_s8_k16(c1, af[mt][2], af[mt][3], bf[nt][1]);
+                        const float xs0 = (float)xsum[wm * 32 + mt * 16 + g][kb], xs1 = (float)xsum[wm * 32 + mt * 16 + g + 8][kb];
+                        acc[mt][nt][0] = fmaf(sx[mt][0], fmaf((float)c0[0], w00, fmaf((float)c1[0], w01, -m0 * xs0)), acc[mt][nt][0]);
+                        acc[mt][nt][1] = fmaf(sx[mt][0], fmaf((float)c0[1], w10, fmaf((float)c1[1], w11, -m1 * xs0)), acc[mt][nt][1]);
+                        acc[mt][nt][2] = fmaf(sx[mt][1], fmaf((float)c0[2], w00, fmaf((float)c1[2], w01, -m0 * xs1)), acc[mt][nt][2]);
+                        acc[mt][nt][3] = fmaf(sx[mt][1], fmaf((float)c0[3], w10, fmaf((float)c1[3], w11, -m1 * xs1)), acc[mt][nt][3]);
+                    }
+                } else if (fp4) {
                     const float w00 = wsc[n][2 * kb], w01 = wsc[n][2 * kb + 1], w10 = wsc[n + 1][2 * kb], w11 = wsc[n + 1][2 * kb + 1];
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {

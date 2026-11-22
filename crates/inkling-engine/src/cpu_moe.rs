@@ -36,6 +36,7 @@ impl CpuExp {
         match self.fmt {
             ExpertFmt::Nvfp4 => (self.k / 2, self.k / 16),
             ExpertFmt::Q8_0 => (self.k, self.k / 16),
+            ExpertFmt::Native(id) => (crate::codecs::row_bytes(id, self.k), 0),
         }
     }
     /// (qs, sc) of row r of expert e
@@ -59,6 +60,15 @@ pub struct CpuLayer {
 struct Acts {
     q: Vec<i8>,
     s8: Vec<f32>,
+    /// native formats: activation scale and sum of the int8 values per 16
+    s16: Vec<f32>,
+    sum16: Vec<i32>,
+}
+
+impl Acts {
+    fn with_capacity(k: usize) -> Self {
+        Acts { q: Vec::with_capacity(k), s8: Vec::with_capacity(k / 4), s16: Vec::with_capacity(k / 16), sum16: Vec::with_capacity(k / 16) }
+    }
 }
 
 /// `x` (int8, quantized in groups of `g` values with scales `xs`) arranged for rows of format `fmt` and length k.
@@ -79,7 +89,16 @@ fn prep_acts_mul(x: &[i8], xs: &[f32], g: usize, fmt: ExpertFmt, k: usize, mul: 
 fn prep_acts(x: &[i8], xs: &[f32], g: usize, fmt: ExpertFmt, k: usize, out: &mut Acts) {
     out.q.clear();
     out.s8.clear();
+    out.s16.clear();
+    out.sum16.clear();
     match fmt {
+        ExpertFmt::Native(_) => {
+            out.q.extend_from_slice(&x[..k]);
+            for i in 0..k / 16 {
+                out.s16.push(xs[16 * i / g]);
+                out.sum16.push(x[16 * i..16 * i + 16].iter().map(|&v| v as i32).sum());
+            }
+        }
         ExpertFmt::Nvfp4 => {
             for b in 0..k / 64 {
                 let xb = &x[64 * b..64 * b + 64];
@@ -121,9 +140,28 @@ fn ue4m3(x: u8) -> f32 {
 
 const E2M1: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
+/// Native formats: decode each group of 32 (codecs) and dot it with the natural-order activations.
+fn dot_native(id: u32, w: CpuExp, row: *const u8, a: &Acts) -> f32 {
+    let rb = crate::codecs::row_bytes(id, w.k);
+    let row = unsafe { std::slice::from_raw_parts(row, rb) };
+    let mut acc = 0f32;
+    for g in 0..w.k / 32 {
+        let q = crate::codecs::g32(id, row, g);
+        let x = &a.q[32 * g..32 * g + 32];
+        let (mut lo, mut hi) = (0i32, 0i32);
+        for i in 0..16 {
+            lo += q.q[i] as i32 * x[i] as i32;
+            hi += q.q[16 + i] as i32 * x[16 + i] as i32;
+        }
+        acc += a.s16[2 * g] * (q.s0 * lo as f32 - q.m * a.sum16[2 * g] as f32) + a.s16[2 * g + 1] * (q.s1 * hi as f32 - q.m * a.sum16[2 * g + 1] as f32);
+    }
+    acc
+}
+
 fn dot_scalar(w: CpuExp, row: (*const u8, *const u8), a: &Acts) -> f32 {
     let mut acc = 0f32;
     match w.fmt {
+        ExpertFmt::Native(id) => return dot_native(id, w, row.0, a),
         ExpertFmt::Nvfp4 => {
             for b in 0..w.k / 64 {
                 let qs = unsafe { std::slice::from_raw_parts(row.0.add(32 * b), 32) };
@@ -172,11 +210,83 @@ mod avx2 {
         _mm_cvtss_f32(s)
     }
 
+    #[inline]
+    fn f16(p: *const u8) -> f32 {
+        half::f16::from_bits(unsafe { (p as *const u16).read_unaligned() }).to_f32()
+    }
+
+    /// Group g of a native row as 32 int8 values + (s0, s1, m); K-quants vectorized, other formats via the
+    /// scalar decoder.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn g32(id: u32, row: *const u8, g: usize, k: usize) -> (__m256i, f32, f32, f32) {
+        use crate::codecs::{Q4_K, Q5_K, Q6_K};
+        let m4 = _mm256_set1_epi8(0x0F);
+        let j = g % 8;
+        match id {
+            Q4_K | Q5_K => {
+                let bs = if id == Q4_K { 144 } else { 176 };
+                let b = row.add(g / 8 * bs);
+                let qs = _mm256_loadu_si256(b.add(if id == Q4_K { 16 } else { 48 } + 32 * (j / 2)) as *const __m256i);
+                let mut q = if j & 1 == 1 { _mm256_and_si256(_mm256_srli_epi16(qs, 4), m4) } else { _mm256_and_si256(qs, m4) };
+                if id == Q5_K {
+                    let qh = _mm256_loadu_si256(b.add(16) as *const __m256i);
+                    let bit = _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128(j as i32)), _mm256_set1_epi8(1));
+                    q = _mm256_or_si256(q, _mm256_slli_epi16(bit, 4));
+                }
+                let sc = std::slice::from_raw_parts(b.add(4), 12);
+                let (d, mn) = if j < 4 {
+                    (sc[j] & 63, sc[j + 4] & 63)
+                } else {
+                    ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4), (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4))
+                };
+                let s = f16(b) * d as f32;
+                (q, s, s, f16(b.add(2)) * mn as f32)
+            }
+            Q6_K => {
+                let b = row.add(g / 8 * 210);
+                let (h, jj) = (j / 4, j % 4);
+                let ql = _mm256_loadu_si256(b.add(64 * h + 32 * (jj & 1)) as *const __m256i);
+                let ql = _mm256_and_si256(_mm256_srl_epi16(ql, _mm_cvtsi32_si128(4 * (jj as i32 >> 1))), m4);
+                let qh = _mm256_loadu_si256(b.add(128 + 32 * h) as *const __m256i);
+                let qh = _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128(2 * jj as i32)), _mm256_set1_epi8(3));
+                let q = _mm256_sub_epi8(_mm256_or_si256(ql, _mm256_slli_epi16(qh, 4)), _mm256_set1_epi8(32));
+                let d = f16(b.add(208));
+                let sc = b.add(192 + 8 * h + 2 * jj) as *const i8;
+                (q, d * *sc as f32, d * *sc.add(1) as f32, 0.0)
+            }
+            _ => {
+                let r = crate::codecs::g32(id, std::slice::from_raw_parts(row, crate::codecs::row_bytes(id, k)), g);
+                (_mm256_loadu_si256(r.q.as_ptr() as *const __m256i), r.s0, r.s1, r.m)
+            }
+        }
+    }
+
+    /// Native formats: per group, int8 dot of the decoded values with the activations (|q| x sign-adjusted x),
+    /// scales per 16, offsets through the per-16 activation sums.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_native(id: u32, w: CpuExp, row: *const u8, a: &Acts) -> f32 {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = _mm256_setzero_ps();
+        let mut moff = 0f32;
+        for g in 0..w.k / 32 {
+            let (q, s0, s1, m) = g32(id, row, g, w.k);
+            let x = _mm256_loadu_si256(a.q.as_ptr().add(32 * g) as *const __m256i);
+            let p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_abs_epi8(q), _mm256_sign_epi8(x, q)), ones);
+            let (xa, xb) = (a.s16[2 * g], a.s16[2 * g + 1]);
+            let sc = _mm256_setr_ps(s0 * xa, s0 * xa, s0 * xa, s0 * xa, s1 * xb, s1 * xb, s1 * xb, s1 * xb);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), sc, acc);
+            moff += m * (xa * a.sum16[2 * g] as f32 + xb * a.sum16[2 * g + 1] as f32);
+        }
+        hsum(acc) - moff
+    }
+
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot(w: CpuExp, row: (*const u8, *const u8), a: &Acts) -> f32 {
         let ones = _mm256_set1_epi16(1);
         let mut acc = _mm256_setzero_ps();
         match w.fmt {
+            ExpertFmt::Native(id) => return dot_native(id, w, row.0, a),
             ExpertFmt::Nvfp4 => {
                 let lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12, 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
                 let m4 = _mm256_set1_epi8(0x0F);
@@ -500,7 +610,7 @@ impl CpuMoe {
         let mut sc = self.scratch.lock().unwrap();
         sc.hq.resize(k * f, 0);
         sc.hd.resize(k * f / 16, 0.0);
-        let mut ax = Acts { q: Vec::with_capacity(d), s8: Vec::with_capacity(d / 4) };
+        let mut ax = Acts::with_capacity(d);
         prep_acts_mul(&io.xq, &io.xd, 32, layer.gate_up.fmt, d, self.fp4_mul(layer.gate_up.fmt), &mut ax);
         let (hq, hd) = (SPtr(sc.hq.as_mut_ptr()), SPtr(sc.hd.as_mut_ptr()));
         let sel: Vec<usize> = io.sel.iter().map(|&e| e as usize).collect();
@@ -537,7 +647,7 @@ impl CpuMoe {
         // phase 2: output rows n: y_n = sum_t wts_t s_e (W_e[n] . h_t)
         let hacts: Vec<Acts> = (0..k)
             .map(|t| {
-                let mut a = Acts { q: Vec::with_capacity(f), s8: Vec::with_capacity(f / 4) };
+                let mut a = Acts::with_capacity(f);
                 prep_acts_mul(&sc.hq[t * f..(t + 1) * f], &sc.hd[t * (f / 16)..(t + 1) * (f / 16)], 16, layer.down.fmt, f, self.fp4_mul(layer.down.fmt), &mut a);
                 a
             })
