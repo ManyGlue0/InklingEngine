@@ -211,14 +211,15 @@ mod avx2 {
     }
 
     #[inline]
-    fn f16(p: *const u8) -> f32 {
-        half::f16::from_bits(unsafe { (p as *const u16).read_unaligned() }).to_f32()
+    #[target_feature(enable = "avx2,f16c")]
+    unsafe fn f16(p: *const u8) -> f32 {
+        _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((p as *const u16).read_unaligned() as i32)))
     }
 
     /// Group g of a native row as 32 int8 values + (s0, s1, m); K-quants vectorized, other formats via the
     /// scalar decoder.
     #[inline]
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn g32(id: u32, row: *const u8, g: usize, k: usize) -> (__m256i, f32, f32, f32) {
         use crate::codec_tables::*;
         use crate::codecs::{IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K};
@@ -371,12 +372,27 @@ mod avx2 {
     #[target_feature(enable = "avx2")]
     unsafe fn signed32(grid: [u64; 4], signs: [u8; 4]) -> __m256i {
         let gv = _mm256_set_epi64x(grid[3] as i64, grid[2] as i64, grid[1] as i64, grid[0] as i64);
-        let rep = |s: u8| (s as u64 * 0x0101_0101_0101_0101) as i64;
-        let sb = _mm256_set_epi64x(rep(signs[3]), rep(signs[2]), rep(signs[1]), rep(signs[0]));
-        let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
-        let m = _mm256_cmpeq_epi8(_mm256_and_si256(sb, bits), bits);
+        let mk = |s: u8| SIGN_MASK64[s as usize] as i64;
+        let m = _mm256_set_epi64x(mk(signs[3]), mk(signs[2]), mk(signs[1]), mk(signs[0]));
         _mm256_sub_epi8(_mm256_xor_si256(gv, m), m)
     }
+
+    /// sign byte -> 8 byte masks (0xFF where the bit is set)
+    static SIGN_MASK64: [u64; 256] = {
+        let mut t = [0u64; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut k = 0;
+            while k < 8 {
+                if i & (1 << k) != 0 {
+                    t[i] |= 0xFFu64 << (8 * k);
+                }
+                k += 1;
+            }
+            i += 1;
+        }
+        t
+    };
 
     /// Q2_0: byte -> its four 2-bit values minus 1, as one little-endian u32 of int8
     static Q2_0_LUT: [u32; 256] = {
@@ -408,7 +424,7 @@ mod avx2 {
             let x = _mm256_loadu_si256(a.q.as_ptr().add(32 * g) as *const __m256i);
             let p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_abs_epi8(q), _mm256_sign_epi8(x, q)), ones);
             let (xa, xb) = (a.s16[2 * g], a.s16[2 * g + 1]);
-            let sc = _mm256_setr_ps(s0 * xa, s0 * xa, s0 * xa, s0 * xa, s1 * xb, s1 * xb, s1 * xb, s1 * xb);
+            let sc = _mm256_set_m128(_mm_set1_ps(s1 * xb), _mm_set1_ps(s0 * xa));
             acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), sc, acc);
             moff += m * (xa * a.sum16[2 * g] as f32 + xb * a.sum16[2 * g + 1] as f32);
         }
@@ -474,6 +490,7 @@ struct PoolShared {
     job: Mutex<Option<JobPtr>>,
     wake: Condvar,
     stop: AtomicBool,
+    pin: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -484,7 +501,10 @@ unsafe impl Sync for JobPtr {}
 impl Pool {
     pub fn new(n: usize) -> Self {
         let n = n.max(1);
-        let shared = Arc::new(PoolShared { epoch: AtomicUsize::new(0), pending: AtomicUsize::new(0), job: Mutex::new(None), wake: Condvar::new(), stop: AtomicBool::new(false) });
+        // one worker per physical core when there are enough (the caller, worker 0, runs wherever CUDA calls it)
+        let logical = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+        let pin = 2 * n <= logical && std::env::var("INKLING_CPU_PIN").as_deref() == Ok("1");
+        let shared = Arc::new(PoolShared { epoch: AtomicUsize::new(0), pending: AtomicUsize::new(0), job: Mutex::new(None), wake: Condvar::new(), stop: AtomicBool::new(false), pin });
         let threads = (1..n)
             .map(|i| {
                 let sh = shared.clone();
@@ -519,7 +539,30 @@ impl Pool {
     }
 }
 
+/// Pin the calling thread to logical CPU `cpu` (Windows; SMT siblings are adjacent there, so 2i = one thread per
+/// physical core). Opt-in with INKLING_CPU_PIN=1: it speeds up the isolated CPU benchmark but slowed real decode
+/// (the CUDA driver and callback threads then compete with pinned workers).
+fn pin_to(cpu: usize) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadAffinityMask(thread: isize, mask: usize) -> usize;
+        }
+        if cpu < usize::BITS as usize {
+            unsafe { SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = cpu;
+}
+
 fn worker(sh: Arc<PoolShared>, i: usize) {
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if sh.pin {
+        pin_to(if 2 * i < logical { 2 * i } else { i % logical });
+    }
     let mut seen = 0usize;
     loop {
         // spin, then sleep until the generation changes
