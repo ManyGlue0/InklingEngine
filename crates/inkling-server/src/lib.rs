@@ -139,6 +139,9 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        // axum refuses bodies over 2 MB by default, about 500k tokens of English: allow a full context of
+        // escaped text (up to ~16 bytes per token) and never less than 64 MiB, for images
+        .layer(axum::extract::DefaultBodyLimit::max((n_ctx * 16).max(64 << 20)))
         .layer(CorsLayer::permissive())
         .with_state(state);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
