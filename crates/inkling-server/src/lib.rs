@@ -23,7 +23,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use inkling_core::chat::{self, Event};
 use inkling_core::{Gguf, Tokenizer};
 use inkling_engine::{EMBED_TOKEN_BASE, Engine, Image, ImageEmbed, Sampling};
@@ -111,6 +111,7 @@ struct BodyLimits {
     total: Duration,
     idle: Duration,
     grace: Duration,
+    /// Minimum bytes per second; zero disables the rate deadline and uses `total`.
     min_rate: usize,
 }
 
@@ -812,12 +813,20 @@ async fn read_body(body: Body, limits: &BodyLimits) -> Result<Vec<u8>, BodyReadE
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::new();
     loop {
-        let rate_nanos = (bytes.len() as u128).saturating_mul(1_000_000_000) / limits.min_rate.max(1) as u128;
-        let deadline = limits.total.min(limits.grace.saturating_add(
-            Duration::from_nanos(rate_nanos.min(u64::MAX as u128) as u64),
-        ));
-        let remaining = deadline.checked_sub(started.elapsed()).filter(|d| !d.is_zero())
-            .ok_or(BodyReadError::TimedOut)?;
+        let deadline = if limits.min_rate == 0 {
+            limits.total
+        } else {
+            let rate_nanos = (bytes.len() as u128).saturating_mul(1_000_000_000) / limits.min_rate as u128;
+            limits.total.min(limits.grace.saturating_add(
+                Duration::from_nanos(rate_nanos.min(u64::MAX as u128) as u64),
+            ))
+        };
+        let Some(remaining) = deadline.checked_sub(started.elapsed()).filter(|d| !d.is_zero()) else {
+            return match stream.next().now_or_never() {
+                Some(None) => Ok(bytes),
+                _ => Err(BodyReadError::TimedOut),
+            };
+        };
         let waiting = tokio::time::Instant::now();
         let chunk = tokio::time::timeout(limits.idle.min(remaining), stream.next()).await
             .map_err(|_| BodyReadError::TimedOut)?;
@@ -1107,11 +1116,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_reader_accepts_a_zero_minimum_rate_without_panicking() {
-        let limits = BodyLimits { min_rate: 0, ..small_body_limits() };
-        let chunks = [Ok::<_, std::io::Error>("hello "), Ok("world")];
-        let body = Body::from_stream(futures_util::stream::iter(chunks));
-        assert_eq!(read_body(body, &limits).await.unwrap(), b"hello world");
+    async fn body_reader_accepts_an_empty_body_with_a_zero_total_deadline() {
+        let limits = BodyLimits { total: Duration::ZERO, ..small_body_limits() };
+        assert_eq!(read_body(Body::empty(), &limits).await, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn body_reader_rejects_a_pending_stream_with_a_zero_total_deadline() {
+        let limits = BodyLimits { total: Duration::ZERO, ..small_body_limits() };
+        let stream = futures_util::stream::pending::<Result<&'static str, std::io::Error>>();
+        assert_eq!(read_body(Body::from_stream(stream), &limits).await, Err(BodyReadError::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn body_reader_rejects_a_ready_chunk_with_a_zero_total_deadline() {
+        let limits = BodyLimits { total: Duration::ZERO, ..small_body_limits() };
+        assert_eq!(read_body(Body::from("x"), &limits).await, Err(BodyReadError::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn body_reader_disables_the_rate_deadline_with_a_zero_minimum_rate() {
+        let limits = BodyLimits {
+            total: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            grace: Duration::ZERO,
+            min_rate: 0,
+            ..small_body_limits()
+        };
+        let stream = futures_util::stream::once(async {
+            tokio::task::yield_now().await;
+            Ok::<_, std::io::Error>("hello world")
+        });
+        let body = Body::from_stream(stream);
+        let read = read_body(body, &limits);
+        tokio::pin!(read);
+        assert!(read.as_mut().now_or_never().is_none());
+        assert_eq!(read.await.unwrap(), b"hello world");
     }
 
     #[tokio::test]

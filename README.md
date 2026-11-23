@@ -340,7 +340,7 @@ Server flags:
   reused count is reported in `usage.prompt_tokens_details.cached_tokens`.
 - **Authentication:** send `Authorization: Bearer YOUR_SECRET_KEY` on every route except `/health`. CORS is disabled by default.
 - **Limits:** request bodies are capped at 8 MiB (HTTP 413, checked against both `Content-Length` and received bytes). Invalid or duplicate `Content-Length` headers and body transport errors return HTTP 400; unsupported content types return HTTP 415.
-  At most 16 bodies are read concurrently, with up to 250 ms to wait for a reader permit (HTTP 503 when busy). Reading has a minimum rate of 64 KiB/s with 2 seconds of grace: after receiving `n` bytes, the deadline is the earlier of 15 seconds and `2 seconds + n / (64 KiB/s)` from the start of reading. Each wait for data is also capped at 3 seconds; any read deadline returns HTTP 408.
+  At most 16 bodies are read concurrently, with up to 250 ms to wait for a reader permit (HTTP 503 when busy). Reading has a minimum rate of 64 KiB/s with 2 seconds of grace: after receiving `n` bytes, the deadline is the earlier of 15 seconds and `2 seconds + n / (64 KiB/s)` from the start of reading. Each wait for data is also capped at 3 seconds; a read deadline returns HTTP 408 unless the body has already ended.
   A full GPU queue (8 admitted jobs) returns HTTP 503 before reading the body. Queue slots are deliberately reserved only after reading, so slow uploads cannot occupy GPU queue capacity; admission checks the queue again when reserving a slot. Requests are served one at a time. `stop` accepts at most 16 strings of at most 256 bytes each.
   When exposing the server beyond the local machine, use a reverse proxy that limits connections per client.
 
