@@ -81,6 +81,8 @@ fn main() -> Result<()> {
              usage:\n\
              \x20 inkling serve <model.gguf> [--mmproj FILE] [--ctx N] [--host H] [--port P] [--api-key KEY] [--model-id NAME]\n\
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
+             \x20               [--reasoning-budget N] [--insecure-no-auth]\n\
+             \x20 serve requires --api-key KEY or INKLING_API_KEY unless --insecure-no-auth is explicit\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
              \x20 inkling bench <model.gguf> [--ctx N] [--fill 0,128k,512k,1M] [--kv q4,q6] [--gen N]\n\
              \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6; K:V such\n\
@@ -392,6 +394,7 @@ fn rendertest(cases: &str) -> Result<()> {
 
 /// OpenAI-compatible server: inkling serve <model> [--host H] [--port P] [--ctx N] [--api-key K] [--temp T]
 /// [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N] [--mmproj FILE] [--model-id NAME]
+/// [--reasoning-budget N] (unlimited by default) [--insecure-no-auth]
 fn serve(model: &str, flags: &[String]) -> Result<()> {
     let get = |name: &str| flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).cloned();
     let num = |name: &str| -> Result<Option<f64>> { get(name).map(|v| v.parse::<f64>().map_err(|e| anyhow::anyhow!("{name}: {e}"))).transpose() };
@@ -405,14 +408,27 @@ fn serve(model: &str, flags: &[String]) -> Result<()> {
     let model_id = get("--model-id").unwrap_or_else(|| {
         std::path::Path::new(model).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "inkling-2-mini".into())
     });
+    let reasoning_budget = if flags.iter().any(|a| a == "--reasoning-budget") {
+        let v = get("--reasoning-budget").ok_or_else(|| anyhow::anyhow!("--reasoning-budget needs a value"))?;
+        Some(v.parse::<usize>().map_err(|e| anyhow::anyhow!("--reasoning-budget: {e}"))?)
+    } else {
+        None
+    };
+    let api_key = if flags.iter().any(|a| a == "--api-key") {
+        Some(get("--api-key").filter(|v| !v.is_empty() && !v.starts_with("--")).ok_or_else(|| anyhow::anyhow!("--api-key needs a non-empty value"))?)
+    } else {
+        std::env::var("INKLING_API_KEY").ok()
+    };
     let opts = inkling_server::Options {
         host: get("--host").unwrap_or_else(|| "127.0.0.1".into()),
         port: num("--port")?.map(|v| v as u16).unwrap_or(8080),
         n_ctx: num("--ctx")?.map(|v| v as usize).unwrap_or(131072),
-        api_key: get("--api-key").or_else(|| std::env::var("INKLING_API_KEY").ok()),
+        api_key,
+        insecure_no_auth: flags.iter().any(|a| a == "--insecure-no-auth"),
         model_id,
         defaults: d,
         mmproj: get("--mmproj"),
+        reasoning_budget,
     };
     inkling_server::serve(model, opts)
 }

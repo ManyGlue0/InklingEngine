@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
+use image::ImageDecoder;
 use inkling_core::Gguf;
 use inkling_cuda::{Arg, DevBuf, Gpu, as_bytes};
 
@@ -66,9 +67,39 @@ pub struct Image {
 }
 
 impl Image {
+    /// Read and validate dimensions before allocating decoded pixels.
+    pub fn dimensions(bytes: &[u8]) -> Result<(usize, usize)> {
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().context("detecting image format")?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(128 << 20);
+        reader.limits(limits);
+        let (width, height) = reader.into_dimensions().context("reading image dimensions")?;
+        ensure!(width > 0 && height > 0, "image dimensions must be nonzero");
+        ensure!(width <= 4096 && height <= 4096, "image dimensions exceed 4096 x 4096");
+        Ok((width as usize, height as usize))
+    }
+
     /// Decode PNG / JPEG / WebP / GIF / BMP bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let img = image::load_from_memory(bytes).context("decoding image")?.to_rgb8();
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().context("detecting image format")?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(4096);
+        limits.max_image_height = Some(4096);
+        limits.max_alloc = Some(128 << 20);
+        reader.limits(limits.clone());
+        let mut decoder = reader.into_decoder().context("decoding image")?;
+        let (width, height) = decoder.dimensions();
+        ensure!(width > 0 && height > 0, "image dimensions must be nonzero");
+        ensure!(width <= 4096 && height <= 4096, "image dimensions exceed 4096 x 4096");
+        limits.max_image_width = Some(width);
+        limits.max_image_height = Some(height);
+        ensure!(decoder.total_bytes() <= u64::from(width) * u64::from(height) * 4, "decoded image exceeds four bytes per pixel");
+        decoder.set_limits(limits).context("decoding image")?;
+        let img = image::DynamicImage::from_decoder(decoder).context("decoding image")?;
+        ensure!(img.width() == width && img.height() == height, "decoded dimensions differ from image header");
+        let img = img.into_rgb8();
         Ok(Self { width: img.width() as usize, height: img.height() as usize, rgb: img.into_raw() })
     }
 
@@ -80,6 +111,122 @@ impl Image {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
         h
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Image;
+
+    fn png(image: image::DynamicImage) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    fn bmp_header(width: u32, height: u32) -> [u8; 54] {
+        let mut bytes = [0u8; 54];
+        bytes[..2].copy_from_slice(b"BM");
+        bytes[2..6].copy_from_slice(&54u32.to_le_bytes());
+        bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bytes[18..22].copy_from_slice(&width.to_le_bytes());
+        bytes[22..26].copy_from_slice(&height.to_le_bytes());
+        bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bytes
+    }
+
+    fn assert_dimension_error(error: anyhow::Error) {
+        let message = format!("{error:#}");
+        assert!(message.contains("image dimensions exceed 4096 x 4096") || matches!(
+            error.downcast_ref::<image::ImageError>(),
+            Some(image::ImageError::Limits(limit)) if matches!(limit.kind(), image::error::LimitErrorKind::DimensionError)
+        ), "{message}");
+    }
+
+    #[test]
+    fn image_dimensions_read_only_the_header_and_accept_the_limit() {
+        assert_eq!(Image::dimensions(&bmp_header(1, 2)).unwrap(), (1, 2));
+        assert_eq!(Image::dimensions(&bmp_header(4096, 4096)).unwrap(), (4096, 4096));
+    }
+
+    #[test]
+    fn image_dimensions_reject_either_side_above_the_limit_before_decode() {
+        for (width, height) in [(4097, 1), (1, 4097), (4097, 4097)] {
+            let bytes = bmp_header(width, height);
+            assert_dimension_error(Image::dimensions(&bytes).err().unwrap());
+            assert_dimension_error(Image::decode(&bytes).err().unwrap());
+        }
+    }
+
+    #[test]
+    fn image_decode_accepts_rgba8_but_rejects_more_than_four_decoded_bytes_per_pixel() {
+        let bytes = png(image::DynamicImage::ImageRgba8(image::ImageBuffer::new(1, 1)));
+        let image = Image::decode(&bytes).unwrap();
+        assert_eq!((image.width, image.height, image.rgb.len()), (1, 1, 3));
+        for image in [
+            image::DynamicImage::ImageRgb16(image::ImageBuffer::new(1, 1)),
+            image::DynamicImage::ImageRgba16(image::ImageBuffer::new(1, 1)),
+        ] {
+            let bytes = png(image);
+            let message = Image::decode(&bytes).err().unwrap().to_string();
+            assert!(message.contains("decoded image exceeds four bytes per pixel"), "{message}");
+        }
+    }
+
+    #[test]
+    fn image_decode_accepts_rgb8_and_rgba8_pngs_at_the_dimension_limit() {
+        for rgba in [false, true] {
+            let image = if rgba { image::DynamicImage::new_rgba8(4096, 4096) } else { image::DynamicImage::new_rgb8(4096, 4096) };
+            let bytes = png(image);
+            let image = Image::decode(&bytes).unwrap();
+            assert_eq!((image.width, image.height), (4096, 4096));
+            assert_eq!(image.rgb.len(), 4096 * 4096 * 3);
+        }
+    }
+
+    #[test]
+    fn image_decode_rejects_png_dimensions_above_the_limit() {
+        let bytes = png(image::DynamicImage::new_rgb8(4097, 1));
+        assert_dimension_error(Image::dimensions(&bytes).err().unwrap());
+        assert_dimension_error(Image::decode(&bytes).err().unwrap());
+    }
+
+    #[test]
+    fn image_decode_accepts_jpeg_bmp_and_webp_at_the_dimension_limit() {
+        for format in [image::ImageFormat::Jpeg, image::ImageFormat::Bmp, image::ImageFormat::WebP] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(4096, 4096).write_to(&mut bytes, format).unwrap();
+            let bytes = bytes.into_inner();
+            assert_eq!(Image::dimensions(&bytes).unwrap(), (4096, 4096));
+            let image = Image::decode(&bytes).unwrap();
+            assert_eq!((image.width, image.height, image.rgb.len()), (4096, 4096, 4096 * 4096 * 3));
+        }
+    }
+
+    #[test]
+    fn image_decode_accepts_a_small_gif() {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 3).write_to(&mut bytes, image::ImageFormat::Gif).unwrap();
+        let bytes = bytes.into_inner();
+        assert_eq!(Image::dimensions(&bytes).unwrap(), (2, 3));
+        let image = Image::decode(&bytes).unwrap();
+        assert_eq!((image.width, image.height, image.rgb.len()), (2, 3, 18));
+    }
+
+    #[test]
+    fn image_decode_rejects_zero_width_or_height() {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1).write_to(&mut bytes, image::ImageFormat::Bmp).unwrap();
+        let bytes = bytes.into_inner();
+        for offset in [18, 22] {
+            let mut bytes = bytes.clone();
+            // Zero dimensions are invalid, so corrupt the header of an encoded image.
+            bytes[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
+            assert!(Image::dimensions(&bytes).is_err());
+            assert!(Image::decode(&bytes).is_err());
+        }
     }
 }
 

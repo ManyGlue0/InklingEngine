@@ -227,7 +227,7 @@ If you would rather not install it, run `cargo build --release` instead and call
 
 ```sh
 # OpenAI-compatible server at http://127.0.0.1:8080/v1 (point any OpenAI client or chat UI at it)
-inkling serve path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf --mmproj path/to/mmproj-F32.gguf --ctx 131072
+inkling serve path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf --mmproj path/to/mmproj-F32.gguf --ctx 131072 --api-key YOUR_SECRET_KEY
 
 # or a one-off generation in the terminal (greedy by default; see "Environment" for sampling)
 inkling generate path/to/Inkling-2-Mini-UD-Q4_K_XL.gguf "The three largest moons of Jupiter are" 64
@@ -311,7 +311,8 @@ Server flags:
 | `--kv q4\|q6\|q8\|f16`, `--kv-k`, `--kv-v` | `q6` (KV cache type, `K:V` such as `q8:q4` for separate types; also on `generate` and `bench`) |
 | `--offload auto\|off\|all\|N` | `auto` (MoE layers on the CPU only when VRAM is short) |
 | `--mmproj FILE` | none (enables image input) |
-| `--api-key KEY` (or `INKLING_API_KEY`) | none |
+| `--api-key KEY` (or `INKLING_API_KEY`) | required unless `--insecure-no-auth` is explicit |
+| `--insecure-no-auth` | off (allows unauthenticated access when no key is configured) |
 | `--model-id NAME` | the file name |
 | `--temp`, `--top-p`, `--top-k`, `--min-p` | `0.8`, `0.95`, `40`, `0.05` |
 | `--repeat-penalty`, `--repeat-last-n` | `1.0`, `64` |
@@ -330,21 +331,27 @@ Server flags:
   - penalties: `presence_penalty`, `frequency_penalty`, `repeat_penalty` (or `repetition_penalty`), `repeat_last_n`.
 - **Images:** content parts of type `image_url`, `input_image` or `image`, carrying a `data:` URL or bare base64
   (PNG, JPEG, WebP, GIF, BMP). Remote URLs are not fetched.
+  - Requires `--mmproj`; at most 8 images per request, each at most 4096×4096 pixels, with a 128 MiB decoder allocation budget (best effort). The global 512 MiB image budget reserves 7 bytes per pixel for decoding and RGB8 conversion.
   - An image becomes up to 4,096 tokens: one per 40×40 pixels.
   - Larger images are downscaled with the aspect ratio kept.
 - `POST /v1/completions`: raw text completion; `prompt` is a string or an array of token ids.
 - `GET /v1/models`, `GET /health`.
 - **Prompt caching:** a request that extends the previous conversation reuses its state, including images, and the
   reused count is reported in `usage.prompt_tokens_details.cached_tokens`.
-- **CORS** is open, so browser UIs work. Requests are served one at a time, in order.
+- **Authentication:** send `Authorization: Bearer YOUR_SECRET_KEY` on every route except `/health`. CORS is disabled by default.
+- **Limits:** request bodies are capped at 8 MiB (HTTP 413, checked against both `Content-Length` and received bytes). Invalid or duplicate `Content-Length` headers and body transport errors return HTTP 400; unsupported content types return HTTP 415.
+  At most 16 bodies are read concurrently, with up to 250 ms to wait for a reader permit (HTTP 503 when busy). Reading has a minimum rate of 64 KiB/s with 2 seconds of grace: after receiving `n` bytes, the deadline is the earlier of 15 seconds and `2 seconds + n / (64 KiB/s)` from the start of reading. Each wait for data is also capped at 3 seconds; any read deadline returns HTTP 408.
+  A full GPU queue (8 admitted jobs) returns HTTP 503 before reading the body. Queue slots are deliberately reserved only after reading, so slow uploads cannot occupy GPU queue capacity; admission checks the queue again when reserving a slot. Requests are served one at a time. `stop` accepts at most 16 strings of at most 256 bytes each.
+  When exposing the server beyond the local machine, use a reverse proxy that limits connections per client.
 
 ```sh
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer YOUR_SECRET_KEY" -H "Content-Type: application/json" -d '{
   "messages": [{"role": "user", "content": "Write a haiku about GPUs."}],
   "reasoning_effort": "low", "stream": true }'
 ```
 
-Try it from a terminal with the bundled client: `python tools/chat.py "Hello!"` (add `--image photo.jpg` for vision).
+The bundled scripts do not send API keys; use them only with a trusted local server started explicitly with
+`--insecure-no-auth` and no configured key. Client: `python tools/chat.py "Hello!"` (add `--image photo.jpg` for vision).
 Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python tools/vision_smoke.py` (image input).
 
 ### Environment
