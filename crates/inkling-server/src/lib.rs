@@ -25,6 +25,8 @@ use futures_util::StreamExt;
 use inkling_core::chat::{self, Event};
 use inkling_core::{Gguf, Tokenizer};
 use inkling_engine::{EMBED_TOKEN_BASE, Engine, Image, ImageEmbed, Sampling};
+
+mod structured;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -71,6 +73,8 @@ struct Job {
     raw: bool,
     /// images: (prompt position of the first embedding row, image)
     images: Vec<(usize, Arc<Image>)>,
+    /// JSON schema the answer must follow (response_format), or None
+    schema: Option<Value>,
     tx: mpsc::UnboundedSender<Out>,
 }
 
@@ -80,6 +84,8 @@ enum Out {
     Ev(Event),
     Done { finish: &'static str, completion_tokens: usize },
     Error(String),
+    /// the request cannot be served as asked (e.g. an unusable JSON schema): 400
+    Invalid(String),
 }
 
 struct AppState {
@@ -187,9 +193,27 @@ impl EmbedCache {
 /// GPU worker: one job at a time.
 fn worker(eng: &mut Engine, tok: &Tokenizer, jobs: std::sync::mpsc::Receiver<Job>) {
     let mut embeds = EmbedCache::default();
+    // structured output: built once, lazily (the first request with response_format pays for it)
+    let mut guidance: Option<Result<structured::Guidance, String>> = None;
     while let Ok(job) = jobs.recv() {
         let tx = job.tx.clone();
-        if let Err(e) = run_job(eng, tok, &mut embeds, job) {
+        let constraint = match &job.schema {
+            None => None,
+            Some(schema) => match guidance.get_or_insert_with(|| structured::Guidance::new(tok).map_err(|e| format!("{e:#}"))) {
+                Err(e) => {
+                    let _ = tx.send(Out::Error(format!("structured output unavailable: {e}")));
+                    continue;
+                }
+                Ok(g) => match g.start(schema.clone()) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        let _ = tx.send(Out::Invalid(format!("{e:#}")));
+                        continue;
+                    }
+                },
+            },
+        };
+        if let Err(e) = run_job(eng, tok, &mut embeds, job, constraint) {
             let _ = tx.send(Out::Error(format!("{e:#}")));
         }
     }
@@ -234,7 +258,9 @@ impl Decoder {
     }
 }
 
-fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job) -> Result<()> {
+fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job, constraint: Option<structured::Constrained>) -> Result<()> {
+    let constraint = constraint.map(std::cell::RefCell::new);
+    let constraint_error: std::cell::RefCell<Option<anyhow::Error>> = std::cell::RefCell::new(None);
     let mut embeds = Vec::with_capacity(job.images.len());
     for (pos, img) in &job.images {
         embeds.push((*pos, embed_cache.get_or_encode(eng, img)?));
@@ -298,10 +324,31 @@ fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job:
             if !started.get() {
                 started.set(true);
             }
+            if let Some(c) = &constraint {
+                if let Err(e) = c.borrow_mut().push(t) {
+                    *constraint_error.borrow_mut() = Some(e);
+                    return false;
+                }
+            }
             on_token(t)
         };
-        eng.generate_mm(&job.prompt, &embeds, job.max_new, &job.sampling, &mut cb)?
+        match &constraint {
+            Some(c) => {
+                let mut mask = || match c.borrow_mut().mask() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        *constraint_error.borrow_mut() = Some(e);
+                        None
+                    }
+                };
+                eng.generate_mm_constrained(&job.prompt, &embeds, job.max_new, &job.sampling, &mut cb, &mut mask)?
+            }
+            None => eng.generate_mm(&job.prompt, &embeds, job.max_new, &job.sampling, &mut cb)?,
+        }
     };
+    if let Some(e) = constraint_error.into_inner() {
+        return Err(e);
+    }
     let _ = tx.send(Out::Started { prompt_tokens, cached });
     if finish.is_none() && !held.is_empty() {
         let _ = tx.send(Out::Ev(Event::Content(std::mem::take(&mut held))));
@@ -340,6 +387,7 @@ struct Req {
     stop: Vec<String>,
     stream: bool,
     include_usage: bool,
+    schema: Option<Value>,
 }
 
 /// Bytes of an image reference: a `data:` URL or bare base64.
@@ -480,7 +528,8 @@ fn parse_request(state: &AppState, body: &Value, raw: bool) -> Result<Req> {
     };
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Value::as_bool).unwrap_or(false);
-    Ok(Req { prompt, images, max_new, sampling, stop, stream, include_usage })
+    let schema = if raw { None } else { structured::requested_schema(body)? };
+    Ok(Req { prompt, images, max_new, sampling, stop, stream, include_usage, schema })
 }
 
 fn usage(prompt_tokens: usize, cached: usize, completion: usize) -> Value {
@@ -507,7 +556,7 @@ async fn start(state: Arc<AppState>, headers: HeaderMap, body: Value, raw: bool)
     let (tx, rx) = mpsc::unbounded_channel();
     let stream = req.stream;
     let include_usage = req.include_usage;
-    if state.jobs.send(Job { prompt: req.prompt, images: req.images, max_new: req.max_new, sampling: req.sampling, stop: req.stop, raw, tx }).is_err() {
+    if state.jobs.send(Job { prompt: req.prompt, images: req.images, max_new: req.max_new, sampling: req.sampling, stop: req.stop, raw, schema: req.schema, tx }).is_err() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "GPU worker is not running");
     }
     let id = new_id(if raw { "cmpl-" } else { "chatcmpl-" });
@@ -533,6 +582,7 @@ async fn collect_text(mut rx: mpsc::UnboundedReceiver<Out>, id: String, model: S
             Out::Ev(Event::Content(s) | Event::Reasoning(s)) => text.push_str(&s),
             Out::Ev(_) => {}
             Out::Error(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Out::Invalid(e) => return err(StatusCode::BAD_REQUEST, e),
             Out::Done { finish, completion_tokens } => {
                 return Json(json!({"id": id, "object": "text_completion", "created": created, "model": model,
                     "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish}],
@@ -562,7 +612,7 @@ fn sse_text(rx: mpsc::UnboundedReceiver<Out>, id: String, model: String, created
             }
             Out::Ev(Event::Content(s) | Event::Reasoning(s)) => out.push(chunk(&s, None)),
             Out::Ev(_) => {}
-            Out::Error(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
+            Out::Error(e) | Out::Invalid(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
             Out::Done { finish, completion_tokens } => {
                 out.push(chunk("", Some(finish)));
                 if include_usage {
@@ -593,6 +643,7 @@ async fn collect_response(mut rx: mpsc::UnboundedReceiver<Out>, id: String, mode
             }
             Out::Ev(Event::End) => {}
             Out::Error(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Out::Invalid(e) => return err(StatusCode::BAD_REQUEST, e),
             Out::Done { finish, completion_tokens } => {
                 let mut msg = json!({"role": "assistant", "content": if content.is_empty() && !tool_calls.is_empty() { Value::Null } else { Value::String(content) }});
                 if !reasoning.is_empty() {
@@ -640,7 +691,7 @@ fn sse_response(rx: mpsc::UnboundedReceiver<Out>, id: String, model: String, cre
                 n_tools += 1;
             }
             Out::Ev(Event::End) => {}
-            Out::Error(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
+            Out::Error(e) | Out::Invalid(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
             Out::Done { finish, completion_tokens } => {
                 out.push(chunk(json!({}), Some(finish)));
                 if usage_tail {
