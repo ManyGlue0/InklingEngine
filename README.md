@@ -113,6 +113,25 @@ normal decode step would be, and a guess is kept only if it equals that sample. 
 The drafter applies to text requests: requests with images, and structured output (`response_format`), decode
 without it. It does not combine with CPU offload yet.
 
+### Parallel requests
+`inkling serve --parallel N` (up to 8) decodes up to N requests together. Every step runs one batched pass that
+produces a token for each of them: the weights and the chosen experts are read once for all, so N streams cost much
+less than N times one. Each stream has its own KV cache and prompt cache over `--ctx` / N positions; a new request
+goes to the free stream whose cache it extends.
+
+| `--parallel` | total decode | per request |
+|---|---|---|
+| 1 | 114 tok/s | 114 tok/s |
+| 2 | 162 tok/s | 81 tok/s |
+| 4 | 237 tok/s | 59 tok/s |
+| 8 | 297 tok/s | 37 tok/s |
+
+RTX 3090, UD-Q4_K_XL, every stream decoding. Each extra stream needs about 0.4–0.5 GB of VRAM beyond the shared
+context (its sliding-window rings): `--ctx 65536 --parallel 4` uses 20.4 GB, against 18.8 GB for one stream. A
+stream's output is the same as it would be alone (bit for bit up to 6 streams; beyond that the projections switch to
+the tensor-core GEMM, which rounds differently). `--parallel` needs the whole model on the GPU (no CPU offload) and
+does not combine with `--draft` yet. A new request's prompt is processed while the other streams wait.
+
 ### Smaller GPUs: CPU offload
 When the model and context do not fit in free VRAM, `inkling` keeps the experts of some MoE layers in system RAM
 and runs them on the CPU (AVX2, all cores). Every token reads only 8 of each layer's 128 experts, so a layer on the
@@ -377,7 +396,8 @@ Server flags:
 - `GET /v1/models`, `GET /health`.
 - **Prompt caching:** a request that extends the previous conversation reuses its state, including images, and the
   reused count is reported in `usage.prompt_tokens_details.cached_tokens`.
-- **Requests** are served one at a time, in order. Up to 8 wait in the queue; more get HTTP 503.
+- **Requests** are served one at a time, in order, or up to N at once with `--parallel N` (see
+  [Parallel requests](#parallel-requests)). Up to 16 are admitted (decoding and waiting); more get HTTP 503.
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -456,6 +476,9 @@ Developer commands:
   output into mapped memory, a CUDA host node runs the experts on a thread pool inside the token's graph, and the
   post conv reads the result back. During prefill the same pinned copy streams to the GPU in 16-expert groups on a
   second stream, double-buffered.
+- **Parallel streams.** The same short-chunk path as the verify pass, with a row table (stream, position) per row:
+  the KV writes, attention and short convs of each row index its own stream's cache and states, everything else is
+  shared across the batch. Sampling, penalties and structured-output masks are per stream.
 - **Speculative decoding.** The drafter reads hidden states that the main model's passes copy out (three looped-layer
   inputs and the final norm). Its guesses go through the batched prefill path with kernels for chains of up to 8
   tokens: the MoE kernel reads the union of the experts the tokens chose once, so a 4-token pass reads about twice
@@ -469,7 +492,8 @@ Developer commands:
 
 ## Limitations
 
-- **Single stream:** one request at a time, no batching across requests.
+- **Parallel requests:** at most 8 streams, each with a fixed share of the context; not with CPU offload or a
+  drafter.
 - **Speculative decoding:** text only (images and structured output decode without the drafter), and not with CPU
   offload.
 - **One model:** Inkling 2 Mini only, in the UD GGUFs of Unsloth's root folder (not UD-Q8_K_XL, which uses BF16

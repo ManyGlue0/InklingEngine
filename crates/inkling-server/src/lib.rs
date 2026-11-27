@@ -4,7 +4,8 @@
 //! Images (with `--mmproj`) arrive as content parts (`image_url` / `input_image` / `image`) carrying `data:` URLs
 //! or bare base64; each becomes `<|content_image|>` + its embedding rows + `<|end_message|>` in the prompt.
 //!
-//! One GPU worker thread owns the engine and serves requests in arrival order. Prompts are rendered with the
+//! One GPU worker thread owns the engine and serves requests in arrival order; with parallel streams
+//! (`--parallel N`) it decodes up to N requests together, one token each per batched step. Prompts are rendered with the
 //! model's chat template (`inkling_core::chat`); generated tokens go through the streaming parser, which splits
 //! reasoning (`reasoning_content`), answer text (`content`) and tool calls (`tool_calls`). Consecutive requests that
 //! extend the previous conversation reuse its KV / conv state (engine prompt cache).
@@ -113,7 +114,8 @@ struct AppState {
     local_only: bool,
 }
 
-const MAX_PENDING: usize = 8;
+/// Requests admitted at once, decoding and queued (parallel streams decode up to 8 of them together).
+const MAX_PENDING: usize = 16;
 /// Smallest request body limit; the limit grows with the context (`body_limit`).
 const MAX_BODY_BYTES: usize = 64 << 20;
 
@@ -248,7 +250,7 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
         .map(|((end, model), text)| [end, model, text]);
     validate_force_ids(opts.reasoning_budget, force_ids)?;
     let (jobs_tx, jobs_rx) = std::sync::mpsc::sync_channel::<Job>(MAX_PENDING);
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(usize, Option<(usize, usize)>)>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(usize, usize, Option<(usize, usize)>)>>();
     let model_path = model.to_string();
     let wtok = tok.clone();
     let n_ctx_req = opts.n_ctx;
@@ -263,15 +265,19 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
         match eng {
             Ok(mut eng) => {
                 let geom = eng.vision().map(|v| (v.patch, v.merge));
-                let _ = ready_tx.send(Ok((eng.n_ctx, geom)));
-                worker(&mut eng, &wtok, jobs_rx, force_ids);
+                let _ = ready_tx.send(Ok((eng.n_ctx, eng.n_streams(), geom)));
+                if eng.n_streams() > 1 {
+                    worker_parallel(&mut eng, &wtok, jobs_rx, force_ids);
+                } else {
+                    worker(&mut eng, &wtok, jobs_rx, force_ids);
+                }
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
             }
         }
     })?;
-    let (n_ctx, vision) = ready_rx.recv().context("GPU worker died")??;
+    let (n_ctx, n_streams, vision) = ready_rx.recv().context("GPU worker died")??;
     let image_pad = tok.token_id("<|unused_200054|>").context("image placeholder token missing")?;
     let state = Arc::new(AppState {
         tok, jobs: jobs_tx, gpu_thread,
@@ -293,7 +299,8 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
         let vis = if vision.is_some() { ", vision on" } else { "" };
-        println!("InklingEngine serving {} on http://{addr} (context {n_ctx}{vis}) - OpenAI API at /v1", opts.model_id);
+        let ctx = if n_streams > 1 { format!("{n_streams} parallel streams of {n_ctx} tokens") } else { format!("context {n_ctx}") };
+        println!("InklingEngine serving {} on http://{addr} ({ctx}{vis}) - OpenAI API at /v1", opts.model_id);
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -331,26 +338,10 @@ impl EmbedCache {
 /// GPU worker: one job at a time.
 fn worker(eng: &mut Engine, tok: &Tokenizer, jobs: std::sync::mpsc::Receiver<Job>, force_ids: Option<[u32; 3]>) {
     let mut embeds = EmbedCache::default();
-    // structured output: built once, lazily (the first request with response_format pays for it)
     let mut guidance: Option<Result<structured::Guidance, String>> = None;
     while let Ok(job) = jobs.recv() {
         let tx = job.tx.clone();
-        let constraint = match &job.schema {
-            None => None,
-            Some(schema) => match guidance.get_or_insert_with(|| structured::Guidance::new(tok).map_err(|e| format!("{e:#}"))) {
-                Err(e) => {
-                    let _ = tx.send(Out::Error(format!("structured output unavailable: {e}")));
-                    continue;
-                }
-                Ok(g) => match g.start(schema.clone()) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        let _ = tx.send(Out::Invalid(format!("{e:#}")));
-                        continue;
-                    }
-                },
-            },
-        };
+        let Some(constraint) = job_constraint(&mut guidance, tok, &job) else { continue };
         if let Err(e) = run_job(eng, tok, &mut embeds, job, force_ids, constraint) {
             let _ = tx.send(Out::Error(format!("{e:#}")));
         }
@@ -431,161 +422,402 @@ fn validate_force_ids(budget: Option<usize>, force_ids: Option<[u32; 3]>) -> Res
 }
 
 /// Tokens the engine keeps in flight ahead of the one being read: when a reasoning budget is this close, decode
-/// steps without lookahead (see `run_job`).
+/// steps without lookahead (see `Run::on_token`).
 const LOOKAHEAD: usize = 3;
 
-fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job, force_ids: Option<[u32; 3]>,
-           constraint: Option<structured::Constrained>) -> Result<()> {
-    let _slot = job.slot;
-    let constraint = constraint.map(std::cell::RefCell::new);
-    let constraint_error: std::cell::RefCell<Option<anyhow::Error>> = std::cell::RefCell::new(None);
-    let mut embeds = Vec::with_capacity(job.images.len());
-    for (pos, img) in &job.images {
-        embeds.push((*pos, embed_cache.get_or_encode(eng, img)?));
+/// One request being generated: turns its tokens into events (chat parser, stop strings, structured output) and
+/// tracks the reasoning budget. The single-stream worker feeds it from the engine's token callback, the parallel
+/// worker after every batched step.
+struct Run {
+    _slot: JobSlot,
+    tx: mpsc::UnboundedSender<Out>,
+    parser: Decoder,
+    constraint: Option<structured::Constrained>,
+    constraint_error: Option<anyhow::Error>,
+    reasoning_budget: Option<usize>,
+    stop: Vec<String>,
+    /// longest stop string: content is held back until it cannot start one
+    hold: usize,
+    /// content not yet sent (may contain the start of a stop string)
+    held: String,
+    finish: Option<&'static str>,
+    tool_called: bool,
+    /// completion tokens so far (sampled and forced)
+    n: usize,
+    thinking_tokens: usize,
+    forced_once: bool,
+    length_limited: bool,
+    /// what the last token asked for
+    action: ReasoningAction,
+    /// decode without lookahead (close to the reasoning budget)
+    exact: bool,
+    started: bool,
+    prompt: Vec<u32>,
+    prompt_tokens: usize,
+    max_new: usize,
+    sampling: Sampling,
+    embeds: Vec<(usize, ImageEmbed)>,
+}
+
+impl Run {
+    fn new(eng: &Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job, constraint: Option<structured::Constrained>) -> Result<Self> {
+        let mut embeds = Vec::with_capacity(job.images.len());
+        for (pos, img) in &job.images {
+            embeds.push((*pos, embed_cache.get_or_encode(eng, img)?));
+        }
+        let hold = job.stop.iter().map(|s| s.len()).max().unwrap_or(0);
+        Ok(Self {
+            _slot: job.slot,
+            tx: job.tx,
+            parser: Decoder::new(tok, job.raw)?,
+            constraint,
+            constraint_error: None,
+            reasoning_budget: if job.raw { None } else { job.reasoning_budget },
+            stop: job.stop,
+            hold,
+            held: String::new(),
+            finish: None,
+            tool_called: false,
+            n: 0,
+            thinking_tokens: 0,
+            forced_once: false,
+            length_limited: false,
+            action: ReasoningAction::Continue,
+            exact: false,
+            started: false,
+            prompt_tokens: job.prompt.len(),
+            prompt: job.prompt,
+            max_new: job.max_new,
+            sampling: job.sampling,
+            embeds,
+        })
     }
-    let mut parser = Decoder::new(tok, job.raw)?;
-    let reasoning_budget = if job.raw { None } else { job.reasoning_budget };
-    let tx = job.tx;
-    let stop = job.stop;
-    let hold = stop.iter().map(|s| s.len()).max().unwrap_or(0);
-    let mut finish: Option<&'static str> = None;
-    let mut tool_called = false;
-    let mut n = 0usize;
-    let mut thinking_tokens = 0usize;
-    let mut forced_once = false;
-    let mut length_limited = false;
-    let mut held = String::new(); // content not yet sent (may contain the start of a stop string)
-    let mut on_events = |events: Vec<Event>| -> bool {
+
+    /// Send events to the client; false once the request is finished (end, stop string) or the client went away.
+    fn on_events(&mut self, events: Vec<Event>) -> bool {
         for ev in events {
             match ev {
                 Event::End => {
-                    finish = Some(if tool_called { "tool_calls" } else { "stop" });
+                    self.finish = Some(if self.tool_called { "tool_calls" } else { "stop" });
                 }
-                Event::Content(s) if hold > 0 => {
-                    held.push_str(&s);
-                    if let Some(pos) = stop.iter().filter_map(|st| held.find(st.as_str())).min() {
-                        let before = held[..pos].to_string();
-                        if !before.is_empty() && tx.send(Out::Ev(Event::Content(before))).is_err() {
+                Event::Content(s) if self.hold > 0 => {
+                    self.held.push_str(&s);
+                    if let Some(pos) = self.stop.iter().filter_map(|st| self.held.find(st.as_str())).min() {
+                        let before = self.held[..pos].to_string();
+                        if !before.is_empty() && self.tx.send(Out::Ev(Event::Content(before))).is_err() {
                             return false;
                         }
-                        held.clear();
-                        finish = Some("stop");
-                    } else if held.len() > hold {
+                        self.held.clear();
+                        self.finish = Some("stop");
+                    } else if self.held.len() > self.hold {
                         // keep the last hold - 1 bytes (on a char boundary) in case a stop string starts there
-                        let mut cut = held.len() - (hold - 1);
-                        while !held.is_char_boundary(cut) {
+                        let mut cut = self.held.len() - (self.hold - 1);
+                        while !self.held.is_char_boundary(cut) {
                             cut -= 1;
                         }
-                        let send: String = held.drain(..cut).collect();
-                        if tx.send(Out::Ev(Event::Content(send))).is_err() {
+                        let send: String = self.held.drain(..cut).collect();
+                        if self.tx.send(Out::Ev(Event::Content(send))).is_err() {
                             return false;
                         }
                     }
                 }
                 ev => {
                     if matches!(ev, Event::ToolCall { .. }) {
-                        tool_called = true;
+                        self.tool_called = true;
                     }
-                    if tx.send(Out::Ev(ev)).is_err() {
+                    if self.tx.send(Out::Ev(ev)).is_err() {
                         return false; // client went away
                     }
                 }
             }
-            if finish.is_some() {
+            if self.finish.is_some() {
                 return false;
             }
         }
         true
-    };
-    let prompt_tokens = job.prompt.len();
-    let mut prompt = job.prompt;
-    'generating: while n < job.max_new {
-        let remaining = job.max_new.saturating_sub(n).min(eng.n_ctx.saturating_sub(prompt.len()));
-        if remaining == 0 {
-            length_limited = true;
-            break;
+    }
+
+    /// A sampled token; false to stop the current segment (finished, constraint error, or reasoning budget reached).
+    fn on_token(&mut self, tok: &Tokenizer, t: u32) -> bool {
+        let was_thinking = self.parser.in_thinking();
+        let events = self.parser.push(tok, t);
+        // Count reasoning content, excluding the opening and closing tokens.
+        if was_thinking && self.parser.in_thinking() {
+            self.thinking_tokens += 1;
         }
-        let mut action = ReasoningAction::Continue;
-        let exact = std::cell::Cell::new(false);
-        let mut cb = |t: u32| {
-            let was_thinking = parser.in_thinking();
-            let events = parser.push(tok, t);
-            // Count reasoning content, excluding the opening and closing tokens.
-            if was_thinking && parser.in_thinking() {
-                thinking_tokens += 1;
-            }
-            if let Some(c) = &constraint {
-                if let Err(e) = c.borrow_mut().push(t) {
-                    *constraint_error.borrow_mut() = Some(e);
-                    return false;
-                }
-            }
-            if !on_events(events) {
+        if let Some(c) = &mut self.constraint {
+            if let Err(e) = c.push(t) {
+                self.constraint_error = Some(e);
                 return false;
             }
-            action = reasoning_action(parser.in_thinking(), thinking_tokens, reasoning_budget, forced_once);
-            // Close to the budget, decode without lookahead: the stop then leaves the device state exactly after the
-            // last token read, so the forced close below extends the cached prompt instead of prefilling it again.
-            exact.set(!forced_once && parser.in_thinking() && reasoning_budget.is_some_and(|b| thinking_tokens + LOOKAHEAD >= b));
-            action == ReasoningAction::Continue
-        };
-        let mut mask = || match constraint.as_ref().map(|c| c.borrow_mut().mask()) {
+        }
+        if !self.on_events(events) {
+            return false;
+        }
+        self.action = reasoning_action(self.parser.in_thinking(), self.thinking_tokens, self.reasoning_budget, self.forced_once);
+        // Close to the budget, decode without lookahead: the stop then leaves the device state exactly after the
+        // last token read, so the forced close extends the cached prompt instead of prefilling it again.
+        self.exact = !self.forced_once && self.parser.in_thinking() && self.reasoning_budget.is_some_and(|b| self.thinking_tokens + LOOKAHEAD >= b);
+        self.action == ReasoningAction::Continue
+    }
+
+    /// Allowed tokens for the next step (structured output), or None.
+    fn mask(&mut self) -> Option<Vec<u32>> {
+        match self.constraint.as_mut().map(|c| c.mask()) {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
-                *constraint_error.borrow_mut() = Some(e);
+                self.constraint_error = Some(e);
                 None
             }
             None => None,
-        };
-        let exact_now = || exact.get();
-        let steer = inkling_engine::Steer {
-            mask: if constraint.is_some() { Some(&mut mask) } else { None },
-            exact: Some(&exact_now),
-        };
-        let (out, cached) = eng.generate_mm_steered(&prompt, &embeds, remaining, &job.sampling, &mut cb, steer)?;
-        if let Some(e) = constraint_error.borrow_mut().take() {
-            return Err(e);
         }
-        if n == 0 {
-            let _ = tx.send(Out::Started { prompt_tokens, cached });
+    }
+
+    /// Tokens the next segment may generate.
+    fn remaining(&self, n_ctx: usize) -> usize {
+        self.max_new.saturating_sub(self.n).min(n_ctx.saturating_sub(self.prompt.len()))
+    }
+
+    fn report_start(&mut self, cached: usize) {
+        if !self.started {
+            self.started = true;
+            let _ = self.tx.send(Out::Started { prompt_tokens: self.prompt_tokens, cached });
         }
-        n += out.len();
-        match action {
+    }
+
+    /// The segment that just ended generated `out` (of `remaining` allowed). Returns true when the reasoning budget
+    /// closed the reasoning: the prompt now ends with the forced header and generation continues from it.
+    fn end_segment(&mut self, tok: &Tokenizer, out: Vec<u32>, remaining: usize, n_ctx: usize, force_ids: Option<[u32; 3]>) -> Result<bool> {
+        self.n += out.len();
+        match self.action {
             ReasoningAction::Continue => {
-                length_limited = out.len() == remaining;
-                break;
+                self.length_limited = out.len() == remaining;
+                return Ok(false);
             }
             ReasoningAction::Length => {
-                length_limited = true;
-                break;
+                self.length_limited = true;
+                return Ok(false);
             }
-            ReasoningAction::ForceClose => forced_once = true,
+            ReasoningAction::ForceClose => self.forced_once = true,
         }
-        prompt.extend(out);
+        self.prompt.extend(out);
         // Forced headers consume the same output/context allowance as sampled tokens.
         let force_ids = force_ids.context("reasoning budget closure tokens missing")?;
-        let count = forced_token_count(prompt.len(), eng.n_ctx, job.max_new, n);
+        let count = forced_token_count(self.prompt.len(), n_ctx, self.max_new, self.n);
         for id in force_ids.into_iter().take(count) {
-            prompt.push(id);
-            n += 1;
-            if let Some(c) = &constraint {
-                c.borrow_mut().push(id)?;
+            self.prompt.push(id);
+            self.n += 1;
+            if let Some(c) = &mut self.constraint {
+                c.push(id)?;
             }
-            if !on_events(parser.push(tok, id)) {
-                break 'generating;
+            let events = self.parser.push(tok, id);
+            if !self.on_events(events) {
+                return Ok(false);
             }
         }
         if count < force_ids.len() {
-            length_limited = true;
+            self.length_limited = true;
+            return Ok(false);
+        }
+        Ok(self.n < self.max_new)
+    }
+
+    /// Flush held content and report the finish reason.
+    fn done(mut self) {
+        if self.finish.is_none() && !self.held.is_empty() {
+            let _ = self.tx.send(Out::Ev(Event::Content(std::mem::take(&mut self.held))));
+        }
+        let finish = self.finish.unwrap_or(if self.length_limited || self.n >= self.max_new { "length" } else { "stop" });
+        let _ = self.tx.send(Out::Done { finish, completion_tokens: self.n });
+    }
+}
+
+fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job, force_ids: Option<[u32; 3]>,
+           constraint: Option<structured::Constrained>) -> Result<()> {
+    let mut run = Run::new(eng, tok, embed_cache, job, constraint)?;
+    while run.n < run.max_new {
+        let remaining = run.remaining(eng.n_ctx);
+        if remaining == 0 {
+            run.length_limited = true;
+            break;
+        }
+        run.action = ReasoningAction::Continue;
+        run.exact = false;
+        let prompt = run.prompt.clone();
+        let embeds = std::mem::take(&mut run.embeds);
+        let sampling = run.sampling;
+        let constrained = run.constraint.is_some();
+        let r = {
+            // the engine calls these one at a time, never nested
+            let cell = std::cell::RefCell::new(&mut run);
+            let mut cb = |t: u32| cell.borrow_mut().on_token(tok, t);
+            let mut mask = || cell.borrow_mut().mask();
+            let exact_now = || cell.borrow().exact;
+            let steer = inkling_engine::Steer { mask: if constrained { Some(&mut mask) } else { None }, exact: Some(&exact_now) };
+            eng.generate_mm_steered(&prompt, &embeds, remaining, &sampling, &mut cb, steer)
+        };
+        run.embeds = embeds;
+        let (out, cached) = r?;
+        if let Some(e) = run.constraint_error.take() {
+            return Err(e);
+        }
+        run.report_start(cached);
+        if !run.end_segment(tok, out, remaining, eng.n_ctx, force_ids)? {
             break;
         }
     }
-    if finish.is_none() && !held.is_empty() {
-        let _ = tx.send(Out::Ev(Event::Content(std::mem::take(&mut held))));
-    }
-    let finish = finish.unwrap_or(if length_limited || n >= job.max_new { "length" } else { "stop" });
-    let _ = tx.send(Out::Done { finish, completion_tokens: n });
+    run.done();
     Ok(())
+}
+
+/// A request decoding on one of the parallel streams.
+struct ParRun {
+    stream: usize,
+    run: Run,
+    /// tokens the current segment may still generate, and what it generated so far
+    remaining: usize,
+    out: Vec<u32>,
+}
+
+impl ParRun {
+    /// Start a segment: prefill the prompt on the stream (reusing its cache). False when no room is left.
+    fn begin(&mut self, eng: &mut Engine) -> Result<bool> {
+        self.remaining = self.run.remaining(eng.n_ctx);
+        if self.remaining == 0 {
+            self.run.length_limited = true;
+            return Ok(false);
+        }
+        self.run.action = ReasoningAction::Continue;
+        self.out.clear();
+        let cached = eng.par_begin(self.stream, &self.run.prompt, &self.run.embeds, &self.run.sampling)?;
+        self.run.report_start(cached);
+        Ok(true)
+    }
+
+    /// Handle a sampled token; false when the request is finished.
+    fn advance(&mut self, eng: &mut Engine, tok: &Tokenizer, t: u32, force_ids: Option<[u32; 3]>) -> Result<bool> {
+        self.out.push(t);
+        let more = self.run.on_token(tok, t);
+        if let Some(e) = self.run.constraint_error.take() {
+            return Err(e);
+        }
+        if more && self.out.len() < self.remaining {
+            return Ok(true);
+        }
+        let out = std::mem::take(&mut self.out);
+        if self.run.end_segment(tok, out, self.remaining, eng.n_ctx, force_ids)? {
+            return self.begin(eng);
+        }
+        Ok(false)
+    }
+}
+
+/// The structured-output constraint of a job. None when the job failed (the error was sent).
+fn job_constraint(guidance: &mut Option<Result<structured::Guidance, String>>, tok: &Tokenizer, job: &Job) -> Option<Option<structured::Constrained>> {
+    let Some(schema) = &job.schema else { return Some(None) };
+    // built once, lazily (the first request with response_format pays for it)
+    match guidance.get_or_insert_with(|| structured::Guidance::new(tok).map_err(|e| format!("{e:#}"))) {
+        Err(e) => {
+            let _ = job.tx.send(Out::Error(format!("structured output unavailable: {e}")));
+            None
+        }
+        Ok(g) => match g.start(schema.clone()) {
+            Ok(c) => Some(Some(c)),
+            Err(e) => {
+                let _ = job.tx.send(Out::Invalid(format!("{e:#}")));
+                None
+            }
+        },
+    }
+}
+
+/// GPU worker with parallel streams: up to n_streams requests decode together, one token each per batched step.
+/// A new request goes to the free stream whose prompt cache it extends (else the least recently used one) and is
+/// prefilled there before the next step.
+fn worker_parallel(eng: &mut Engine, tok: &Tokenizer, jobs: std::sync::mpsc::Receiver<Job>, force_ids: Option<[u32; 3]>) {
+    let n = eng.n_streams();
+    let mut embeds = EmbedCache::default();
+    let mut guidance: Option<Result<structured::Guidance, String>> = None;
+    let mut active: Vec<ParRun> = Vec::with_capacity(n);
+    let mut last_used = vec![0u64; n];
+    let mut clock = 0u64;
+    loop {
+        while active.len() < n {
+            let job = if active.is_empty() {
+                match jobs.recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
+                }
+            } else {
+                match jobs.try_recv() {
+                    Ok(j) => j,
+                    Err(_) => break,
+                }
+            };
+            let tx = job.tx.clone();
+            let Some(constraint) = job_constraint(&mut guidance, tok, &job) else { continue };
+            let free = (0..n).filter(|s| !active.iter().any(|a| a.stream == *s));
+            let stream = free.max_by_key(|&s| (eng.par_reusable(s, &job.prompt), std::cmp::Reverse(last_used[s]))).expect("a free stream");
+            clock += 1;
+            last_used[stream] = clock;
+            let started = Run::new(eng, tok, &mut embeds, job, constraint).and_then(|run| {
+                let mut p = ParRun { stream, run, remaining: 0, out: Vec::new() };
+                Ok(if p.begin(eng)? { Some(p) } else { p.run.done(); None })
+            });
+            match started {
+                Ok(Some(p)) => active.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = tx.send(Out::Error(format!("{e:#}")));
+                }
+            }
+        }
+        if active.is_empty() {
+            continue;
+        }
+        // structured output: each constrained stream's mask for this step
+        let mut failed = Vec::new();
+        for (i, p) in active.iter_mut().enumerate() {
+            if p.run.constraint.is_some() {
+                let m = p.run.mask();
+                if p.run.constraint_error.is_some() {
+                    failed.push(i);
+                } else if let Err(e) = eng.par_mask(p.stream, m) {
+                    p.run.constraint_error = Some(e);
+                    failed.push(i);
+                }
+            }
+        }
+        for i in failed.into_iter().rev() {
+            let mut p = active.remove(i);
+            let e = p.run.constraint_error.take().expect("constraint error");
+            let _ = p.run.tx.send(Out::Error(format!("{e:#}")));
+        }
+        if active.is_empty() {
+            continue;
+        }
+        let rows: Vec<usize> = active.iter().map(|p| p.stream).collect();
+        let toks = match eng.par_step(&rows) {
+            Ok(t) => t,
+            Err(e) => {
+                for p in active.drain(..) {
+                    let _ = p.run.tx.send(Out::Error(format!("{e:#}")));
+                }
+                continue;
+            }
+        };
+        let mut keep = Vec::with_capacity(n);
+        for (mut p, t) in active.drain(..).zip(toks) {
+            match p.advance(eng, tok, t, force_ids) {
+                Ok(true) => keep.push(p),
+                Ok(false) => p.run.done(),
+                Err(e) => {
+                    let _ = p.run.tx.send(Out::Error(format!("{e:#}")));
+                }
+            }
+        }
+        active = keep;
+    }
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {

@@ -92,7 +92,8 @@ fn main() -> Result<()> {
              usage:\n\
              \x20 inkling serve <model.gguf> [--mmproj FILE] [--ctx N] [--host H] [--port P] [--api-key KEY] [--model-id NAME]\n\
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
-             \x20               [--reasoning-budget N] [--cors] [--insecure-no-auth]\n\
+             \x20               [--reasoning-budget N] [--cors] [--insecure-no-auth] [--parallel N]\n\
+             \x20 --parallel N serves up to N requests at once (1 to 8; each gets --ctx / N of the context)\n\
              \x20 serve on an address other machines can reach (--host 0.0.0.0) needs --api-key KEY (or\n\
              \x20 INKLING_API_KEY), or --insecure-no-auth to serve without one\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\

@@ -155,6 +155,17 @@ impl Engine {
         }
     }
 
+    /// Prompt tokens stream `s`'s prompt cache would reuse for `prompt` (as `par_begin` would find them).
+    pub fn par_reusable(&self, s: usize, prompt: &[u32]) -> usize {
+        let c = if s == self.stream { &self.cache } else { &self.streams[s].cache };
+        let head = &prompt[..prompt.len().saturating_sub(1)];
+        if !c.tokens.is_empty() && head.starts_with(&c.tokens) {
+            c.tokens.len()
+        } else {
+            c.snap_tokens.as_ref().filter(|st| head.starts_with(st)).map_or(0, |st| st.len())
+        }
+    }
+
     /// Positions stream `s` has left (its next input's position counts as used).
     pub fn par_room(&self, s: usize) -> usize {
         self.par.as_ref().and_then(|p| p.seqs.get(s).copied().flatten()).map_or(0, |q| self.n_ctx - q.pos)
