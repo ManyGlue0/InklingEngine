@@ -340,7 +340,11 @@ Server flags:
 | `--offload auto\|off\|all\|N` | `auto` (MoE layers on the CPU only when VRAM is short) |
 | `--mmproj FILE` | none (enables image input) |
 | `--draft PATH`, `--draft-n N` | none, `3` (speculative decoding, see [Speculative decoding](#speculative-decoding); also on `generate` and `bench`) |
-| `--api-key KEY` (or `INKLING_API_KEY`) | none |
+| `--parallel N` | `1` (requests decoded at once; `--ctx` is split between them) |
+| `--api-key KEY` (or `INKLING_API_KEY`) | none on localhost; required when `--host` is reachable from other machines (see Security) |
+| `--insecure-no-auth` | off (serve a reachable `--host` without a key) |
+| `--cors` | off (let browser pages on other origins call the API) |
+| `--reasoning-budget N` | unlimited (default for `thinking_token_budget`) |
 | `--model-id NAME` | the file name |
 | `--temp`, `--top-p`, `--top-k`, `--min-p` | `0.8`, `0.95`, `40`, `0.05` |
 | `--repeat-penalty`, `--repeat-last-n` | `1.0`, `64` |
@@ -354,6 +358,9 @@ Server flags:
 - **Request fields:**
   - `tools` and `tool_choice: "none"`;
   - `reasoning_effort` (`none`/`low`/`medium`/`high`/`max` or a number in 0–0.99; default 0.9);
+  - `thinking_token_budget`: the most reasoning tokens before the server closes the reasoning and the model answers
+    (default `--reasoning-budget`, unlimited). It is closed at most once per request; reasoning that resumes after
+    that ends the request with `finish_reason: "length"`;
   - `response_format`: `json_schema` (the answer follows `json_schema.schema`) or `json_object` (any JSON object),
     enforced by token masking with [llguidance](https://github.com/guidance-ai/llguidance). The reasoning stays
     free; the constraint applies to the answer, which then ends the turn. An unusable schema is a 400.
@@ -362,13 +369,15 @@ Server flags:
   - penalties: `presence_penalty`, `frequency_penalty`, `repeat_penalty` (or `repetition_penalty`), `repeat_last_n`.
 - **Images:** content parts of type `image_url`, `input_image` or `image`, carrying a `data:` URL or bare base64
   (PNG, JPEG, WebP, GIF, BMP). Remote URLs are not fetched.
+  - Requires `--mmproj`. At most 8 images per request, each at most 4096×4096 pixels. Decoding is limited to 128 MiB
+    per image and 512 MiB for all requests together (7 bytes per pixel are reserved for decoding and RGB conversion).
   - An image becomes up to 4,096 tokens: one per 40×40 pixels.
   - Larger images are downscaled with the aspect ratio kept.
 - `POST /v1/completions`: raw text completion; `prompt` is a string or an array of token ids.
 - `GET /v1/models`, `GET /health`.
 - **Prompt caching:** a request that extends the previous conversation reuses its state, including images, and the
   reused count is reported in `usage.prompt_tokens_details.cached_tokens`.
-- **CORS** is open, so browser UIs work. Requests are served one at a time, in order.
+- **Requests** are served one at a time, in order. Up to 8 wait in the queue; more get HTTP 503.
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -376,8 +385,29 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   "reasoning_effort": "low", "stream": true }'
 ```
 
+With an API key, add `-H "Authorization: Bearer KEY"`.
+
 Try it from a terminal with the bundled client: `python tools/chat.py "Hello!"` (add `--image photo.jpg` for vision).
+The bundled scripts do not send an API key: use them with a local server started without one.
 Smoke tests: `python tools/server_smoke.py` (tool-call round trip) and `python tools/vision_smoke.py` (image input).
+
+### Security
+
+- **On localhost** (the default `--host 127.0.0.1`), no API key is needed. Without a key, the server only answers
+  requests addressed to `localhost`, `127.0.0.1` or `[::1]`, so a web page cannot reach it through a DNS name that
+  points to your machine (DNS rebinding).
+- **On a reachable address** (`--host 0.0.0.0` or a LAN address), `serve` refuses to start without `--api-key KEY`
+  (or `INKLING_API_KEY`). Pass `--insecure-no-auth` to serve without one anyway.
+- **With a key,** every route except `/health` needs `Authorization: Bearer KEY`. The key is compared in constant time.
+- **CORS** is off: browser pages on other origins cannot call the API. Turn it on with `--cors` for a browser-based
+  chat UI. Any page you visit can then use the server, unless it has an API key.
+- **Limits:**
+  - Request bodies: a full context of text (16 bytes per token of `--ctx`), at least 64 MiB. Larger bodies get
+    HTTP 413, bad `Content-Length` headers HTTP 400, other content types than JSON HTTP 415.
+  - Up to 16 bodies are read at once (HTTP 503 after 250 ms when busy).
+  - A body must arrive at 64 KiB/s or faster after a 2-second grace, and within 15 seconds; otherwise HTTP 408.
+  - `stop` takes at most 16 strings of at most 256 bytes.
+- **Exposing the server** beyond your machine: put a reverse proxy in front that limits connections per client.
 
 ### Environment
 

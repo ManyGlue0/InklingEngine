@@ -257,6 +257,11 @@ struct Ids {
 }
 
 impl Parser {
+    /// Whether the current segment contains reasoning.
+    pub fn in_thinking(&self) -> bool {
+        self.seg == Seg::Thinking
+    }
+
     pub fn new(tok: &crate::Tokenizer) -> Result<Self> {
         let id = |s: &str| tok.token_id(s).ok_or_else(|| anyhow!("special token {s} missing"));
         Ok(Self {
@@ -386,5 +391,13 @@ mod tests {
             render(&m, None, None).unwrap(),
             "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
         );
+    }
+
+    #[test]
+    fn renders_answer_after_reasoning() {
+        let m = vec![json!({"role": "assistant", "reasoning_content": "Think", "content": "Answer"})];
+        assert!(render(&m, None, None).unwrap().contains(
+            "<|content_thinking|>Think<|end_message|><|message_model|><|content_text|>Answer<|end_message|>"
+        ));
     }
 }

@@ -30,8 +30,8 @@ pub struct Tokenizer {
     byte_token: [u32; 256],
     /// mapped char -> byte (decoding)
     char_byte: HashMap<char, u8>,
-    /// special tokens sorted by length, longest first
-    specials: Vec<(String, u32)>,
+    /// Nonempty special tokens grouped by first character, longest first within each group.
+    specials: HashMap<char, Vec<(String, u32)>>,
     pre: Regex,
     pub eos: u32,
 }
@@ -50,6 +50,18 @@ fn byte_to_char_table() -> [char; 256] {
         };
     }
     t
+}
+
+fn group_specials(specials: impl IntoIterator<Item = (String, u32)>) -> HashMap<char, Vec<(String, u32)>> {
+    let mut groups: HashMap<char, Vec<(String, u32)>> = HashMap::new();
+    for (s, id) in specials {
+        let Some(first) = s.chars().next() else { continue };
+        groups.entry(first).or_default().push((s, id));
+    }
+    for group in groups.values_mut() {
+        group.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    }
+    groups
 }
 
 impl Tokenizer {
@@ -96,13 +108,11 @@ impl Tokenizer {
 
         let is_special: Vec<bool> =
             types.iter().map(|&t| t == TOKEN_TYPE_CONTROL || t == TOKEN_TYPE_USER_DEFINED).collect();
-        let mut specials: Vec<(String, u32)> = tokens
+        let specials = group_specials(tokens
             .iter()
             .enumerate()
-            .filter(|(i, t)| is_special[*i] && !t.is_empty())
-            .map(|(i, t)| (t.clone(), i as u32))
-            .collect();
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            .filter(|(i, _)| is_special[*i])
+            .map(|(i, t)| (t.clone(), i as u32)));
 
         Ok(Self {
             eos: g.u64("tokenizer.ggml.eos_token_id")? as u32,
@@ -136,11 +146,33 @@ impl Tokenizer {
             self.encode_plain(text, &mut out)?;
             return Ok(out);
         }
+        let mut plain_start = 0;
+        let mut scan = 0;
+        while scan < text.len() {
+            let c = text[scan..].chars().next().unwrap();
+            let special = self.specials.get(&c)
+                .and_then(|group| group.iter().find(|(s, _)| text[scan..].starts_with(s.as_str())));
+            if let Some((s, id)) = special {
+                self.encode_plain(&text[plain_start..scan], &mut out)?;
+                out.push(*id);
+                scan += s.len();
+                plain_start = scan;
+            } else {
+                scan += c.len_utf8();
+            }
+        }
+        self.encode_plain(&text[plain_start..], &mut out)?;
+        Ok(out)
+    }
+
+    /// Original scan retained only as a test oracle.
+    #[cfg(test)]
+    fn encode_oracle(&self, text: &str) -> Result<Vec<u32>> {
+        let mut out = Vec::with_capacity(text.len() / 3 + 4);
         let mut rest = text;
         while !rest.is_empty() {
-            // find the earliest special-token occurrence (longest match at that position)
             let mut best: Option<(usize, usize, u32)> = None;
-            for (s, id) in &self.specials {
+            for (s, id) in self.specials.values().flatten() {
                 if let Some(p) = rest.find(s.as_str()) {
                     if best.is_none_or(|(bp, bl, _)| p < bp || (p == bp && s.len() > bl)) {
                         best = Some((p, s.len(), *id));
@@ -215,5 +247,119 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32], render_special: bool) -> String {
         let bytes: Vec<u8> = ids.iter().flat_map(|&id| self.token_bytes(id, render_special)).collect();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokenizer_with_specials(special_tokens: &[&str]) -> Tokenizer {
+        let table = byte_to_char_table();
+        let mut tokens: Vec<String> = table.iter().map(char::to_string).collect();
+        let mut is_special = vec![false; tokens.len()];
+        let mut specials = Vec::new();
+        for &s in special_tokens {
+            let id = tokens.len() as u32;
+            tokens.push(s.to_owned());
+            is_special.push(true);
+            specials.push((s.to_owned(), id));
+        }
+        let specials = group_specials(specials);
+        let mut merges = HashMap::new();
+        for (rank, (a, b)) in [(b'a', b'b'), (b'<', b'|')].into_iter().enumerate() {
+            let id = tokens.len() as u32;
+            tokens.push(format!("{}{}", table[a as usize], table[b as usize]));
+            is_special.push(false);
+            merges.insert((a as u32, b as u32), (rank as u32, id));
+        }
+        let token_to_id = tokens.iter().enumerate().map(|(id, s)| (s.clone(), id as u32)).collect();
+        Tokenizer {
+            tokens,
+            is_special,
+            token_to_id,
+            merges,
+            byte_token: std::array::from_fn(|b| b as u32),
+            char_byte: table.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect(),
+            specials,
+            pre: Regex::new(PRE_TOKENIZER).unwrap(),
+            eos: 258,
+        }
+    }
+
+    fn tokenizer() -> Tokenizer {
+        tokenizer_with_specials(&["<|message_model|>", "<|message_user|>", "<|end_message|>", "<|a|><|b|>", "<|a|>"])
+    }
+
+    #[test]
+    fn special_scan_handles_non_prefix_specials() {
+        let tok = tokenizer_with_specials(&["[special]", "<|a|>"]);
+        let mut expected = tok.encode("ab", false).unwrap();
+        expected.extend([tok.token_id("[special]").unwrap(), tok.token_id("<|a|>").unwrap(), tok.token_id("[special]").unwrap()]);
+        assert_eq!(tok.encode("ab[special]<|a|>[special]", true).unwrap(), expected);
+    }
+
+    #[test]
+    fn special_scan_sorts_unordered_prefixes_longest_first() {
+        let tok = tokenizer_with_specials(&["<|a|>", "<|a|><|b|>"]);
+        assert_eq!(tok.encode("<|a|><|b|>", true).unwrap(), vec![tok.token_id("<|a|><|b|>").unwrap()]);
+    }
+
+    #[test]
+    fn general_special_scan_matches_oracle_with_empty_unicode_and_overlapping_specials() {
+        let tok = tokenizer_with_specials(&["", "[special]", "[special]tail", "α", "αβ", "🙂!", "<|a|>"]);
+        assert!(tok.specials.values().flatten().all(|(s, _)| !s.is_empty()));
+        assert_eq!(tok.specials[&'['][0].0, "[special]tail");
+        assert_eq!(tok.encode("[special]tailαβ🙂!", true).unwrap(), vec![
+            tok.token_id("[special]tail").unwrap(), tok.token_id("αβ").unwrap(), tok.token_id("🙂!").unwrap(),
+        ]);
+        let fragments = ["", "ab text ", "éβ", "[special]", "[special]tail", "[spec", "α", "αβ", "🙂!", "🙂", "<|a|>"];
+        for a in fragments {
+            for b in fragments {
+                for c in fragments {
+                    let text = format!("{a}{b}{c}");
+                    assert_eq!(tok.encode(&text, true).unwrap(), tok.encode_oracle(&text).unwrap(), "{text:?}");
+                }
+            }
+        }
+        for text in [
+            "[special]tailαβ🙂!<|a|>".repeat(2048),
+            "[spec🙂".repeat(2048),
+            format!("{}[special]{}", "α".repeat(2048), "[spec".repeat(2048)),
+        ] {
+            assert_eq!(tok.encode(&text, true).unwrap(), tok.encode_oracle(&text).unwrap());
+        }
+        let empty = tokenizer_with_specials(&[""]);
+        for text in ["", "ab text αβ🙂", "[special]"] {
+            assert_eq!(empty.encode(text, true).unwrap(), empty.encode(text, false).unwrap());
+            assert_eq!(empty.encode(text, true).unwrap(), empty.encode_oracle(text).unwrap());
+        }
+    }
+
+    #[test]
+    fn special_scan_matches_original_on_mixed_repeated_and_partial_tokens() {
+        let tok = tokenizer();
+        let fragments = [
+            "", "ab ordinary text ", "áβ🙂", "<|message_user|>", "<|message_model|>",
+            "<|end_message|>", "<|a|><|b|>", "<|a|>", "<|unknown|>", "<|message_", "<|", "|>",
+        ];
+        for a in fragments {
+            for b in fragments {
+                for c in fragments {
+                    let text = format!("{a}{b}{c}");
+                    assert_eq!(tok.encode(&text, true).unwrap(), tok.encode_oracle(&text).unwrap(), "{text:?}");
+                }
+            }
+        }
+        for text in [
+            "<|a|>".repeat(512),
+            "<|".repeat(512),
+            format!("{}<|message_user|>{}<|end_message|>", "plain ab ".repeat(512), "<|".repeat(512)),
+            "ab áβ🙂 ".repeat(2048),
+        ] {
+            assert_eq!(tok.encode(&text, true).unwrap(), tok.encode_oracle(&text).unwrap());
+        }
+        assert_eq!(tok.encode("<|a|><|b|>", true).unwrap(), vec![tok.token_id("<|a|><|b|>").unwrap()]);
+        assert_ne!(tok.encode("<|message_user|>", false).unwrap(), tok.encode("<|message_user|>", true).unwrap());
     }
 }

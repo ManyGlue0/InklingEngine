@@ -192,6 +192,23 @@ impl Sampling {
 /// Penalty ring size (mirrors smp::RING in sample.cu).
 pub(crate) const PEN_RING: usize = 1024;
 
+/// Decode steps queued ahead of the token being read (the sampled tokens go to the device's next step directly).
+const LOOKAHEAD: usize = 3;
+
+/// Step-by-step control of `Engine::generate_mm_steered`.
+#[derive(Default)]
+pub struct Steer<'a> {
+    /// Called before every step: the allowed tokens (one bit per token over the unpadded vocabulary, 32 per word),
+    /// or None for no constraint on that step. Steps then run one at a time, so `on_token` has seen every token
+    /// before the next mask is asked for.
+    pub mask: Option<&'a mut dyn FnMut() -> Option<Vec<u32>>>,
+    /// Called before every step: true to run it only after the previous token was read. A stop decided on that
+    /// token then leaves the device state exactly after it, so a following call whose prompt extends the tokens
+    /// read reuses the cache (e.g. to close a reasoning segment); with lookahead the device has already run up to
+    /// two steps further, and the next call prefills the whole prompt again.
+    pub exact: Option<&'a dyn Fn() -> bool>,
+}
+
 /// What the device state currently holds, for prompt caching across `generate` calls.
 #[derive(Default)]
 struct PromptCache {
@@ -1149,6 +1166,13 @@ impl Engine {
     /// prompt positions pos..pos + n (those prompt ids must be >= EMBED_TOKEN_BASE and should identify the image,
     /// e.g. EMBED_TOKEN_BASE | hash bits, so the prompt cache does not confuse different images).
     pub fn generate_mm(&mut self, prompt: &[u32], embeds: &[(usize, ImageEmbed)], max_new: usize, sampling: &Sampling, on_token: &mut dyn FnMut(u32) -> bool) -> Result<(Vec<u32>, usize)> {
+        self.generate_mm_steered(prompt, embeds, max_new, sampling, on_token, Steer::default())
+    }
+
+    /// As `generate_mm`, steered step by step (see `Steer`): a token constraint, and/or no lookahead when the caller
+    /// may stop on the next token and continue from exactly there.
+    pub fn generate_mm_steered(&mut self, prompt: &[u32], embeds: &[(usize, ImageEmbed)], max_new: usize, sampling: &Sampling,
+                               on_token: &mut dyn FnMut(u32) -> bool, steer: Steer) -> Result<(Vec<u32>, usize)> {
         ensure!(!prompt.is_empty(), "empty prompt");
         ensure!(*prompt.last().unwrap() < EMBED_TOKEN_BASE, "the prompt must not end inside an image");
         for (pos, e) in embeds {
@@ -1156,32 +1180,22 @@ impl Engine {
             ensure!(pos + e.n <= prompt.len() && prompt[*pos..pos + e.n].iter().all(|&t| t >= EMBED_TOKEN_BASE), "image embedding positions do not match the prompt");
         }
         ensure!(prompt.iter().filter(|&&t| t >= EMBED_TOKEN_BASE).count() == embeds.iter().map(|(_, e)| e.n).sum::<usize>(), "prompt has image positions without embeddings");
-        // speculative decoding when a drafter is attached (text only)
-        if self.draft.is_some() && self.use_spec && embeds.is_empty() && prompt.len() >= 2 && std::env::var_os("INKLING_NO_SPEC").is_none() {
+        // speculative decoding when a drafter is attached (text only, unconstrained; an exact stop only costs speed:
+        // the device may have committed drafts past the stop, and the next call then resumes from the snapshot)
+        if self.draft.is_some() && self.use_spec && embeds.is_empty() && steer.mask.is_none() && prompt.len() >= 2
+            && std::env::var_os("INKLING_NO_SPEC").is_none()
+        {
             return self.generate_spec(prompt, max_new, self.draft_n, sampling, on_token);
         }
         self.embeds = embeds.to_vec();
-        let r = self.generate_inner(prompt, max_new, sampling, on_token, None);
-        self.embeds.clear();
-        r
-    }
-
-    /// As `generate_mm`, with a token constraint: before every step `mask` gives the allowed tokens (one bit per
-    /// token over the unpadded vocabulary, 32 per word) or None for no constraint on that step. Steps run one at a
-    /// time (no lookahead), so `on_token` sees each token before the next mask is asked for.
-    pub fn generate_mm_constrained(&mut self, prompt: &[u32], embeds: &[(usize, ImageEmbed)], max_new: usize, sampling: &Sampling,
-                                   on_token: &mut dyn FnMut(u32) -> bool, mask: &mut dyn FnMut() -> Option<Vec<u32>>) -> Result<(Vec<u32>, usize)> {
-        ensure!(!prompt.is_empty(), "empty prompt");
-        ensure!(*prompt.last().unwrap() < EMBED_TOKEN_BASE, "the prompt must not end inside an image");
-        ensure!(prompt.iter().filter(|&&t| t >= EMBED_TOKEN_BASE).count() == embeds.iter().map(|(_, e)| e.n).sum::<usize>(), "prompt has image positions without embeddings");
-        self.embeds = embeds.to_vec();
-        let r = self.generate_inner(prompt, max_new, sampling, on_token, Some(mask));
+        let r = self.generate_inner(prompt, max_new, sampling, on_token, steer);
         self.embeds.clear();
         r
     }
 
     fn generate_inner(&mut self, prompt: &[u32], max_new: usize, sampling: &Sampling, on_token: &mut dyn FnMut(u32) -> bool,
-                      mut mask: Option<&mut dyn FnMut() -> Option<Vec<u32>>>) -> Result<(Vec<u32>, usize)> {
+                      steer: Steer) -> Result<(Vec<u32>, usize)> {
+        let Steer { mut mask, exact } = steer;
         ensure!(prompt.len() + max_new <= self.n_ctx, "prompt + generation exceed the context ({})", self.n_ctx);
         ensure!(self.use_graph, "generate needs CUDA graphs");
         ensure!(max_new > 0, "max_new must be positive");
@@ -1209,15 +1223,16 @@ impl Engine {
         };
         // the last prompt token runs as the first decode step
         self.gpu.write(self.act.step.ptr, inkling_cuda::as_bytes(&[p[n - 1], (n - 1) as i32, 0, 0]))?;
-        // a constraint needs each token before the next mask: one step at a time
-        let ahead: usize = if mask.is_some() { 1 } else { 3 };
+        // steps queued ahead of the token being read; a constraint needs each token before the next mask, and an
+        // exact stop needs the device not to have run past the token it stops on: then one step at a time
+        let ahead = |mask_on: bool| if mask_on || exact.is_some_and(|f| f()) { 1 } else { LOOKAHEAD };
         let words = self.cfg.n_vocab.div_ceil(32);
         self.gpu.write(self.act.mask_on.ptr, inkling_cuda::as_bytes(&[0i32]))?;
         let mut events = Vec::with_capacity(max_new);
         let mut out = Vec::with_capacity(max_new);
         let mut launched = 0;
         while out.len() < max_new {
-            while launched < max_new && launched - out.len() < ahead {
+            while launched < max_new && launched - out.len() < ahead(mask.is_some()) {
                 if let Some(m) = mask.as_mut() {
                     match m() {
                         Some(mut bits) => {
