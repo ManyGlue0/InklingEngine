@@ -81,8 +81,9 @@ fn main() -> Result<()> {
              usage:\n\
              \x20 inkling serve <model.gguf> [--mmproj FILE] [--ctx N] [--host H] [--port P] [--api-key KEY] [--model-id NAME]\n\
              \x20               [--temp T] [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N]\n\
-             \x20               [--reasoning-budget N] [--insecure-no-auth]\n\
-             \x20 serve requires --api-key KEY or INKLING_API_KEY unless --insecure-no-auth is explicit\n\
+             \x20               [--reasoning-budget N] [--cors] [--insecure-no-auth]\n\
+             \x20 serve on an address other machines can reach (--host 0.0.0.0) needs --api-key KEY (or\n\
+             \x20 INKLING_API_KEY), or --insecure-no-auth to serve without one\n\
              \x20 inkling generate <model.gguf> <prompt> [max_tokens]\n\
              \x20 inkling bench <model.gguf> [--ctx N] [--fill 0,128k,512k,1M] [--kv q4,q6] [--gen N]\n\
              \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6; K:V such\n\
@@ -394,7 +395,7 @@ fn rendertest(cases: &str) -> Result<()> {
 
 /// OpenAI-compatible server: inkling serve <model> [--host H] [--port P] [--ctx N] [--api-key K] [--temp T]
 /// [--top-p P] [--top-k K] [--min-p P] [--repeat-penalty R] [--repeat-last-n N] [--mmproj FILE] [--model-id NAME]
-/// [--reasoning-budget N] (unlimited by default) [--insecure-no-auth]
+/// [--reasoning-budget N] (unlimited by default) [--cors] [--insecure-no-auth]
 fn serve(model: &str, flags: &[String]) -> Result<()> {
     let get = |name: &str| flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).cloned();
     let num = |name: &str| -> Result<Option<f64>> { get(name).map(|v| v.parse::<f64>().map_err(|e| anyhow::anyhow!("{name}: {e}"))).transpose() };
@@ -425,6 +426,7 @@ fn serve(model: &str, flags: &[String]) -> Result<()> {
         n_ctx: num("--ctx")?.map(|v| v as usize).unwrap_or(131072),
         api_key,
         insecure_no_auth: flags.iter().any(|a| a == "--insecure-no-auth"),
+        cors: flags.iter().any(|a| a == "--cors"),
         model_id,
         defaults: d,
         mmproj: get("--mmproj"),

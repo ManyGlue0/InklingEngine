@@ -40,8 +40,10 @@ pub struct Options {
     pub port: u16,
     pub n_ctx: usize,
     pub api_key: Option<String>,
-    /// explicitly allow serving without an API key
+    /// serve without an API key on an address other machines can reach (on loopback no key is needed)
     pub insecure_no_auth: bool,
+    /// allow cross-origin requests from browser pages (CORS), off by default
+    pub cors: bool,
     /// model id reported by /v1/models (default: file name)
     pub model_id: String,
     /// sampling defaults for requests that do not set them
@@ -107,10 +109,19 @@ struct AppState {
     vision: Option<(usize, usize)>,
     image_pad: u32,
     force_ids: Option<[u32; 3]>,
+    /// no API key on a loopback address: serve only requests whose Host header names this machine
+    local_only: bool,
 }
 
 const MAX_PENDING: usize = 8;
-const MAX_BODY_BYTES: usize = 8 << 20;
+/// Smallest request body limit; the limit grows with the context (`body_limit`).
+const MAX_BODY_BYTES: usize = 64 << 20;
+
+/// Request body limit: a full context of JSON-escaped text (up to ~16 bytes per token), and never less than
+/// MAX_BODY_BYTES, for images.
+fn body_limit(n_ctx: usize) -> usize {
+    n_ctx.saturating_mul(16).max(MAX_BODY_BYTES)
+}
 
 struct BodyLimits {
     max_bytes: usize,
@@ -218,9 +229,18 @@ fn now() -> u64 {
 
 /// Run the server until Ctrl-C.
 pub fn serve(model: &str, opts: Options) -> Result<()> {
-    if !opts.api_key.as_deref().is_some_and(|key| !key.is_empty()) && !opts.insecure_no_auth {
-        return Err(anyhow!("an API key is required (--api-key or INKLING_API_KEY); use --insecure-no-auth to disable authentication"));
+    let has_key = opts.api_key.as_deref().is_some_and(|key| !key.is_empty());
+    let loopback = is_loopback_host(&opts.host);
+    if !has_key && !loopback && !opts.insecure_no_auth {
+        return Err(anyhow!(
+            "--host {} accepts connections from other machines: set an API key (--api-key or INKLING_API_KEY), or pass \
+             --insecure-no-auth to serve without one",
+            opts.host
+        ));
     }
+    // Without a key on a loopback address, requests are served only when their Host header names this machine: a
+    // web page then cannot reach the server through a DNS name that resolves to 127.0.0.1 (DNS rebinding).
+    let local_only = !has_key && loopback && !opts.insecure_no_auth;
     let tok = Arc::new(Tokenizer::from_gguf(&Gguf::open(model)?)?);
     let force_ids = tok.token_id("<|end_message|>")
         .zip(tok.token_id("<|message_model|>"))
@@ -255,9 +275,9 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
     let image_pad = tok.token_id("<|unused_200054|>").context("image placeholder token missing")?;
     let state = Arc::new(AppState {
         tok, jobs: jobs_tx, gpu_thread,
-        admission: BodyAdmission { readers: Semaphore::new(2 * MAX_PENDING), limits: BodyLimits::default(), pending: Arc::new(AtomicUsize::new(0)) },
+        admission: BodyAdmission { readers: Semaphore::new(2 * MAX_PENDING), limits: BodyLimits { max_bytes: body_limit(n_ctx), ..BodyLimits::default() }, pending: Arc::new(AtomicUsize::new(0)) },
         builds: Arc::new(Semaphore::new(2)),
-        opts: opts.clone(), n_ctx, vision, image_pad, force_ids,
+        opts: opts.clone(), n_ctx, vision, image_pad, force_ids, local_only,
     });
     let app = Router::new()
         .route("/health", get(health))
@@ -266,6 +286,8 @@ pub fn serve(model: &str, opts: Options) -> Result<()> {
         .route("/v1/completions", post(completions))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state);
+    // outermost, so that preflight requests (which carry no credentials) are answered before authentication
+    let app = if opts.cors { app.layer(tower_http::cors::CorsLayer::permissive()) } else { app };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let addr = format!("{}:{}", opts.host, opts.port);
@@ -589,9 +611,31 @@ fn authorized(api_key: Option<&str>, insecure_no_auth: bool, headers: &HeaderMap
     value.trim().strip_prefix("Bearer ").is_some_and(|supplied| keys_equal(key.as_bytes(), supplied.as_bytes()))
 }
 
+/// Whether `host` (a --host value or a Host header's name) is this machine: localhost, 127.0.0.0/8 or ::1.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a request's Host header names this machine (with or without a port).
+fn host_header_is_local(headers: &HeaderMap) -> bool {
+    let Some(h) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) else { return false };
+    let name = match h.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => h.rsplit_once(':').map_or(h, |(name, _)| name),
+    };
+    is_loopback_host(name)
+}
+
 async fn authenticate(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
-    if request.uri().path() != "/health" && !authorized(state.opts.api_key.as_deref(), state.opts.insecure_no_auth, request.headers()) {
-        return err(StatusCode::UNAUTHORIZED, "invalid API key");
+    if request.uri().path() != "/health" {
+        if state.local_only {
+            if !host_header_is_local(request.headers()) {
+                return err(StatusCode::FORBIDDEN, "without an API key, the server only answers requests addressed to localhost, 127.0.0.1 or [::1]");
+            }
+        } else if !authorized(state.opts.api_key.as_deref(), state.opts.insecure_no_auth, request.headers()) {
+            return err(StatusCode::UNAUTHORIZED, "invalid API key");
+        }
     }
     next.run(request).await
 }
@@ -1333,6 +1377,30 @@ mod tests {
             assert_eq!(server.admission.readers.available_permits(), 2 * MAX_PENDING);
             assert_eq!(server.admission.pending.load(Ordering::Relaxed), 0);
         }
+    }
+
+    #[test]
+    fn loopback_hosts_and_host_headers() {
+        for h in ["127.0.0.1", "localhost", "LocalHost", "::1", "[::1]", "127.1.2.3"] {
+            assert!(is_loopback_host(h), "{h}");
+        }
+        for h in ["0.0.0.0", "192.168.1.10", "::", "example.com", "localhost.example.com", ""] {
+            assert!(!is_loopback_host(h), "{h}");
+        }
+        let host = |v: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::HOST, v.parse().unwrap());
+            host_header_is_local(&headers)
+        };
+        for v in ["localhost:8080", "127.0.0.1:8080", "[::1]:8080", "localhost", "127.0.0.1"] {
+            assert!(host(v), "{v}");
+        }
+        for v in ["evil.example:8080", "evil.example", "192.168.1.10:8080", "localhost.evil.example:8080"] {
+            assert!(!host(v), "{v}");
+        }
+        assert!(!host_header_is_local(&HeaderMap::new()));
+        assert_eq!(body_limit(4096), MAX_BODY_BYTES);
+        assert_eq!(body_limit(1 << 23), 1 << 27);
     }
 
     #[tokio::test]
