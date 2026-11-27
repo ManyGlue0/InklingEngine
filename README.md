@@ -326,6 +326,9 @@ Server flags:
 - **Request fields:**
   - `tools` and `tool_choice: "none"`;
   - `reasoning_effort` (`none`/`low`/`medium`/`high`/`max` or a number in 0–0.99; default 0.9);
+  - `response_format`: `json_schema` (the answer follows `json_schema.schema`) or `json_object` (any JSON object),
+    enforced by token masking with [llguidance](https://github.com/guidance-ai/llguidance). The reasoning stays
+    free; the constraint applies to the answer, which then ends the turn. An unusable schema is a 400.
   - `max_tokens` / `max_completion_tokens`, `stop`, `seed`, `stream_options.include_usage`;
   - sampling: `temperature`, `top_p`, `top_k`, `min_p`;
   - penalties: `presence_penalty`, `frequency_penalty`, `repeat_penalty` (or `repetition_penalty`), `repeat_last_n`.
@@ -374,6 +377,9 @@ Developer commands:
 - **Correctness:** `validate` against reference dumps, `kvstudy`, `cachetest`, `rendertest`, `gemmtest`, `visiontest`,
   `cpumoetest` (CPU experts against the GPU kernel), `codectest` (every weight format: CUDA vs CPU decoders; then
   `python tools/codec_oracle.py` compares with gguf-py).
+- **Smaller GPUs:** the fused MoE kernel's grid follows the SM count, so a large GPU does not exercise the grids of
+  smaller ones. Run `validate` again with `INKLING_MOE_BLOCKS=96` (66 SMs, e.g. RTX 4070 Ti SUPER) and
+  `INKLING_MOE_BLOCKS=32`. The results must be identical to the default grid.
 - **Diagnostics:** `vraminfo` prints total and usable VRAM.
 
 ## How it works

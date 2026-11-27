@@ -206,12 +206,13 @@ extern "C" __global__ void __launch_bounds__(256, 2) ink_moe8(ExpW wg, ExpW wd, 
         };
         float acc = 0.0f;
         const int8_t* hr = hs + t * HS;
-        // conv/residual operands of this warp's (at most 2) channels, fetched before the barrier: lane 8q + k holds
-        // operand k of task q (k < 4: conv taps, 4..6: state, 7: residual x)
+        // conv/residual operands of this warp's first 4 channels, fetched before the barrier: lane 8q + k holds
+        // operand k of task q (k < 4: conv taps, 4..6: state, 7: residual x). A warp has D / NWt channels (rounded
+        // up): 2 with 144 blocks, 3 with 96 (66 SMs at 2 blocks each). Tasks past the 4th read theirs in compute.
         float opnd = 0.0f;
         {
             const int q = lane >> 3, k = lane & 7, n = gw + q * NWt;
-            if (q < 2 && n < D) opnd = k < 4 ? cw[(size_t)n * 4 + k] : k < 7 ? state[(k - 4) * D + n] : x[n];
+            if (n < D) opnd = k < 4 ? cw[(size_t)n * 4 + k] : k < 7 ? state[(k - 4) * D + n] : x[n];
         }
         auto compute = [&](const Chunk& c, int j) {
             const int half = j % cp;
@@ -239,12 +240,17 @@ extern "C" __global__ void __launch_bounds__(256, 2) ink_moe8(ExpW wg, ExpW wd, 
                 float y = acc * sw;
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
-                const int q8 = 8 * (j / cp);
+                const int task = j / cp;  // warp-uniform
+                const int n = gw + task * NWt;
                 float op[8];
+                if (task < 4) {
 #pragma unroll
-                for (int k = 0; k < 8; ++k) op[k] = __shfl_sync(0xffffffffu, opnd, q8 + k);
+                    for (int k = 0; k < 8; ++k) op[k] = __shfl_sync(0xffffffffu, opnd, 8 * task + k);
+                } else {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) op[k] = k < 4 ? cw[(size_t)n * 4 + k] : k < 7 ? state[(k - 4) * D + n] : x[n];
+                }
                 if (lane == 0) {
-                    const int n = gw + (j / cp) * NWt;
                     const float s1 = op[5], s2 = op[6];
                     const float o = (y + op[4] * op[0] + s1 * op[1] + s2 * op[2] + y * op[3]) * rsqrtf(5.0f);
                     state[n] = s1;
@@ -258,7 +264,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) ink_moe8(ExpW wg, ExpW wd, 
         };
         const unsigned int gen = grid_arrive(bar);
         mark(2);
-        // every down chunk of this warp (at most 2) stays in flight across the barrier wait
+        // the warp's first two down chunks stay in flight across the barrier wait
         if (nch > 0) load(A, 0);
         if (nch > 1) load(B, 1);
         grid_wait(bar, gen);

@@ -27,6 +27,8 @@ use futures_util::{FutureExt, StreamExt};
 use inkling_core::chat::{self, Event};
 use inkling_core::{Gguf, Tokenizer};
 use inkling_engine::{EMBED_TOKEN_BASE, Engine, Image, ImageEmbed, Sampling};
+
+mod structured;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -78,6 +80,8 @@ struct Job {
     raw: bool,
     /// images: (prompt position of the first embedding row, image)
     images: Vec<(usize, Arc<Image>)>,
+    /// JSON schema the answer must follow (response_format), or None
+    schema: Option<Value>,
     tx: mpsc::UnboundedSender<Out>,
 }
 
@@ -87,6 +91,8 @@ enum Out {
     Ev(Event),
     Done { finish: &'static str, completion_tokens: usize },
     Error(String),
+    /// the request cannot be served as asked (e.g. an unusable JSON schema): 400
+    Invalid(String),
 }
 
 struct AppState {
@@ -153,13 +159,24 @@ struct ImageBytes<'a> {
     bytes: usize,
 }
 
+/// Atomically adds `n` to `counter` unless the sum would exceed `max`; returns the previous value when it added.
+/// (A compare-exchange loop: `fetch_update` is deprecated in newer Rust and `try_update` missing in older.)
+fn add_bounded(counter: &AtomicUsize, n: usize, max: usize) -> Option<usize> {
+    let mut cur = counter.load(Ordering::Relaxed);
+    loop {
+        let next = cur.checked_add(n).filter(|&total| total <= max)?;
+        match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(prev) => return Some(prev),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 impl<'a> ImageBytes<'a> {
     fn reserve(used: &'a AtomicUsize, width: usize, height: usize) -> Result<Self> {
         // Cover the decoded image (up to RGBA8) and its simultaneous RGB8 conversion.
         let bytes = width.checked_mul(height).and_then(|n| n.checked_mul(7)).ok_or(ImageQueueFull)?;
-        used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            n.checked_add(bytes).filter(|&total| total <= MAX_IMAGE_BYTES)
-        }).map_err(|_| ImageQueueFull)?;
+        add_bounded(used, bytes, MAX_IMAGE_BYTES).ok_or(ImageQueueFull)?;
         Ok(Self { used, bytes })
     }
 }
@@ -177,9 +194,7 @@ struct JobSlot {
 
 impl JobSlot {
     fn reserve(pending: &Arc<AtomicUsize>) -> Option<Self> {
-        pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            if n < MAX_PENDING { Some(n + 1) } else { None }
-        }).ok().map(|_| Self { pending: pending.clone(), images: Vec::new() })
+        add_bounded(pending, 1, MAX_PENDING).map(|_| Self { pending: pending.clone(), images: Vec::new() })
     }
 }
 
@@ -294,9 +309,27 @@ impl EmbedCache {
 /// GPU worker: one job at a time.
 fn worker(eng: &mut Engine, tok: &Tokenizer, jobs: std::sync::mpsc::Receiver<Job>, force_ids: Option<[u32; 3]>) {
     let mut embeds = EmbedCache::default();
+    // structured output: built once, lazily (the first request with response_format pays for it)
+    let mut guidance: Option<Result<structured::Guidance, String>> = None;
     while let Ok(job) = jobs.recv() {
         let tx = job.tx.clone();
-        if let Err(e) = run_job(eng, tok, &mut embeds, job, force_ids) {
+        let constraint = match &job.schema {
+            None => None,
+            Some(schema) => match guidance.get_or_insert_with(|| structured::Guidance::new(tok).map_err(|e| format!("{e:#}"))) {
+                Err(e) => {
+                    let _ = tx.send(Out::Error(format!("structured output unavailable: {e}")));
+                    continue;
+                }
+                Ok(g) => match g.start(schema.clone()) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        let _ = tx.send(Out::Invalid(format!("{e:#}")));
+                        continue;
+                    }
+                },
+            },
+        };
+        if let Err(e) = run_job(eng, tok, &mut embeds, job, force_ids, constraint) {
             let _ = tx.send(Out::Error(format!("{e:#}")));
         }
     }
@@ -375,8 +408,15 @@ fn validate_force_ids(budget: Option<usize>, force_ids: Option<[u32; 3]>) -> Res
     Ok(())
 }
 
-fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job, force_ids: Option<[u32; 3]>) -> Result<()> {
+/// Tokens the engine keeps in flight ahead of the one being read: when a reasoning budget is this close, decode
+/// steps without lookahead (see `run_job`).
+const LOOKAHEAD: usize = 3;
+
+fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job: Job, force_ids: Option<[u32; 3]>,
+           constraint: Option<structured::Constrained>) -> Result<()> {
     let _slot = job.slot;
+    let constraint = constraint.map(std::cell::RefCell::new);
+    let constraint_error: std::cell::RefCell<Option<anyhow::Error>> = std::cell::RefCell::new(None);
     let mut embeds = Vec::with_capacity(job.images.len());
     for (pos, img) in &job.images {
         embeds.push((*pos, embed_cache.get_or_encode(eng, img)?));
@@ -444,19 +484,46 @@ fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job:
             break;
         }
         let mut action = ReasoningAction::Continue;
-        let (out, cached) = eng.generate_mm(&prompt, &embeds, remaining, &job.sampling, &mut |t| {
+        let exact = std::cell::Cell::new(false);
+        let mut cb = |t: u32| {
             let was_thinking = parser.in_thinking();
             let events = parser.push(tok, t);
             // Count reasoning content, excluding the opening and closing tokens.
             if was_thinking && parser.in_thinking() {
                 thinking_tokens += 1;
             }
+            if let Some(c) = &constraint {
+                if let Err(e) = c.borrow_mut().push(t) {
+                    *constraint_error.borrow_mut() = Some(e);
+                    return false;
+                }
+            }
             if !on_events(events) {
                 return false;
             }
             action = reasoning_action(parser.in_thinking(), thinking_tokens, reasoning_budget, forced_once);
+            // Close to the budget, decode without lookahead: the stop then leaves the device state exactly after the
+            // last token read, so the forced close below extends the cached prompt instead of prefilling it again.
+            exact.set(!forced_once && parser.in_thinking() && reasoning_budget.is_some_and(|b| thinking_tokens + LOOKAHEAD >= b));
             action == ReasoningAction::Continue
-        })?;
+        };
+        let mut mask = || match constraint.as_ref().map(|c| c.borrow_mut().mask()) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
+                *constraint_error.borrow_mut() = Some(e);
+                None
+            }
+            None => None,
+        };
+        let exact_now = || exact.get();
+        let steer = inkling_engine::Steer {
+            mask: if constraint.is_some() { Some(&mut mask) } else { None },
+            exact: Some(&exact_now),
+        };
+        let (out, cached) = eng.generate_mm_steered(&prompt, &embeds, remaining, &job.sampling, &mut cb, steer)?;
+        if let Some(e) = constraint_error.borrow_mut().take() {
+            return Err(e);
+        }
         if n == 0 {
             let _ = tx.send(Out::Started { prompt_tokens, cached });
         }
@@ -479,6 +546,9 @@ fn run_job(eng: &mut Engine, tok: &Tokenizer, embed_cache: &mut EmbedCache, job:
         for id in force_ids.into_iter().take(count) {
             prompt.push(id);
             n += 1;
+            if let Some(c) = &constraint {
+                c.borrow_mut().push(id)?;
+            }
             if !on_events(parser.push(tok, id)) {
                 break 'generating;
             }
@@ -549,6 +619,7 @@ struct Req {
     stop: Vec<String>,
     stream: bool,
     include_usage: bool,
+    schema: Option<Value>,
 }
 
 /// Bytes of an image reference: a `data:` URL or bare base64.
@@ -739,7 +810,8 @@ fn parse_request(state: &AppState, body: &Value, raw: bool, slot: &mut JobSlot) 
     }
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Value::as_bool).unwrap_or(false);
-    Ok(Req { prompt, images, max_new, reasoning_budget, sampling, stop, stream, include_usage })
+    let schema = if raw { None } else { structured::requested_schema(body)? };
+    Ok(Req { prompt, images, max_new, reasoning_budget, sampling, stop, stream, include_usage, schema })
 }
 
 fn usage(prompt_tokens: usize, cached: usize, completion: usize) -> Value {
@@ -896,7 +968,7 @@ async fn start(state: Arc<AppState>, headers: HeaderMap, body: Body, raw: bool) 
     let (tx, rx) = mpsc::unbounded_channel();
     let stream = req.stream;
     let include_usage = req.include_usage;
-    if let Err(e) = state.jobs.try_send(Job { slot, prompt: req.prompt, images: req.images, max_new: req.max_new, reasoning_budget: req.reasoning_budget, sampling: req.sampling, stop: req.stop, raw, tx }) {
+    if let Err(e) = state.jobs.try_send(Job { slot, prompt: req.prompt, images: req.images, max_new: req.max_new, reasoning_budget: req.reasoning_budget, schema: req.schema, sampling: req.sampling, stop: req.stop, raw, tx }) {
         return match e {
             std::sync::mpsc::TrySendError::Full(_) => err(StatusCode::SERVICE_UNAVAILABLE, "GPU queue is full"),
             std::sync::mpsc::TrySendError::Disconnected(_) => err(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not running"),
@@ -925,6 +997,7 @@ async fn collect_text(mut rx: mpsc::UnboundedReceiver<Out>, id: String, model: S
             Out::Ev(Event::Content(s) | Event::Reasoning(s)) => text.push_str(&s),
             Out::Ev(_) => {}
             Out::Error(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Out::Invalid(e) => return err(StatusCode::BAD_REQUEST, e),
             Out::Done { finish, completion_tokens } => {
                 return Json(json!({"id": id, "object": "text_completion", "created": created, "model": model,
                     "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish}],
@@ -954,7 +1027,7 @@ fn sse_text(rx: mpsc::UnboundedReceiver<Out>, id: String, model: String, created
             }
             Out::Ev(Event::Content(s) | Event::Reasoning(s)) => out.push(chunk(&s, None)),
             Out::Ev(_) => {}
-            Out::Error(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
+            Out::Error(e) | Out::Invalid(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
             Out::Done { finish, completion_tokens } => {
                 out.push(chunk("", Some(finish)));
                 if include_usage {
@@ -985,6 +1058,7 @@ async fn collect_response(mut rx: mpsc::UnboundedReceiver<Out>, id: String, mode
             }
             Out::Ev(Event::End) => {}
             Out::Error(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Out::Invalid(e) => return err(StatusCode::BAD_REQUEST, e),
             Out::Done { finish, completion_tokens } => {
                 let mut msg = json!({"role": "assistant", "content": if content.is_empty() && !tool_calls.is_empty() { Value::Null } else { Value::String(content) }});
                 if !reasoning.is_empty() {
@@ -1032,7 +1106,7 @@ fn sse_response(rx: mpsc::UnboundedReceiver<Out>, id: String, model: String, cre
                 n_tools += 1;
             }
             Out::Ev(Event::End) => {}
-            Out::Error(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
+            Out::Error(e) | Out::Invalid(e) => out.push(SseEvent::default().data(json!({"error": {"message": e}}).to_string())),
             Out::Done { finish, completion_tokens } => {
                 out.push(chunk(json!({}), Some(finish)));
                 if usage_tail {
@@ -1215,16 +1289,26 @@ mod tests {
                 socket.set_nodelay(true).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                // Read from the start, on its own thread: a server that answers early (408, 413) and closes makes
+                // the remaining writes reset the connection, and Windows then discards a reply not yet read.
+                let mut reader = socket.try_clone().unwrap();
+                let read = std::thread::spawn(move || {
+                    let mut response = Vec::new();
+                    let r = reader.read_to_end(&mut response);
+                    (response, r)
+                });
                 for (delay, bytes) in parts {
                     std::thread::sleep(delay);
                     if socket.write_all(&bytes).is_err() {
                         break;
                     }
                 }
-                let mut response = Vec::new();
-                if let Err(error) = socket.read_to_end(&mut response) {
-                    // Rejecting an unread body may close the connection with a reset after the response.
-                    assert!(error.kind() == std::io::ErrorKind::ConnectionReset && !response.is_empty(), "{error}");
+                let (response, r) = read.join().unwrap();
+                if let Err(error) = r {
+                    // Rejecting an unread body may close the connection with a reset after the response (Windows
+                    // reports it as an abort).
+                    let closed = matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted);
+                    assert!(closed && !response.is_empty(), "{error}");
                 }
                 String::from_utf8(response).unwrap()
             }).await.unwrap()
