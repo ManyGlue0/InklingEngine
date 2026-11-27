@@ -491,7 +491,15 @@ struct PoolShared {
     wake: Condvar,
     stop: AtomicBool,
     pin: bool,
+    /// test-only rendezvous points that force the lost-wakeup interleaving (`pool_no_lost_wakeup`)
+    #[cfg_attr(not(test), allow(dead_code))]
+    hooks: Hooks,
 }
+
+#[cfg(test)]
+type Hooks = Option<Arc<RaceHooks>>;
+#[cfg(not(test))]
+type Hooks = ();
 
 #[derive(Clone, Copy)]
 struct JobPtr(*const (dyn Fn(usize) + Sync));
@@ -500,11 +508,21 @@ unsafe impl Sync for JobPtr {}
 
 impl Pool {
     pub fn new(n: usize) -> Self {
+        Self::build(n, Hooks::default())
+    }
+
+    /// A pool whose `run` and workers meet at the race hooks (tests).
+    #[cfg(test)]
+    fn with_hooks(n: usize, hooks: Arc<RaceHooks>) -> Self {
+        Self::build(n, Some(hooks))
+    }
+
+    fn build(n: usize, hooks: Hooks) -> Self {
         let n = n.max(1);
         // one worker per physical core when there are enough (the caller, worker 0, runs wherever CUDA calls it)
         let logical = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
         let pin = 2 * n <= logical && std::env::var("INKLING_CPU_PIN").as_deref() == Ok("1");
-        let shared = Arc::new(PoolShared { epoch: AtomicUsize::new(0), pending: AtomicUsize::new(0), job: Mutex::new(None), wake: Condvar::new(), stop: AtomicBool::new(false), pin });
+        let shared = Arc::new(PoolShared { epoch: AtomicUsize::new(0), pending: AtomicUsize::new(0), job: Mutex::new(None), wake: Condvar::new(), stop: AtomicBool::new(false), pin, hooks });
         let threads = (1..n)
             .map(|i| {
                 let sh = shared.clone();
@@ -528,10 +546,24 @@ impl Pool {
         }
         // SAFETY: the job pointer is only used until `pending` reaches 0, which happens before this returns
         let ptr: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(f) };
-        *self.shared.job.lock().unwrap() = Some(JobPtr(ptr));
-        self.shared.pending.store(self.n - 1, Ordering::Release);
-        self.shared.epoch.fetch_add(1, Ordering::AcqRel);
-        self.shared.wake.notify_all();
+        // publish, bump and notify inside one hold of the job mutex: a sleeping worker checks `epoch` and enters its
+        // Condvar wait under that mutex, so the bump can no longer land between its check and its wait (a lost
+        // wakeup would leave `pending` above 0 and this call spinning forever, with the CUDA stream behind it)
+        {
+            let mut job = self.shared.job.lock().unwrap();
+            *job = Some(JobPtr(ptr));
+            #[cfg(test)]
+            if let Some(h) = &self.shared.hooks {
+                h.run_published();
+            }
+            self.shared.pending.store(self.n - 1, Ordering::Release);
+            self.shared.epoch.fetch_add(1, Ordering::AcqRel);
+            self.shared.wake.notify_all();
+            #[cfg(test)]
+            if let Some(h) = &self.shared.hooks {
+                h.run_notified();
+            }
+        }
         f(0);
         while self.shared.pending.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
@@ -575,6 +607,10 @@ fn worker(sh: Arc<PoolShared>, i: usize) {
         if g == seen {
             let mut lock = sh.job.lock().unwrap();
             while sh.epoch.load(Ordering::Acquire) == seen && !sh.stop.load(Ordering::Acquire) {
+                #[cfg(test)]
+                if let Some(h) = &sh.hooks {
+                    h.worker_gap();
+                }
                 lock = sh.wake.wait(lock).unwrap();
             }
             drop(lock);
@@ -850,6 +886,64 @@ impl CpuMoe {
         });
         if PHASE_DEBUG.load(Ordering::Relaxed) {
             eprintln!("cpu moe layer {li}: phase 1 {:.0} us, total {:.0} us", t_p1.as_secs_f64() * 1e6, tp.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+}
+
+/// Test-only rendezvous between `Pool::run` and one worker, each side waiting at most `RaceHooks::WAIT` for the other.
+#[cfg(test)]
+#[derive(Default)]
+struct RaceHooks {
+    /// (a worker sits between its check and its wait, run has bumped and notified)
+    state: Mutex<(bool, bool)>,
+    cv: Condvar,
+}
+
+#[cfg(test)]
+impl RaceHooks {
+    const WAIT: Duration = Duration::from_millis(200);
+
+    fn worker_gap(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.0 = true;
+        self.cv.notify_all();
+        let (mut s, _) = self.cv.wait_timeout_while(s, Self::WAIT, |s| !s.1).unwrap();
+        s.0 = false;
+    }
+
+    fn run_published(&self) {
+        let s = self.state.lock().unwrap();
+        let _ = self.cv.wait_timeout_while(s, Self::WAIT, |s| !s.0).unwrap();
+    }
+
+    fn run_notified(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worker that went to sleep must not miss a job published while it sits between its `epoch` check and its
+    /// Condvar wait (the hooks force exactly that interleaving).
+    #[test]
+    fn pool_no_lost_wakeup() {
+        let hooks = Arc::new(RaceHooks::default());
+        let pool = Arc::new(Pool::with_hooks(2, hooks));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = pool.clone();
+        std::thread::spawn(move || {
+            let hits = AtomicUsize::new(0);
+            p.run(&|_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            });
+            let _ = tx.send(hits.load(Ordering::SeqCst));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(n) => assert_eq!(n, 2, "run returned before every worker ran the job"),
+            Err(_) => panic!("Pool::run did not return within 5 s: the worker missed the epoch bump (lost wakeup)"),
         }
     }
 }
