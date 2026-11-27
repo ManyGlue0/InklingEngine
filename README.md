@@ -85,6 +85,34 @@ itself. The KL column checks this engine against the reference llama.cpp on the 
 every row, and it does. Q4_K_M and IQ4_XS are as good as Q4_K_XL and smaller; Q3_K_XL is the best trade-off for
 16 GB cards; the 1- and 2-bit files lose noticeably more, and the three smallest fit a 12 GB card entirely.
 
+### Speculative decoding
+With `--draft`, a small drafter model guesses the next few tokens and the main model checks all of them in one
+batched pass. A pass costs less than two ordinary decode steps and keeps every guess up to the first wrong one,
+so each pass yields more than one token. Two drafters are supported:
+
+| drafter | download | VRAM | `--draft` takes |
+|---|---|---|---|
+| **DFlash2** (recommended) | [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2): `config.json` + `model.safetensors` (0.99 GB) | ~0.85 GB | the folder |
+| DSpark | `dspark-Inkling-2-Mini-Q8_0.gguf` (0.5 GB) in the root of [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | ~0.7 GB + 4 KiB per context token | the `.gguf` file |
+
+```sh
+huggingface-cli download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors --local-dir Inkling-2-Mini-DFlash2
+inkling serve Inkling-2-Mini-UD-Q4_K_XL.gguf --draft Inkling-2-Mini-DFlash2
+```
+
+Decode speed in tok/s, RTX 3090, UD-Q4_K_XL, 3 drafted tokens per step (`--draft-n 3`, the default), greedy:
+
+| | no drafter | DSpark | **DFlash2** |
+|---|---|---|---|
+| code (a Python function) | 110 | 160 | **172** (3.1 tokens per pass) |
+| prose (two explanations) | 110 | 123–134 | **138** |
+
+The output is unchanged at any temperature. Every position of a pass is sampled by the main model exactly as a
+normal decode step would be, and a guess is kept only if it equals that sample. More drafted tokens per step
+(`--draft-n` up to 7) pay off only on very predictable text such as code. `bench` prints the tokens per pass.
+The drafter applies to text requests: requests with images, and structured output (`response_format`), decode
+without it. It does not combine with CPU offload yet.
+
 ### Smaller GPUs: CPU offload
 When the model and context do not fit in free VRAM, `inkling` keeps the experts of some MoE layers in system RAM
 and runs them on the CPU (AVX2, all cores). Every token reads only 8 of each layer's 128 experts, so a layer on the
@@ -311,6 +339,7 @@ Server flags:
 | `--kv q4\|q6\|q8\|f16`, `--kv-k`, `--kv-v` | `q6` (KV cache type, `K:V` such as `q8:q4` for separate types; also on `generate` and `bench`) |
 | `--offload auto\|off\|all\|N` | `auto` (MoE layers on the CPU only when VRAM is short) |
 | `--mmproj FILE` | none (enables image input) |
+| `--draft PATH`, `--draft-n N` | none, `3` (speculative decoding, see [Speculative decoding](#speculative-decoding); also on `generate` and `bench`) |
 | `--api-key KEY` (or `INKLING_API_KEY`) | none |
 | `--model-id NAME` | the file name |
 | `--temp`, `--top-p`, `--top-k`, `--min-p` | `0.8`, `0.95`, `40`, `0.05` |
@@ -397,6 +426,12 @@ Developer commands:
   output into mapped memory, a CUDA host node runs the experts on a thread pool inside the token's graph, and the
   post conv reads the result back. During prefill the same pinned copy streams to the GPU in 16-expert groups on a
   second stream, double-buffered.
+- **Speculative decoding.** The drafter reads hidden states that the main model's passes copy out (three looped-layer
+  inputs and the final norm). Its guesses go through the batched prefill path with kernels for chains of up to 8
+  tokens: the MoE kernel reads the union of the experts the tokens chose once, so a 4-token pass reads about twice
+  the expert weights of one decode step, not four times. The short convolutions defer their state updates until the
+  accepted length is known. Each pass is three CUDA graphs (draft, verify + sample every position, commit) with one
+  host sync.
 - **Vision.** Native ViT (23 layers) on f16 tensor cores: 2-D RoPE, flash attention, 2×2 patch merge and MLP
   projector. The embeddings replace the image placeholder positions during prefill.
 
@@ -405,6 +440,8 @@ Developer commands:
 ## Limitations
 
 - **Single stream:** one request at a time, no batching across requests.
+- **Speculative decoding:** text only (images and structured output decode without the drafter), and not with CPU
+  offload.
 - **One model:** Inkling 2 Mini only, in the UD GGUFs of Unsloth's root folder (not UD-Q8_K_XL, which uses BF16
   weights, and not the `Mainline_Support` layout).
 - **Offload:** only the MoE experts move to the CPU; the rest of the model (about 3.3 GiB) and the KV cache stay in
@@ -416,7 +453,8 @@ Developer commands:
 ## Credits
 
 - **Inkling 2 Mini** by [Thinking Machines Lab](https://thinkingmachines.ai) (Apache-2.0).
-- **GGUF conversion and quantization** by [Unsloth](https://unsloth.ai).
+- **GGUF conversion and quantization** by [Unsloth](https://unsloth.ai), including the DSpark drafter conversion.
+- **DFlash2 drafter** by [Inco AI](https://inco.ai/blog/dflash2/) (Apache-2.0).
 - **Reference implementation:** [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), Unsloth's Inkling 2
   branch. It was used as the numerical reference and as the source of the model, preprocessing and quantization
   format semantics. The only material taken from it is the codebook tables of the IQ formats (generated from

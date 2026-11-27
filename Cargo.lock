@@ -573,6 +573,7 @@ dependencies = [
  "image",
  "inkling-core",
  "inkling-cuda",
+ "serde_json",
 ]
 
 [[package]]

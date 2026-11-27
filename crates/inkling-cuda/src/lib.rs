@@ -76,6 +76,39 @@ pub struct ExpW {
     /// prefill grouped GEMMs: only experts in [lo, hi) (erange = lo | hi << 16; 0 = all)
     pub erange: i32,
 }
+/// Batched Q8_0 matvec segment (ink_mv_q8q_b).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvSegQB {
+    pub qs: u64,
+    pub d: u64,
+    pub xq: u64,
+    pub xd: u64,
+    pub y: u64,
+    pub n: i32,
+    pub ldy: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MvQB4 {
+    pub s: [MvSegQB; 4],
+    pub nseg: i32,
+    pub k: i32,
+    pub t: i32,
+}
+/// Deferred short-conv commits (ink_conv_commit): up to 64 (state, inputs, channels) entries.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ConvCommit {
+    pub state: [u64; 64],
+    pub x: [u64; 64],
+    pub ch: [i32; 64],
+}
+impl Default for ConvCommit {
+    fn default() -> Self {
+        Self { state: [0; 64], x: [0; 64], ch: [0; 64] }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Ctrl4 {
@@ -204,6 +237,8 @@ unsafe impl DeviceRepr for Mv4 {}
 unsafe impl DeviceRepr for MvB4 {}
 unsafe impl DeviceRepr for ExpW {}
 unsafe impl DeviceRepr for Ctrl4 {}
+unsafe impl DeviceRepr for ConvCommit {}
+unsafe impl DeviceRepr for MvQB4 {}
 unsafe impl DeviceRepr for MixArgs {}
 
 /// One kernel argument.
@@ -224,6 +259,8 @@ pub enum Arg {
     Gemm(GemmArgs),
     MvG(MvGen),
     GemmG(GemmGen),
+    Conv(ConvCommit),
+    MvQB(MvQB4),
 }
 
 impl From<&DevBuf> for Arg {
@@ -469,6 +506,8 @@ impl Gpu {
                 Arg::MvB(v) => l.arg(v),
                 Arg::Exp(v) => l.arg(v),
                 Arg::Ctrl(v) => l.arg(v),
+                Arg::Conv(v) => l.arg(v),
+                Arg::MvQB(v) => l.arg(v),
                 Arg::Mix(v) => l.arg(v),
                 Arg::MvQ(v) => l.arg(v),
                 Arg::MixQ(v) => l.arg(v),

@@ -6,7 +6,8 @@ use inkling_cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
 
 /// Engine-wide flags accepted by every command; they are forwarded as the INKLING_* variables the engine reads.
 const ENGINE_FLAGS: &[(&str, &str)] =
-    &[("--kv", "INKLING_KV"), ("--kv-k", "INKLING_KV_K"), ("--kv-v", "INKLING_KV_V"), ("--offload", "INKLING_OFFLOAD")];
+    &[("--kv", "INKLING_KV"), ("--kv-k", "INKLING_KV_K"), ("--kv-v", "INKLING_KV_V"), ("--offload", "INKLING_OFFLOAD"),
+      ("--draft", "INKLING_DRAFT"), ("--draft-n", "INKLING_DRAFT_N"), ("--parallel", "INKLING_PARALLEL")];
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = Vec::new();
@@ -18,7 +19,13 @@ fn main() -> Result<()> {
         };
         if let Some(&(_, var)) = ENGINE_FLAGS.iter().find(|(f, _)| *f == name) {
             let Some(v) = inline.or_else(|| it.next()) else { bail!("{name} needs a value") };
-            if var == "INKLING_OFFLOAD" {
+            if var == "INKLING_DRAFT" {
+                ensure!(std::path::Path::new(&v).exists(), "--draft: no such file or folder `{v}`");
+            } else if var == "INKLING_PARALLEL" {
+                ensure!(matches!(v.parse::<usize>(), Ok(1..=8)), "--parallel: expected 1 to 8 streams, got `{v}`");
+            } else if var == "INKLING_DRAFT_N" {
+                ensure!(matches!(v.parse::<usize>(), Ok(1..=7)), "--draft-n: expected 1 to 7, got `{v}`");
+            } else if var == "INKLING_OFFLOAD" {
                 let ok = matches!(v.to_ascii_lowercase().as_str(), "auto" | "off" | "none" | "all") || v.parse::<usize>().is_ok();
                 ensure!(ok, "--offload: expected auto, off, all or a number of layers, got `{v}`");
             } else if var == "INKLING_KV" && (v.contains(',') || v.contains(':')) {
@@ -71,6 +78,10 @@ fn main() -> Result<()> {
         Some("visiontest") if args.len() > 2 => visiontest(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(400)),
         Some("serve") if args.len() > 1 => serve(&args[1], &args[2..]),
         Some("bench") if args.len() > 1 => bench(&args[1], &args[2..]),
+        Some("spectest") if args.len() > 2 => spectest(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(256)),
+        Some("chaintest") if args.len() > 1 => chaintest(&args[1]),
+        Some("partest") if args.len() > 1 => partest(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(128)),
+        Some("specbench") if args.len() > 1 => specbench(&args[1], args.get(2).map(|s| parse_tokens(s)).transpose()?.unwrap_or(4096)),
         Some("generate") if args.len() > 2 => generate(&args[1], &args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64)),
         Some("--version" | "-V" | "version") => {
             println!("inkling {}", env!("CARGO_PKG_VERSION"));
@@ -85,7 +96,9 @@ fn main() -> Result<()> {
              \x20 inkling bench <model.gguf> [--ctx N] [--fill 0,128k,512k,1M] [--kv q4,q6] [--gen N]\n\
              \x20 commands that load the model also take --kv q4|q6|q8|f16 (KV cache type, default q6; K:V such\n\
              \x20 as q8:q4 sets keys and values separately) and --offload auto|off|all|N (MoE layers kept in\n\
-             \x20 system RAM and run on the CPU when the GPU is too small; default auto)\n\
+             \x20 system RAM and run on the CPU when the GPU is too small; default auto), and --draft PATH\n\
+             \x20 (speculative decoding: a DFlash2 folder or a DSpark .gguf) with --draft-n N (tokens drafted per\n\
+             \x20 step, 1 to 7, default 3)\n\
              \x20 inkling inspect <model.gguf> | tokenize <model.gguf> <file> [--special] | vraminfo | smoke | --version\n\n\
              developer checks: validate, kvstudy, cachetest, rendertest, gemmtest, visiontest (see README)",
             env!("CARGO_PKG_VERSION")
@@ -554,6 +567,10 @@ fn bench(model: &str, flags: &[String]) -> Result<()> {
         if let Some((calls, us)) = eng.cpu_moe_stats() {
             println!("  CPU experts: {us:.0} us per layer visit ({calls} visits)");
         }
+        if eng.has_draft() {
+            let s = eng.spec_stats;
+            println!("  speculative decoding: {:.2} tokens per step ({} of {} drafted tokens accepted)", s.tokens_per_pass(), s.accepted, s.drafted);
+        }
         if eng.moe_tl.is_some() {
             for slot in [10usize, 21] {
                 let tl = eng.moe_timeline(slot)?;
@@ -591,6 +608,199 @@ fn bench(model: &str, flags: &[String]) -> Result<()> {
 }
 
 /// Greedy generation from a raw prompt (special tokens parsed); reports prefill and decode speed.
+/// Speculative decoding check: greedy generation with and without the drafter on a chat prompt; acceptance,
+/// speed and whether the outputs agree.
+fn spectest(model: &str, draft: &str, k: usize, n_gen: usize) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 16384)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    eng.attach_draft(draft)?;
+    let prompts = [
+        "Write a Python function that returns the n-th Fibonacci number iteratively, with a short docstring.",
+        "Explain in a few paragraphs why the sky is blue.",
+        "List the planets of the solar system with one fact about each.",
+    ];
+    let eos = tok.eos;
+    // INKLING_TEMP etc. as for generate (sampling_from_env); greedy by default
+    let smp = sampling_from_env();
+    for p in prompts {
+        let msgs = vec![serde_json::json!({"role": "user", "content": p})];
+        let text = inkling_core::chat::render(&msgs, None, Some(&serde_json::json!(0.0)))?;
+        let ids = tok.encode(&text, true)?;
+        eng.use_spec = false;
+        let t0 = Instant::now();
+        let base = eng.generate(&ids, n_gen, &smp, |t| t != eos)?;
+        let t_base = t0.elapsed().as_secs_f64();
+        eng.use_spec = true;
+        let before = eng.spec_stats;
+        let t0 = Instant::now();
+        let (spec, _) = eng.generate_spec(&ids, n_gen, k, &smp, &mut |t| t != eos)?;
+        let t_spec = t0.elapsed().as_secs_f64();
+        let mut st = eng.spec_stats;
+        st.passes -= before.passes;
+        st.drafted -= before.drafted;
+        st.accepted -= before.accepted;
+        let same = base.iter().zip(&spec).take_while(|(a, b)| a == b).count();
+        println!(
+            "k={k}: {:.1} tokens/pass ({} of {} drafts accepted, {:.0}%), base {:.1} tok/s, spec {:.1} tok/s, outputs agree for {same}/{} tokens",
+            st.tokens_per_pass(), st.accepted, st.drafted, 100.0 * st.accepted as f64 / st.drafted.max(1) as f64,
+            base.len() as f64 / t_base, spec.len() as f64 / t_spec, base.len().min(spec.len())
+        );
+        let piece = |v: &[u32]| v.iter().map(|&t| String::from_utf8_lossy(&tok.token_bytes(t, true)).into_owned()).collect::<Vec<_>>().join("|");
+        if same < base.len().min(spec.len()) {
+            let lo = same.saturating_sub(4);
+            println!("  diverge at {same}: base [{}]  spec [{}]", piece(&base[lo..(same + 4).min(base.len())]), piece(&spec[lo..(same + 4).min(spec.len())]));
+        }
+        let s: String = spec.iter().map(|&t| String::from_utf8_lossy(&tok.token_bytes(t, true)).into_owned()).collect();
+        println!("  {}", s.chars().take(300).collect::<String>().replace('\n', " "));
+    }
+    Ok(())
+}
+
+/// Parallel streams check (run with --parallel N): N chat prompts decoded together. Every batched step must give the
+/// same tokens as stepping each stream alone; also compares with single-stream generation and reports the speed.
+fn partest(model: &str, n_gen: usize) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 16384)?;
+    let n = eng.n_streams();
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let topics = [
+        "Write a Python function that returns the n-th Fibonacci number iteratively, with a short docstring.",
+        "Explain in a few paragraphs why the sky is blue.",
+        "List the planets of the solar system with one fact about each.",
+        "Write a haiku about GPUs, then explain it.",
+        "What are the main differences between TCP and UDP?",
+        "Give me a recipe for a simple tomato pasta.",
+        "Summarize the plot of a heist movie you invent, in five sentences.",
+        "Write a Rust function that reverses the words of a sentence.",
+    ];
+    let smp = sampling_from_env();
+    let prompts: Vec<Vec<u32>> = (0..n)
+        .map(|i| {
+            let msgs = vec![serde_json::json!({"role": "user", "content": topics[i % topics.len()]})];
+            let text = inkling_core::chat::render(&msgs, None, Some(&serde_json::json!(0.0)))?;
+            tok.encode(&text, true)
+        })
+        .collect::<Result<_>>()?;
+    // 1) reference: each stream alone (rows of one)
+    let mut alone = vec![Vec::new(); n];
+    for s in 0..n {
+        eng.par_begin(s, &prompts[s], &[], &smp)?;
+        for _ in 0..n_gen {
+            alone[s].push(eng.par_step(&[s])?[0]);
+        }
+    }
+    // 2) all streams in one batch (the prompts are cached now: started again from the same prompts)
+    let rows: Vec<usize> = (0..n).collect();
+    for s in 0..n {
+        let reused = eng.par_begin(s, &prompts[s], &[], &smp)?;
+        ensure!(reused + 1 == prompts[s].len(), "stream {s}: expected the whole prompt head from the cache, got {reused}");
+    }
+    let mut batch = vec![Vec::new(); n];
+    let t0 = Instant::now();
+    for _ in 0..n_gen {
+        for (s, t) in eng.par_step(&rows)?.into_iter().enumerate() {
+            batch[s].push(t);
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let mut exact = true;
+    for s in 0..n {
+        let same = alone[s].iter().zip(&batch[s]).take_while(|(a, b)| a == b).count();
+        exact &= same == n_gen;
+        println!("stream {s}: batched = alone for {same}/{n_gen} tokens");
+    }
+    println!("{n} streams x {n_gen} tokens: {:.1} tok/s in total, {:.1} tok/s per stream, {:.2} ms per step", (n * n_gen) as f64 / dt, n_gen as f64 / dt, dt * 1e3 / n_gen as f64);
+    // 3) single-stream generation on stream 0 (decode path) for comparison
+    eng.select_stream(0)?;
+    let t0 = Instant::now();
+    let single = eng.generate(&prompts[0], n_gen, &smp, |_| true)?;
+    let dt1 = t0.elapsed().as_secs_f64();
+    let same = single.iter().zip(&batch[0]).take_while(|(a, b)| a == b).count();
+    println!("single stream: {:.1} tok/s; stream 0 agrees with it for {same}/{n_gen} tokens", n_gen as f64 / dt1);
+    let s: String = batch[n - 1].iter().map(|&t| String::from_utf8_lossy(&tok.token_bytes(t, true)).into_owned()).collect();
+    println!("stream {}: {}", n - 1, s.chars().take(240).collect::<String>().replace('\n', " "));
+    // more than 6 rows run the projections on the tensor-core GEMM instead of the batched matvec (another
+    // summation order); INKLING_NO_MV_B=1 uses the GEMM for every row count, then the comparison is exact again
+    if n > 6 && std::env::var_os("INKLING_NO_MV_B").is_none() {
+        if !exact {
+            println!("note: with more than 6 streams the projections use another kernel; run with INKLING_NO_MV_B=1 for an exact comparison");
+        }
+        return Ok(());
+    }
+    ensure!(exact, "batched steps differ from single-row steps");
+    Ok(())
+}
+
+/// Short-chain check: logits of 1..8 tokens processed as one chunk vs. the same tokens decoded one at a time.
+fn chaintest(model: &str) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, 8192)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let base = tok.encode(include_str!("../../../tests/data/prompt_long.txt"), false)?;
+    let nv = eng.cfg.n_vocab_unpadded;
+    let n0 = 800;
+    let lsm = |r: &[f32]| {
+        let m = r.iter().cloned().fold(f32::MIN, f32::max);
+        let z: f64 = r.iter().map(|&v| ((v - m) as f64).exp()).sum();
+        r.iter().map(|&v| (v - m) as f64 - z.ln()).collect::<Vec<f64>>()
+    };
+    let argmax = |r: &[f32]| r.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    for t in [1usize, 2, 3, 5, 8] {
+        let toks = &base[n0..n0 + t];
+        eng.prefill_fresh(&base[..n0])?;
+        let chain = eng.chunk_rows(toks, n0)?;
+        eng.prefill_fresh(&base[..n0])?;
+        let mut kl_max = 0f64;
+        let mut agree = 0;
+        for (i, &tk) in toks.iter().enumerate() {
+            let r = eng.step(tk, n0 + i, None)?;
+            let c = &chain[i * nv..(i + 1) * nv];
+            let (p, q) = (lsm(&r), lsm(c));
+            let kl: f64 = p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum();
+            kl_max = kl_max.max(kl);
+            agree += (argmax(&r) == argmax(c)) as usize;
+        }
+        println!("T={t}: max KL(step || chain) {kl_max:.5}, argmax agree {agree}/{t}");
+    }
+    Ok(())
+}
+
+/// Timing study for speculative decoding: one decode step vs. one t-token verify pass at a given depth.
+fn specbench(model: &str, depth: usize) -> Result<()> {
+    let mut eng = inkling_engine::Engine::load(model, depth + 64)?;
+    let tok = inkling_core::Tokenizer::from_gguf(&inkling_core::Gguf::open(model)?)?;
+    let base = tok.encode(include_str!("../../../tests/data/prompt_long.txt"), false)?;
+    let fill: Vec<u32> = base.iter().copied().cycle().take(depth).collect();
+    if depth > 0 {
+        eng.prefill_fresh(&fill)?;
+    }
+    let ts: Vec<usize> = match std::env::var("INKLING_SPEC_TS") {
+        Ok(v) => v.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?,
+        Err(_) => vec![1, 2, 3, 4, 5, 6, 8, 12, 16],
+    };
+    let (dec, ver) = eng.bench_verify(depth, &ts, 50)?;
+    println!("depth {}: decode step {dec:.2} ms ({:.1} tok/s)", fmt_tokens(depth), 1e3 / dec);
+    println!("{:>4} {:>10} {:>10} {:>16}", "t", "verify ms", "x decode", "break-even acc");
+    for (t, v) in ts.iter().zip(&ver) {
+        // tokens per verify pass needed to match plain decode
+        println!("{t:>4} {v:>10.2} {:>10.2} {:>16.2}", v / dec, v / dec);
+    }
+    if let Some(b) = eng.moe_b_tl.as_ref() {
+        // phase timeline of the last short-chain MoE launch: median block, us since the earliest start
+        let raw = eng.gpu.read_f32(b.ptr, b.bytes / 4)?;
+        let v: Vec<u64> = raw.chunks(2).map(|c| c[0].to_bits() as u64 | (c[1].to_bits() as u64) << 32).collect();
+        let nb = (v.len() - 4) / 8;
+        let st = &v[nb * 8..];
+        println!("  union: {:.1} experts per layer on average ({:.1} on FP4 layers, {} launches)", st[0] as f64 / st[1].max(1) as f64, st[2] as f64 / st[3].max(1) as f64, st[1]);
+        let t0 = (0..nb).map(|i| v[i * 8]).min().unwrap_or(0);
+        let names = ["start", "A done", "Q start", "Q done", "B start", "B done", "C start", "end"];
+        for (k, nm) in names.iter().enumerate() {
+            let mut xs: Vec<f64> = (0..nb).map(|i| (v[i * 8 + k] - t0) as f64 / 1e3).collect();
+            xs.sort_by(f64::total_cmp);
+            println!("  {nm:>8}: median {:7.1} us, max {:7.1} us", xs[nb / 2], xs[nb - 1]);
+        }
+    }
+    Ok(())
+}
+
 fn generate(model: &str, prompt: &str, n_gen: usize) -> Result<()> {
     use std::io::Write;
     let mut eng = inkling_engine::Engine::load(model, 16384)?;
@@ -964,7 +1174,7 @@ fn attnbench(depth: usize, kv: &str, iters: usize) -> Result<()> {
         gpu.launch(name, (8, ns), 128, &[
             Arg::Ptr(qb.ptr), Arg::Ptr(rb.ptr), Arg::Ptr(sb.ptr), Arg::Ptr(kc.ptr), Arg::Ptr(vc.ptr), Arg::Ptr(relb.ptr), Arg::Ptr(gb.ptr),
             Arg::Ptr(out.ptr), Arg::Ptr(oq.ptr), Arg::Ptr(od.ptr), Arg::Ptr(step.ptr), Arg::I32(cap as i32), Arg::I32(window as i32), Arg::I32(1024),
-            Arg::Ptr(part.ptr), Arg::Ptr(cnt.ptr), Arg::I32(0), Arg::I32(0), Arg::I32(fmt),
+            Arg::Ptr(part.ptr), Arg::Ptr(cnt.ptr), Arg::I32(0), Arg::I32(0), Arg::I32(fmt), Arg::Ptr(0), Arg::Ptr(0), Arg::Ptr(0),
         ])
     };
     launch("ink_attn_split")?;

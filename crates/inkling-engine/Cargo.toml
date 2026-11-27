@@ -12,3 +12,4 @@ half.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 inkling-core = { path = "../inkling-core" }
 inkling-cuda = { path = "../inkling-cuda" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }

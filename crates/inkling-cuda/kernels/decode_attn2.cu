@@ -419,7 +419,8 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_mma(const float* __re
                                                                const float* __restrict__ gate, float* __restrict__ out,
                                                                int8_t* __restrict__ oq, float* __restrict__ od, const int* __restrict__ step,
                                                                int kv_cap, int window, int extent, float* __restrict__ part,
-                                                               unsigned int* __restrict__ counters, int qstride, int sstride, int kvfmt) {
+                                                               unsigned int* __restrict__ counters, int qstride, int sstride, int kvfmt,
+                                                               const int* __restrict__ rt, long long ks, long long vs) {
     using namespace da2;
     __shared__ __align__(16) float qs[NQ][HD];
     __shared__ float rs[NQ][16];
@@ -428,8 +429,14 @@ extern "C" __global__ void __launch_bounds__(128) ink_attn_mma(const float* __re
     __shared__ float ml[64][NQ][2];  // NS <= 64
     __shared__ bool last;
     // batched prefill: query token t = grid.z at position step[1] + t (its K/V are already in the cache)
+    // parallel streams (rt != null): token tq of stream s = rt[2 tq] at rt[2 tq + 1], caches s * ks / s * vs bytes in
     const int tq = blockIdx.z;
-    const int pos = step[1] + tq;
+    int pos = step[1] + tq;
+    if (rt) {
+        pos = rt[2 * tq + 1];
+        Kc = (const char*)Kc + rt[2 * tq] * ks;
+        Vc = (const char*)Vc + rt[2 * tq] * vs;
+    }
     q += (size_t)tq * qstride;
     r += (size_t)tq * qstride;
     gate += (size_t)tq * qstride;

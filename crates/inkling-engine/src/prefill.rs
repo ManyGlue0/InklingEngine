@@ -31,8 +31,8 @@ impl Q8 {
 }
 
 pub(crate) struct PrefillBufs {
-    tokens: DevBuf,
-    step: DevBuf,
+    pub(crate) tokens: DevBuf,
+    pub(crate) step: DevBuf,
     x: DevBuf,
     xp: DevBuf,
     xprev: DevBuf,
@@ -72,7 +72,27 @@ pub(crate) struct PrefillBufs {
     fa: DevBuf,
     ic: DevBuf,
     im: DevBuf,
+    // short-chain MoE (ink_moe8b, T <= MOE_B_MAX): expert hidden h [8T][F] float, int8 copy + scales per 16
+    bh: DevBuf,
+    bhq: DevBuf,
+    bhd: DevBuf,
 }
+
+/// Options of a batched forward pass: feature capture for the drafter (`feat` != 0: tap j's input residual
+/// rows go to feat + j * FEAT_ROWS * D, taps[0..3] are layer visits, tap 3 the final-norm output) and deferred conv
+/// states (`hist` != 0: per-slot input history, see spec::hist_offset; chunks of at most spec::HIST_T tokens).
+/// `rt` != 0: parallel streams, row r is one token of stream rt[2r] at position rt[2r + 1] (device i32 table; at most
+/// MOE_B_MAX rows, distinct streams).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ChunkOpts {
+    pub feat: u64,
+    pub taps: [usize; 3],
+    pub hist: u64,
+    pub rt: u64,
+}
+
+/// Longest chunk the short-chain MoE kernel takes (ink_moe8b TMAX).
+pub(crate) const MOE_B_MAX: usize = 8;
 
 const LOGIT_ROWS: usize = 64;
 /// Floats of split-K scratch for ink_sgemm.
@@ -126,6 +146,9 @@ impl PrefillBufs {
             fa: f(tp * d)?,
             ic: f(tp)?,
             im: f(tp)?,
+            bh: f(8 * MOE_B_MAX * cfg.n_ff_exp)?,
+            bhq: gpu.alloc(8 * MOE_B_MAX * cfg.n_ff_exp)?,
+            bhd: f(8 * MOE_B_MAX * cfg.n_ff_exp / 16)?,
         })
     }
 }
@@ -153,6 +176,15 @@ impl Engine {
         Ok(out)
     }
 
+    /// Process `tokens` at positions `pos0..` on top of the current state (one chunk) and return their soft-capped
+    /// logits, row-major [n][vocab] (validation of the short-chain path).
+    pub fn chunk_rows(&mut self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(tokens.len() * self.cfg.n_vocab_unpadded);
+        self.cache = crate::PromptCache::default();
+        self.prefill_chunk(tokens, pos0, Some(&mut |_, row: &[f32]| out.extend_from_slice(row)))?;
+        Ok(out)
+    }
+
     /// Prefill a fresh sequence and call `f(position, logits)` for every position (long-context evaluation without
     /// holding all logits in memory).
     pub fn prefill_each(&mut self, tokens: &[u32], f: &mut dyn FnMut(usize, &[f32])) -> Result<()> {
@@ -171,7 +203,7 @@ impl Engine {
         self.gpu.launch(k, (1, t as u32), 768, &[Arg::MixQ(MixArgsQ { m, xq: xq.0, xd: xq.1 })])
     }
 
-    fn pre_norm(&self, items: &[(u64, u64, u64, (u64, u64))], t: usize) -> Result<()> {
+    pub(crate) fn pre_norm(&self, items: &[(u64, u64, u64, (u64, u64))], t: usize) -> Result<()> {
         let mut a = NormQ4::default();
         for (j, &(x, w, y, (q, d))) in items.iter().enumerate() {
             a.x[j] = x;
@@ -184,7 +216,17 @@ impl Engine {
     }
 
     /// int8 GEMM segments (weights, (xq, xd), y, rows, ldy), shared K.
-    fn pre_gemm(&self, segs: &[(weights::Q8M, (u64, u64), u64, usize, usize)], k: usize, t: usize) -> Result<()> {
+    pub(crate) fn pre_gemm(&self, segs: &[(weights::Q8M, (u64, u64), u64, usize, usize)], k: usize, t: usize) -> Result<()> {
+        if t <= 6 && segs.len() <= 4 && segs.iter().all(|s| s.0.fmt == 0) && std::env::var_os("INKLING_NO_MV_B").is_none() {
+            // short chain: every weight row read once for all t tokens
+            let mut a = inkling_cuda::MvQB4 { nseg: segs.len() as i32, k: k as i32, t: t as i32, ..Default::default() };
+            let mut rows = 0;
+            for (i, &(w, (x, xd), y, n, ldy)) in segs.iter().enumerate() {
+                a.s[i] = inkling_cuda::MvSegQB { qs: w.qs, d: w.d, xq: x, xd, y, n: n as i32, ldy: ldy as i32 };
+                rows += n;
+            }
+            return self.gpu.launch("ink_mv_q8q_b", (rows.div_ceil(8) as u32, 1), 256, &[Arg::MvQB(a)]);
+        }
         if segs.len() > 4 || segs.iter().any(|s| s.0.fmt != 0) || std::env::var_os("INKLING_GEN_DENSE").is_some() {
             ensure!(segs.len() <= 8, "pre_gemm: too many segments");
             let mut a = inkling_cuda::GemmGen { nseg: segs.len() as i32, t: t as i32, k: k as i32, ..Default::default() };
@@ -233,6 +275,22 @@ impl Engine {
         ensure!(lp.f16, "batched loop controls need F16 loop weights");
         let p = self.pre.as_ref().unwrap();
         let (d, r) = (self.cfg.n_embd, self.cfg.gate_rank);
+        if t <= 16 && std::env::var_os("INKLING_NO_CTRL_B").is_none() {
+            // short chunk: the decode kernels with a token grid dimension, all controls in one launch each
+            let mut a = inkling_cuda::Ctrl4 { n: ctrls.len() as i32, ..Default::default() };
+            for (j, &(idx, c, m, out)) in ctrls.iter().enumerate() {
+                a.c[j] = c;
+                a.m[j] = m;
+                a.wd[j] = lp.down[idx];
+                a.wg[j] = lp.gain[idx];
+                a.wf[j] = lp.forget[idx];
+                a.g[j] = p.g.at(j * t * r * F32);
+                a.out[j] = out;
+            }
+            let n = ctrls.len() as u32;
+            self.gpu.launch3("ink_ctrl_down2", (r as u32, n, t as u32), 192, &[Arg::Ctrl(a), Arg::I32(d as i32), Arg::I32(r as i32)])?;
+            return self.gpu.launch3("ink_ctrl_up_h", ((d / 8) as u32, n, t as u32), 256, &[Arg::Ctrl(a), Arg::I32(d as i32), Arg::I32(r as i32)]);
+        }
         let g = p.g.ptr; // [T][R]
         for &(idx, c, m, out) in ctrls {
             self.gpu.launch("ink_rowrms", (t as u32, 1), 256, &[Arg::Ptr(c), Arg::I32(d as i32), Arg::I32(d as i32), Arg::Ptr(p.ic.ptr), Arg::F32(1e-6)])?;
@@ -249,19 +307,36 @@ impl Engine {
         Ok(())
     }
 
-    fn pre_conv_res(&self, xin: u64, w: u64, state: u64, x: u64, accumulate: bool, t: usize) -> Result<()> {
+    /// Post conv + residual; `hist` != 0 defers the state update (the inputs are kept there for `commit_conv`).
+    /// `rt` != 0: parallel streams (row table, states `cs` floats apart).
+    fn pre_conv_res(&self, xin: u64, w: u64, state: u64, x: u64, accumulate: bool, t: usize, hist: u64, rt: u64, cs: usize) -> Result<()> {
         let d = self.cfg.n_embd;
         self.gpu.launch("ink_conv_res_b", (d.div_ceil(256) as u32, t as u32), 256, &[
-            Arg::Ptr(xin), Arg::Ptr(w), Arg::Ptr(state), Arg::Ptr(x), Arg::I32(accumulate as i32), Arg::I32(d as i32),
+            Arg::Ptr(xin), Arg::Ptr(w), Arg::Ptr(state), Arg::Ptr(x), Arg::I32(accumulate as i32), Arg::I32(d as i32), Arg::Ptr(rt), Arg::I32(cs as i32),
         ])?;
-        self.conv_state(xin, state, d, t)
+        self.conv_adv(xin, state, d, t, hist, rt, cs)
+    }
+
+    /// Advance a conv state past the chunk, or (hist != 0) keep its inputs for a later commit; with a row table
+    /// (`rt` != 0) each row advances its own stream's state by one input.
+    fn conv_adv(&self, x: u64, state: u64, ch: usize, t: usize, hist: u64, rt: u64, cs: usize) -> Result<()> {
+        if rt != 0 {
+            return self.gpu.launch("ink_conv_state_m", (ch.div_ceil(256) as u32, t as u32), 256, &[
+                Arg::Ptr(x), Arg::Ptr(rt), Arg::Ptr(state), Arg::I32(cs as i32), Arg::I32(ch as i32),
+            ]);
+        }
+        match hist {
+            0 => self.conv_state(x, state, ch, t),
+            h if h == x => Ok(()), // already written there
+            h => self.copy_n(x, h, t * ch * F32),
+        }
     }
 
     fn conv_state(&self, x: u64, state: u64, ch: usize, t: usize) -> Result<()> {
         self.gpu.launch("ink_conv_state_b", (ch.div_ceil(256) as u32, 1), 256, &[Arg::Ptr(x), Arg::I32(t as i32), Arg::Ptr(state), Arg::I32(ch as i32)])
     }
 
-    fn copy_n(&self, src: u64, dst: u64, bytes: usize) -> Result<()> {
+    pub(crate) fn copy_n(&self, src: u64, dst: u64, bytes: usize) -> Result<()> {
         unsafe { inkling_cuda::cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.gpu.stream.cu_stream()) }?;
         Ok(())
     }
@@ -328,6 +403,24 @@ impl Engine {
         let t = tokens.len();
         ensure!(t > 0 && t <= PREFILL_CHUNK, "bad chunk length");
         ensure!(pos0 + t <= self.n_ctx, "prompt exceeds the context ({})", self.n_ctx);
+        self.upload_chunk(tokens, pos0)?;
+        self.enqueue_chunk(t, pos0, ChunkOpts::default())?;
+        if let Some(out) = logits_out {
+            self.chunk_logits(t, pos0, out)?;
+        }
+        Ok(())
+    }
+
+    /// Chunk inputs: token ids and the start position (read on the device, so an enqueued chunk is replayable).
+    pub(crate) fn upload_chunk(&self, tokens: &[u32], pos0: usize) -> Result<()> {
+        let p = self.pre.as_ref().expect("prefill buffers");
+        let ids: Vec<i32> = tokens.iter().map(|&x| if x >= crate::EMBED_TOKEN_BASE { 0 } else { x as i32 }).collect();
+        self.gpu.write(p.tokens.ptr, inkling_cuda::as_bytes(&ids))?;
+        self.gpu.write(p.step.ptr, inkling_cuda::as_bytes(&[0i32, pos0 as i32, 0, 0]))
+    }
+
+    /// The forward pass of a chunk of `t` tokens (inputs already uploaded); `pos0` only places image rows.
+    pub(crate) fn enqueue_chunk(&self, t: usize, pos0: usize, o: ChunkOpts) -> Result<()> {
         let p = self.pre.as_ref().expect("prefill buffers");
         let cfg = &self.cfg;
         let (d, kvw, qd, r) = (cfg.n_embd, cfg.n_head_kv * cfg.head_dim, cfg.n_head * cfg.head_dim, cfg.gate_rank);
@@ -337,9 +430,6 @@ impl Engine {
         let row = |j: usize| j * td * F32; // j-th [T][D] slab
         let nqv = |j: usize| p.nq.at(j * td);
 
-        let ids: Vec<i32> = tokens.iter().map(|&x| if x >= crate::EMBED_TOKEN_BASE { 0 } else { x as i32 }).collect();
-        self.gpu.write(p.tokens.ptr, inkling_cuda::as_bytes(&ids))?;
-        self.gpu.write(p.step.ptr, inkling_cuda::as_bytes(&[0i32, pos0 as i32, 0, 0]))?;
         if self.w.token_embd_fmt == 8 {
             self.gpu.launch("ink_embed_b", (t as u32, 1), 256, &[
                 Arg::Ptr(self.w.token_embd), Arg::Ptr(p.tokens.ptr), Arg::Ptr(self.w.token_embd_norm), Arg::Ptr(p.x.ptr), Arg::I32(d as i32), Arg::F32(cfg.rms_eps),
@@ -364,7 +454,13 @@ impl Engine {
         let mut bank: Vec<u64> = Vec::new();
         let mut n_push = 0usize;
 
-        for ps in cfg.schedule() {
+        for (vi, ps) in cfg.schedule().into_iter().enumerate() {
+            if o.feat != 0 {
+                if let Some(j) = o.taps.iter().position(|&v| v == vi) {
+                    self.copy_n(p.x.ptr, o.feat + (j * crate::dspark::FEAT_ROWS * d * F32) as u64, td * F32)?;
+                }
+            }
+            let hist = |site: usize| if o.hist != 0 { o.hist + crate::spec::hist_offset(ps.slot, site, d) as u64 } else { 0 };
             let lw = self.w.layers[ps.phys];
             if ps.phys == cfg.core_start {
                 if ps.pass == 0 {
@@ -377,7 +473,9 @@ impl Engine {
                     blocks = prelude_blocks.clone();
                 }
             }
-            let slot = &self.slots[ps.slot];
+            // parallel streams: stream 0's buffers, the kernels add each row's stream offset
+            let slot = if o.rt != 0 { self.slot_base(ps.slot) } else { self.slots[ps.slot] };
+            let (ks, vs, cs) = if o.rt != 0 { self.stream_strides(ps.slot) } else { (0, 0, 0) };
             let (conv_k, conv_v) = (slot.conv.ptr, slot.conv.at(3 * kvw * F32));
             let (conv_attn, conv_ffn) = (slot.conv.at(6 * kvw * F32), slot.conv.at((6 * kvw + 3 * d) * F32));
             let looped = ps.pass > 0;
@@ -428,8 +526,12 @@ impl Engine {
 
             // projections
             let mut segs: Vec<_> = self.qrg_segs(&lw, nqv(iq), p.qrg.ptr).into_iter().map(|(w, x, y, n)| (w, x, y, n, qs)).collect();
-            segs.push((lw.wk, nqv(ik), p.kraw.ptr, kvw, kvw));
-            segs.push((lw.wv, nqv(iv), p.vraw.ptr, kvw, kvw));
+            // deferred conv states: the conv inputs are written straight into the history
+            let kraw = if o.hist != 0 { hist(0) } else { p.kraw.ptr };
+            let vraw = if o.hist != 0 { hist(1) } else { p.vraw.ptr };
+            let proj = if o.hist != 0 { hist(2) } else { p.proj.ptr };
+            segs.push((lw.wk, nqv(ik), kraw, kvw, kvw));
+            segs.push((lw.wv, nqv(iv), vraw, kvw, kvw));
             self.pre_gemm(&segs, d, t)?;
             let nkc = cfg.n_head_kv * cfg.n_conv;
             let mut mb = MvB4 { k: d as i32, ..Default::default() };
@@ -445,24 +547,31 @@ impl Engine {
             self.gpu.launch("ink_mv_bf16b", (rows.div_ceil(8) as u32, t as u32), 256, &[Arg::MvB(mb), Arg::I32(ss as i32)])?;
             // K/V convs + clip/norm + cache write, q/r clip + tau
             self.gpu.launch("ink_attn_prep_b", (64, t as u32), 128, &[
-                Arg::Ptr(p.qrg.ptr), Arg::I32(qs as i32), Arg::I32(qd as i32), Arg::Ptr(p.kraw.ptr), Arg::Ptr(p.vraw.ptr),
+                Arg::Ptr(p.qrg.ptr), Arg::I32(qs as i32), Arg::I32(qd as i32), Arg::Ptr(kraw), Arg::Ptr(vraw),
                 Arg::Ptr(lw.q_clip), Arg::Ptr(lw.rel_clip), Arg::Ptr(lw.k_conv), Arg::Ptr(lw.v_conv), Arg::Ptr(conv_k), Arg::Ptr(conv_v),
                 Arg::Ptr(p.sink.at(cfg.n_head * F32)), Arg::I32(ss as i32), Arg::I32(!lw.is_swa as i32), Arg::Ptr(p.step.ptr),
                 Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(!lw.is_swa as i32),
                 Arg::F32(cfg.qk_clip), Arg::F32(cfg.rel_clip), Arg::F32(cfg.log_scale_floor), Arg::F32(cfg.log_scale_alpha), Arg::F32(cfg.rms_eps),
                 Arg::I32(self.kv_bits(lw.is_swa).0), Arg::I32(self.kv_bits(lw.is_swa).1), Arg::I32(slot.kv_fmt),
+                Arg::Ptr(o.rt), Arg::Ptr(ks as u64), Arg::Ptr(vs as u64), Arg::I32(cs as i32),
             ])?;
-            self.conv_state(p.kraw.ptr, conv_k, kvw, t)?;
-            self.conv_state(p.vraw.ptr, conv_v, kvw, t)?;
+            self.conv_adv(kraw, conv_k, kvw, t, hist(0), o.rt, cs)?;
+            self.conv_adv(vraw, conv_v, kvw, t, hist(1), o.rt, cs)?;
             let window = if lw.is_swa { cfg.n_swa as i32 } else { 0 };
             let (oq, od) = p.attq.at(0);
-let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
-            if let Some(k @ ("split" | "mma")) = pre_attn.as_deref() {
-                            self.gpu.launch3(if k == "mma" { "ink_attn_mma" } else { "ink_attn_split" }, (cfg.n_head_kv as u32, PRE_SPLITS as u32, t as u32), 128, &[
+            // short chunks (speculative verify): the decode attention per token with decode's position splits (the
+            // prefill kernel would run only n_head blocks); INKLING_PRE_ATTN=split|mma|prefill forces a kernel
+            let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
+            let short = (t <= 16 && pre_attn.as_deref() != Some("prefill")) || o.rt != 0;
+            if short || matches!(pre_attn.as_deref(), Some("split" | "mma")) {
+                let splits = if short { self.attn_splits as usize } else { PRE_SPLITS };
+                let k = if pre_attn.as_deref() == Some("split") && o.rt == 0 { "ink_attn_split" } else { "ink_attn_mma" };
+                self.gpu.launch3(k, (cfg.n_head_kv as u32, splits as u32, t as u32), 128, &[
                 Arg::Ptr(p.qrg.ptr), Arg::Ptr(p.qrg.at(qd * F32)), Arg::Ptr(p.sink.ptr), Arg::Ptr(slot.k.ptr), Arg::Ptr(slot.v.ptr),
                 Arg::Ptr(lw.rel_bias), Arg::Ptr(p.qrg.at((qd + cfg.n_head * cfg.n_rel) * F32)), Arg::Ptr(p.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                 Arg::Ptr(p.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
                 Arg::Ptr(p.part.ptr), Arg::Ptr(p.cnt.ptr), Arg::I32(qs as i32), Arg::I32(ss as i32), Arg::I32(slot.kv_fmt),
+                Arg::Ptr(o.rt), Arg::Ptr(ks as u64), Arg::Ptr(vs as u64),
             ])?;
             } else {
                 self.gpu.launch("ink_attn_prefill", (t.div_ceil(64) as u32, cfg.n_head as u32), 128, &[
@@ -472,11 +581,11 @@ let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
                     Arg::Ptr(p.att.ptr), Arg::Ptr(oq), Arg::Ptr(od), Arg::I32(slot.kv_fmt),
                 ])?;
             }
-            self.pre_gemm(&[(lw.wo, (oq, od), p.proj.ptr, d, d)], qd, t)?;
+            self.pre_gemm(&[(lw.wo, (oq, od), proj, d, d)], qd, t)?;
             if let Some(dst) = inp_copy {
                 blocks.push(dst);
             }
-            self.pre_conv_res(p.proj.ptr, lw.attn_post_conv, conv_attn, p.x.ptr, inp_copy.is_none(), t)?;
+            self.pre_conv_res(proj, lw.attn_post_conv, conv_attn, p.x.ptr, inp_copy.is_none(), t, hist(2), o.rt, cs)?;
 
             // FFN input
             let mut st = blocks.clone();
@@ -492,11 +601,30 @@ let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
 
             // MoE: router, routing, grouped expert GEMMs, weighted combine, post conv + residual
             let k = cfg.n_expert_used;
-            self.sgemm(p.fnorm.ptr, d, lw.router, d, false, p.rlog.ptr, cfg.n_expert, 0, false, t, cfg.n_expert, d)?;
+            if t <= 16 && std::env::var_os("INKLING_NO_ROUTER_B").is_none() {
+                self.gpu.launch("ink_router_b", (cfg.n_expert as u32, t as u32), 192, &[Arg::Ptr(p.fnorm.ptr), Arg::Ptr(lw.router), Arg::Ptr(p.rlog.ptr), Arg::I32(cfg.n_expert as i32)])?;
+            } else {
+                self.sgemm(p.fnorm.ptr, d, lw.router, d, false, p.rlog.ptr, cfg.n_expert, 0, false, t, cfg.n_expert, d)?;
+            }
             self.gpu.launch("ink_topk_b", (t as u32, 1), 32, &[
                 Arg::Ptr(p.rlog.ptr), Arg::Ptr(lw.probs_bias), Arg::Ptr(p.sel.ptr), Arg::Ptr(p.wts.ptr), Arg::I32(cfg.n_expert as i32),
                 Arg::I32(k as i32), Arg::F32(cfg.expert_weights_scale),
             ])?;
+            let on_gpu = self.cpu.as_ref().is_none_or(|c| !c.plan.on_cpu[ps.phys]);
+            if t <= MOE_B_MAX && self.moe_blocks > 0 && on_gpu && lw.gate_up.fmt.tuned() && lw.down.fmt.tuned()
+                && std::env::var_os("INKLING_NO_MOE_B").is_none()
+            {
+                // short chain: gate_up + down + expert sum + causal post conv + residual, one persistent kernel
+                let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt.code(), erange: 0 };
+                self.gpu.launch(if t <= 4 { "ink_moe8b4" } else { "ink_moe8b8" }, (self.moe_blocks, 1), 256, &[
+                    Arg::Exp(ew(lw.gate_up)), Arg::Exp(ew(lw.down)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(p.sel.ptr), Arg::Ptr(p.wts.ptr),
+                    Arg::I32(t as i32), Arg::Ptr(p.bh.ptr), Arg::Ptr(p.bhq.ptr), Arg::Ptr(p.bhd.ptr), Arg::Ptr(p.ya.ptr),
+                    Arg::Ptr(lw.ffn_post_conv), Arg::Ptr(conv_ffn), Arg::Ptr(p.x.ptr), Arg::Ptr(hist(3)), Arg::Ptr(self.act.bar.ptr),
+                    Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta), Arg::Ptr(self.moe_b_tl.as_ref().map_or(0, |b| b.ptr)),
+                    Arg::Ptr(o.rt), Arg::I32(cs as i32),
+                ])?;
+                continue;
+            }
             let na = t * k;
             self.gpu.launch("ink_moe_route", (1, 1), 1024, &[
                 Arg::Ptr(p.sel.ptr), Arg::I32(na as i32), Arg::Ptr(p.alist.ptr), Arg::Ptr(p.inv.ptr), Arg::Ptr(p.tiles.ptr), Arg::Ptr(p.ntiles.ptr),
@@ -516,37 +644,95 @@ let pre_attn = std::env::var("INKLING_PRE_ATTN").ok();
             self.gpu.launch("ink_moe_combine", (d.div_ceil(256) as u32, t as u32), 256, &[
                 Arg::Ptr(p.ya.ptr), Arg::Ptr(p.inv.ptr), Arg::Ptr(p.sel.ptr), Arg::Ptr(p.wts.ptr), Arg::Ptr(lw.down.scale), Arg::Ptr(p.ysum.ptr), Arg::I32(d as i32),
             ])?;
-            self.pre_conv_res(p.ysum.ptr, lw.ffn_post_conv, conv_ffn, p.x.ptr, true, t)?;
+            self.pre_conv_res(p.ysum.ptr, lw.ffn_post_conv, conv_ffn, p.x.ptr, true, t, hist(3), o.rt, cs)?;
         }
         let _ = r;
 
-        // output head (validation path): logits of every position
-        if let Some(out) = logits_out {
-            let mut st = blocks.clone();
-            st.push(p.x.ptr);
-            let fq = p.fq.at(0);
-            self.pre_mix(&st, self.w.output_res_query, 1, p.f.ptr, p.fnorm.ptr, [self.w.output_norm, 0, 0, 0], fq, t)?;
-            if self.pre.as_ref().unwrap().logits.is_none() {
-                let b = self.gpu.alloc(LOGIT_ROWS * self.cfg.n_vocab * F32)?;
-                self.pre.as_mut().unwrap().logits = Some(b);
-            }
-            let p = self.pre.as_ref().unwrap();
-            let lg = p.logits.as_ref().unwrap();
-            let (nv, nvu, cap) = (self.cfg.n_vocab, self.cfg.n_vocab_unpadded, self.cfg.final_softcap);
-            for r0 in (0..t).step_by(LOGIT_ROWS) {
-                let rows = LOGIT_ROWS.min(t - r0);
-                let (xq, xd) = p.fq.at(r0 * d);
-                self.pre_gemm(&[(self.w.output, (xq, xd), lg.ptr, nv, nv)], d, rows)?;
-                let v = self.gpu.read_f32(lg.ptr, rows * nv)?;
-                let mut row = vec![0f32; nvu];
-                for rr in 0..rows {
-                    for (o, &z) in row.iter_mut().zip(&v[rr * nv..rr * nv + nvu]) {
-                        *o = cap * (z / cap).tanh();
-                    }
-                    out(pos0 + r0 + rr, &row);
+        // output head input (normalized, q8_1 in fq) of every position; only the logits paths read it
+        let mut st = blocks.clone();
+        st.push(p.x.ptr);
+        self.pre_mix(&st, self.w.output_res_query, 1, p.f.ptr, p.fnorm.ptr, [self.w.output_norm, 0, 0, 0], p.fq.at(0), t)?;
+        if o.feat != 0 {
+            // the last feature tap: the final-norm output
+            self.copy_n(p.fnorm.ptr, o.feat + (3 * crate::dspark::FEAT_ROWS * d * F32) as u64, td * F32)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn logit_rows(&mut self) -> Result<u64> {
+        if self.pre.as_ref().unwrap().logits.is_none() {
+            let b = self.gpu.alloc(LOGIT_ROWS * self.cfg.n_vocab * F32)?;
+            self.pre.as_mut().unwrap().logits = Some(b);
+        }
+        Ok(self.pre.as_ref().unwrap().logits.as_ref().unwrap().ptr)
+    }
+
+    /// Output head over rows r0..r0 + rows of the last chunk (rows <= LOGIT_ROWS), raw logits into the row buffer.
+    pub(crate) fn enqueue_head(&self, lg: u64, r0: usize, rows: usize) -> Result<()> {
+        let p = self.pre.as_ref().unwrap();
+        let nv = self.cfg.n_vocab;
+        self.pre_gemm(&[(self.w.output, p.fq.at(r0 * self.cfg.n_embd), lg, nv, nv)], self.cfg.n_embd, rows)
+    }
+
+    /// Output head (validation path): soft-capped logits of every position of the last chunk.
+    fn chunk_logits(&mut self, t: usize, pos0: usize, out: &mut dyn FnMut(usize, &[f32])) -> Result<()> {
+        let lg = self.logit_rows()?;
+        let (nv, nvu, cap) = (self.cfg.n_vocab, self.cfg.n_vocab_unpadded, self.cfg.final_softcap);
+        for r0 in (0..t).step_by(LOGIT_ROWS) {
+            let rows = LOGIT_ROWS.min(t - r0);
+            self.enqueue_head(lg, r0, rows)?;
+            let v = self.gpu.read_f32(lg, rows * nv)?;
+            let mut row = vec![0f32; nvu];
+            for rr in 0..rows {
+                for (o, &z) in row.iter_mut().zip(&v[rr * nv..rr * nv + nvu]) {
+                    *o = cap * (z / cap).tanh();
                 }
+                out(pos0 + r0 + rr, &row);
             }
         }
         Ok(())
+    }
+
+    /// Timing study for speculative decoding: milliseconds of one decode step and of one t-token verify pass
+    /// (the batched forward pass plus the output head on all t rows, replayed as a CUDA graph) at position `pos`.
+    /// The state must already hold `pos` tokens; conv states drift during the measurement (timing only).
+    pub fn bench_verify(&mut self, pos: usize, ts: &[usize], reps: usize) -> Result<(f64, Vec<f64>)> {
+        ensure!(self.cpu.is_none(), "bench_verify: no CPU offload");
+        ensure!(pos + ts.iter().max().copied().unwrap_or(1) <= self.n_ctx, "bench_verify: context too small");
+        let lg = self.logit_rows()?;
+        // decode: graph replay, one step after another
+        for _ in 0..3 {
+            self.run(1000, pos, None)?;
+        }
+        self.gpu.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            self.run(1000, pos, None)?;
+        }
+        self.gpu.sync()?;
+        let dec = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        let mut out = Vec::new();
+        for &t in ts {
+            let toks: Vec<u32> = (0..t as u32).map(|i| 1000 + i).collect();
+            self.upload_chunk(&toks, pos)?;
+            self.gpu.sync()?;
+            self.gpu.stream.begin_capture(inkling_cuda::cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let r = self.enqueue_chunk(t, pos, ChunkOpts::default()).and_then(|_| self.enqueue_head(lg, 0, t));
+            let g = self.gpu.stream.end_capture(inkling_cuda::cudarc::driver::sys::CUgraphInstantiate_flags(0))?;
+            r?;
+            let g = g.expect("graph");
+            for _ in 0..3 {
+                g.launch()?;
+            }
+            self.gpu.sync()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                g.launch()?;
+            }
+            self.gpu.sync()?;
+            out.push(t0.elapsed().as_secs_f64() * 1e3 / reps as f64);
+        }
+        self.cache = crate::PromptCache::default();
+        Ok((dec, out))
     }
 }

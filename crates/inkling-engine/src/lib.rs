@@ -7,9 +7,13 @@
 mod codec_tables;
 pub mod codecs;
 pub mod cpu_moe;
+mod dflash2;
+mod dspark;
 pub mod offload;
+mod parallel;
 mod prefill;
 pub mod repack;
+mod spec;
 pub mod vision;
 pub mod weights;
 
@@ -18,6 +22,7 @@ use inkling_core::{Config, Gguf};
 use inkling_cuda::cudarc::driver::{CudaGraph, sys};
 use inkling_cuda::{Arg, Ctrl4, DevBuf, ExpW, GemmArgs, GemmSeg, Gpu, HostMapped, MixArgs, MixArgsQ, MvB4, MvQ4, MvSegB, MvSegQ, NormQ4};
 
+pub use spec::SpecStats;
 pub use vision::{Image, ImageEmbed, Vision};
 pub use weights::{ExpertFmt, LayerW, Weights};
 
@@ -101,14 +106,47 @@ pub fn kv_bytes_per_token(cfg: &Config, k: KvType, v: KvType) -> usize {
     n_full * cfg.n_head_kv * (k.head_bytes() + v.head_bytes())
 }
 
-/// Per-slot recurrent state: KV cache + short-conv histories.
+/// A device range inside a larger allocation (one stream's part of a per-slot buffer).
+#[derive(Clone, Copy)]
+struct View {
+    ptr: u64,
+    bytes: usize,
+}
+
+impl View {
+    fn at(&self, off: usize) -> u64 {
+        debug_assert!(off <= self.bytes);
+        self.ptr + off as u64
+    }
+}
+
+/// Per-slot recurrent state of one stream: KV cache + short-conv histories.
+#[derive(Clone, Copy)]
 struct Slot {
-    k: DevBuf,
-    v: DevBuf,
+    k: View,
+    v: View,
     kv_cap: usize,
     /// packed cache format for the kernels: K type in bits 0..3, V type in bits 4..7 (KvType values)
     kv_fmt: i32,
-    conv: DevBuf, // [k: 3x1024][v: 3x1024][attn: 3xD][ffn: 3xD] floats
+    conv: View, // [k: 3x1024][v: 3x1024][attn: 3xD][ffn: 3xD] floats
+}
+
+/// Per-slot buffers of every stream: stream s's part starts s * (bytes / n_streams) in.
+struct SlotBufs {
+    k: DevBuf,
+    v: DevBuf,
+    conv: DevBuf,
+    kv_cap: usize,
+    kv_fmt: i32,
+}
+
+/// What a stream keeps while another one is selected (the selected stream's copy lives in the Engine).
+#[derive(Default)]
+struct StreamState {
+    cache: PromptCache,
+    graph: Option<CudaGraph>,
+    graph_pre: Option<CudaGraph>,
+    graph_dec: Option<CudaGraph>,
 }
 
 /// A q8_1 activation buffer: int8 values + one f32 scale per 32.
@@ -152,7 +190,7 @@ impl Sampling {
 }
 
 /// Penalty ring size (mirrors smp::RING in sample.cu).
-const PEN_RING: usize = 1024;
+pub(crate) const PEN_RING: usize = 1024;
 
 /// What the device state currently holds, for prompt caching across `generate` calls.
 #[derive(Default)]
@@ -161,6 +199,8 @@ struct PromptCache {
     tokens: Vec<u32>,
     /// conv-state snapshot taken right after prefilling `snap_tokens` (the previous prompt minus its last token)
     snap_tokens: Option<Vec<u32>>,
+    /// the drafter's KV cache also holds `tokens` (speculative decoding can continue from them)
+    drafted: bool,
 }
 
 /// CPU offload state: the expert executor, the host-mapped exchange block, one host-node context per layer, and
@@ -240,7 +280,17 @@ pub struct Engine {
     pub gpu: Gpu,
     pub cfg: Config,
     pub w: Weights,
+    /// the selected stream's view of every slot
     slots: Vec<Slot>,
+    slot_bufs: Vec<SlotBufs>,
+    /// parallel streams (--parallel): each has its own KV cache, conv states and prompt cache over n_ctx positions
+    n_streams: usize,
+    /// the stream single-sequence calls (generate, prefill, step) work on
+    stream: usize,
+    /// the other streams' state (index = stream; the selected stream's entry is empty)
+    streams: Vec<StreamState>,
+    /// batched decoding of several streams
+    par: Option<parallel::ParBufs>,
     act: Act,
     pub n_ctx: usize,
     graph: Option<CudaGraph>,
@@ -254,12 +304,27 @@ pub struct Engine {
     attn_splits: u32,
     /// INKLING_MOE_TL: per-slot, per-block phase timestamps of the persistent MoE kernel (u64 [slot][block][8])
     pub moe_tl: Option<DevBuf>,
+    /// INKLING_MOE_TL: per-block phase timestamps of the short-chain MoE kernel, last layer run (u64 [block][8])
+    pub moe_b_tl: Option<DevBuf>,
     /// batched prompt-processing buffers
     pre: Option<prefill::PrefillBufs>,
     cache: PromptCache,
     vision: Option<Vision>,
     /// image embeddings of the current request: (absolute position of the first row, rows)
     embeds: Vec<(usize, ImageEmbed)>,
+    /// speculative decoding: the drafter and the deferred conv-state history of a verify pass
+    draft: Option<spec::Drafter>,
+    /// drafted tokens per speculative pass
+    pub draft_n: usize,
+    /// use the drafter in generate (true by default once one is attached)
+    pub use_spec: bool,
+    /// speculative decoding counters, accumulated over generations
+    pub spec_stats: SpecStats,
+    spec_hist: Option<DevBuf>,
+    /// per-row sampler steps of a verify pass (i32 [HIST_T][4])
+    spec_steps: Option<DevBuf>,
+    /// captured speculative-decoding graphs by (kind, size): 0 = draft k, 1 = verify T, 2 = commit + inject n
+    spec_graphs: std::collections::HashMap<(u8, usize), CudaGraph>,
     /// MoE layers running on the CPU (declared last: dropped after the graphs that reference it)
     cpu: Option<CpuOffload>,
 }
@@ -268,7 +333,16 @@ pub struct Engine {
 pub type Capture<'a> = &'a mut dyn FnMut(usize, &Engine);
 
 impl Engine {
+    /// Load `model` with `n_ctx` positions of context. With INKLING_PARALLEL=N (--parallel) the context is split
+    /// into N streams of n_ctx / N positions each.
     pub fn load(model: &str, n_ctx: usize) -> Result<Self> {
+        let n_streams: usize = match std::env::var("INKLING_PARALLEL") {
+            Ok(v) if !v.is_empty() => v.parse().ok().filter(|n| (1..=parallel::MAX_STREAMS).contains(n)).with_context(|| format!("--parallel: expected 1 to {}, got `{v}`", parallel::MAX_STREAMS))?,
+            _ => 1,
+        };
+        ensure!(n_ctx / n_streams >= 1024, "--ctx {n_ctx} is too small for {n_streams} parallel streams (at least 1024 positions each)");
+        let total_ctx = n_ctx;
+        let n_ctx = n_ctx / n_streams;
         let g = Gguf::open(model)?;
         let cfg = Config::from_gguf(&g)?;
         // several kernels are specialised for Inkling 2 Mini's dimensions
@@ -277,7 +351,8 @@ impl Engine {
                 && cfg.n_head == 24 && cfg.n_head_kv == 8 && cfg.n_rel == 16,
             "unsupported model dimensions"
         );
-        ensure!(n_ctx >= 1 && n_ctx <= cfg.context_length, "--ctx {n_ctx} is outside the model's range (1 to {})", cfg.context_length);
+        ensure!(n_ctx >= 1 && total_ctx <= cfg.context_length * n_streams, "--ctx {total_ctx} is outside the model's range (1 to {})", cfg.context_length);
+        ensure!(n_ctx <= cfg.context_length, "--ctx {n_ctx} per stream is outside the model's range (1 to {})", cfg.context_length);
         let gpu = Gpu::new(0)?;
         let d = cfg.n_embd;
         let kvw = cfg.n_head_kv * cfg.head_dim;
@@ -292,9 +367,10 @@ impl Engine {
             .map(|s| {
                 let swa = cfg.is_swa[slot_phys[s]];
                 let cap = if swa { (cfg.n_swa + prefill::PREFILL_CHUNK).min(n_ctx) } else { n_ctx };
-                if swa { 2 * cap * kvw * 2 } else { cap * cfg.n_head_kv * (kv_k.head_bytes() + kv_v.head_bytes()) }
+                n_streams * if swa { 2 * cap * kvw * 2 } else { cap * cfg.n_head_kv * (kv_k.head_bytes() + kv_v.head_bytes()) }
             })
-            .sum();
+            .sum::<usize>()
+            + (n_streams - 1) * 2 * cfg.n_slots() * 3 * (2 * kvw + 2 * d) * F32;
         let weight_bytes: usize =
             g.tensors.iter().filter(|t| !(weights::embed_on_host() && t.name == "token_embd.weight")).map(|t| t.n_bytes).sum();
         let base_need = weight_bytes + kv_bytes + VRAM_FIXED;
@@ -304,7 +380,9 @@ impl Engine {
         let vram_free = offload::effective_free_vram(free_at_start, gpu.total_vram()?)?;
         let plan = offload::plan(&g, &cfg, base_need, vram_free, VRAM_MARGIN, n_ctx)?;
         let need = plan.vram_need;
-        check_vram(vram_free, need, &format!("this model at context {n_ctx}"))?;
+        let what = if n_streams > 1 { format!("this model with {n_streams} streams of {n_ctx} positions") } else { format!("this model at context {n_ctx}") };
+        check_vram(vram_free, need, &what)?;
+        ensure!(n_streams == 1 || plan.n_cpu() == 0, "--parallel needs the whole model on the GPU, but {} MoE layers would run on the CPU; use a smaller --ctx or fewer streams", plan.n_cpu());
         let mut w = Weights::load(&gpu, &g, &cfg, &plan.on_cpu)?;
         let cpu = if plan.n_cpu() > 0 {
             let threads = std::env::var("INKLING_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(cpu_moe::default_threads);
@@ -317,7 +395,7 @@ impl Engine {
         } else {
             None
         };
-        let mut slots = Vec::with_capacity(cfg.n_slots());
+        let mut slot_bufs = Vec::with_capacity(cfg.n_slots());
         for s in 0..cfg.n_slots() {
             // sliding-window ring: a prefill chunk writes its K/V before attending, so window + chunk - 1 must fit
             let swa = cfg.is_swa[slot_phys[s]];
@@ -326,14 +404,15 @@ impl Engine {
             // quality); sliding-window rings stay f16 (fixed size)
             let (fk, fv) = if swa { (KvType::F16, KvType::F16) } else { (kv_k, kv_v) };
             let kv_fmt = fk as i32 | (fv as i32) << 4;
-            slots.push(Slot {
-                k: gpu.alloc(cap * cfg.n_head_kv * fk.head_bytes())?,
-                v: gpu.alloc(cap * cfg.n_head_kv * fv.head_bytes())?,
+            slot_bufs.push(SlotBufs {
+                k: gpu.alloc(n_streams * cap * cfg.n_head_kv * fk.head_bytes())?,
+                v: gpu.alloc(n_streams * cap * cfg.n_head_kv * fv.head_bytes())?,
+                conv: gpu.alloc(n_streams * 3 * (2 * kvw + 2 * d) * F32)?,
                 kv_cap: cap,
                 kv_fmt,
-                conv: gpu.alloc(3 * (2 * kvw + 2 * d) * F32)?,
             });
         }
+        let slots = slot_bufs.iter().map(|b| SlotBufs::view(b, 0, n_streams)).collect();
         let f = |n: usize| gpu.alloc(n * F32);
         let qd = cfg.n_head * cfg.head_dim;
         let k = cfg.n_expert_used;
@@ -378,7 +457,7 @@ impl Engine {
             pen_ring: gpu.alloc(PEN_RING * 4)?,
             mask_on: gpu.alloc(4)?,
             mask: gpu.alloc(cfg.n_vocab.div_ceil(32) * 4)?,
-            snap: gpu.alloc(cfg.n_slots() * 3 * (2 * kvw + 2 * d) * F32)?,
+            snap: gpu.alloc(n_streams * cfg.n_slots() * 3 * (2 * kvw + 2 * d) * F32)?,
         };
         gpu.write(act.mask_on.ptr, inkling_cuda::as_bytes(&[0i32]))?;
         gpu.sync()?;
@@ -400,6 +479,7 @@ impl Engine {
         let attn_splits = std::env::var("INKLING_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(attn_slots / cfg.n_head_kv as u32).clamp(4, ATTN_SPLITS_MAX as u32);
         let pre = Some(prefill::PrefillBufs::new(&gpu, &cfg)?);
         let moe_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(cfg.n_slots() * moe_blocks as usize * 64)?) } else { None };
+        let moe_b_tl = if std::env::var_os("INKLING_MOE_TL").is_some() { Some(gpu.alloc(moe_blocks as usize * 64 + 32)?) } else { None };
         if std::env::var_os("INKLING_VRAM_DEBUG").is_some() {
             let free_now = gpu.free_vram()?;
             eprintln!("vram: estimated {need} B (fixed part {VRAM_FIXED}), used by load {} B", free_at_start.saturating_sub(free_now));
@@ -423,7 +503,16 @@ impl Engine {
                 c.moe.simd()
             );
         }
-        Ok(Self { gpu, cfg, w, slots, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, attn_splits, pre, cache: PromptCache::default(), vision: None, embeds: Vec::new(), cpu })
+        let par = Some(parallel::ParBufs::new(&gpu, &cfg, n_streams)?);
+        let streams = (0..n_streams).map(|_| StreamState::default()).collect();
+        let mut e = Self { gpu, cfg, w, slots, slot_bufs, n_streams, stream: 0, streams, par, act, n_ctx, graph: None, graph_pre: None, graph_dec: None, use_graph, moe_blocks, moe_tl, moe_b_tl, attn_splits, pre, cache: PromptCache::default(), vision: None, embeds: Vec::new(), draft: None, draft_n: 3, use_spec: true, spec_stats: SpecStats::default(), spec_hist: None, spec_steps: None, spec_graphs: Default::default(), cpu };
+        if let Ok(path) = std::env::var("INKLING_DRAFT") {
+            if let Ok(n) = std::env::var("INKLING_DRAFT_N") {
+                e.draft_n = n.parse().context("INKLING_DRAFT_N")?;
+            }
+            e.attach_draft(&path)?;
+        }
+        Ok(e)
     }
 
     /// One-line description of the CPU offload (None when everything runs on the GPU).
@@ -455,11 +544,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Zero all KV caches and conv states (start a new sequence).
+    /// Zero the selected stream's KV caches and conv states (start a new sequence).
     pub fn reset(&mut self) -> Result<()> {
         self.cache = PromptCache::default();
         for s in &self.slots {
-            for b in [&s.k, &s.v, &s.conv] {
+            for b in [s.k, s.v, s.conv] {
                 unsafe { inkling_cuda::cudarc::driver::result::memset_d8_async(b.ptr, 0, b.bytes, self.gpu.stream.cu_stream()) }?;
             }
         }
@@ -881,6 +970,7 @@ impl Engine {
                 Arg::Ptr(gate_ptr), Arg::Ptr(a.att.ptr), Arg::Ptr(oq), Arg::Ptr(od),
                 Arg::Ptr(a.step.ptr), Arg::I32(slot.kv_cap as i32), Arg::I32(window), Arg::I32(cfg.rel_extent as i32),
                 Arg::Ptr(a.attn_part.ptr), Arg::Ptr(a.attn_cnt.ptr), Arg::I32((2 * qd + cfg.n_head * cfg.n_rel) as i32), Arg::I32(0), Arg::I32(slot.kv_fmt),
+                Arg::Ptr(0), Arg::Ptr(0), Arg::Ptr(0),
             ])?;
             self.mv(&[(lw.wo, (oq, od), a.proj.ptr, d)], qd)?;
 
@@ -1000,8 +1090,9 @@ impl Engine {
     /// Copy every slot's conv state to (`save`) or from the prompt-cache snapshot.
     fn snapshot(&self, save: bool) -> Result<()> {
         let per = self.slots[0].conv.bytes;
+        let base = self.stream * self.slots.len() * per;
         for (i, s) in self.slots.iter().enumerate() {
-            let (src, dst) = if save { (s.conv.ptr, self.act.snap.at(i * per)) } else { (self.act.snap.at(i * per), s.conv.ptr) };
+            let (src, dst) = if save { (s.conv.ptr, self.act.snap.at(base + i * per)) } else { (self.act.snap.at(base + i * per), s.conv.ptr) };
             unsafe { inkling_cuda::cudarc::driver::result::memcpy_dtod_async(dst, src, per, self.gpu.stream.cu_stream()) }?;
         }
         Ok(())
@@ -1037,7 +1128,7 @@ impl Engine {
         }
         self.prefill(&head[start..], start)?;
         self.snapshot(true)?;
-        self.cache = PromptCache { tokens: head.to_vec(), snap_tokens: Some(head.to_vec()) };
+        self.cache = PromptCache { tokens: head.to_vec(), snap_tokens: Some(head.to_vec()), drafted: false };
         Ok(start)
     }
 
@@ -1065,6 +1156,10 @@ impl Engine {
             ensure!(pos + e.n <= prompt.len() && prompt[*pos..pos + e.n].iter().all(|&t| t >= EMBED_TOKEN_BASE), "image embedding positions do not match the prompt");
         }
         ensure!(prompt.iter().filter(|&&t| t >= EMBED_TOKEN_BASE).count() == embeds.iter().map(|(_, e)| e.n).sum::<usize>(), "prompt has image positions without embeddings");
+        // speculative decoding when a drafter is attached (text only)
+        if self.draft.is_some() && self.use_spec && embeds.is_empty() && prompt.len() >= 2 && std::env::var_os("INKLING_NO_SPEC").is_none() {
+            return self.generate_spec(prompt, max_new, self.draft_n, sampling, on_token);
+        }
         self.embeds = embeds.to_vec();
         let r = self.generate_inner(prompt, max_new, sampling, on_token, None);
         self.embeds.clear();

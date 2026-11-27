@@ -43,14 +43,26 @@ __device__ __forceinline__ float conv_in(const float* __restrict__ x, const floa
 // Attention prep for a chunk, grid (64, T), 128 threads (as ink_attn_prep2 per token, position step[1] + t):
 //   0..23 q heads (clip, tau), 24..31 k heads (causal conv [+dyn] -> clip -> cache), 32..39 v heads (conv -> rms ->
 //   cache), 40..63 r heads (clip, tau). The conv states are read only (ink_conv_state_b advances them afterwards).
+// Parallel streams (rt != null): row t is one token of stream s = rt[2t] at position rt[2t + 1]; its conv states sit
+// s * cs floats and its caches s * ks / s * vs bytes past the given pointers, and the conv reads only the state.
 INK_EXTERN void ink_attn_prep_b(float* __restrict__ qrg, int qs, int roff, const float* __restrict__ kraw, const float* __restrict__ vraw,
                                 const float* __restrict__ qclip, const float* __restrict__ rclip, const float* __restrict__ kconv,
                                 const float* __restrict__ vconv, const float* __restrict__ kstate, const float* __restrict__ vstate,
                                 const float* __restrict__ dyn, int dyns, int has_dyn, const int* __restrict__ step,
                                 void* __restrict__ Kc, void* __restrict__ Vc, int kv_cap, int is_full, float qk_clip,
-                                float rel_clip, float log_floor, float log_alpha, float eps, int kbits, int vbits, int kvfmt) {
+                                float rel_clip, float log_floor, float log_alpha, float eps, int kbits, int vbits, int kvfmt,
+                                const int* __restrict__ rt, long long ks, long long vs, int cs) {
     const int task = blockIdx.x, tid = threadIdx.x, t = blockIdx.y;
-    const int pos = step[1] + t;
+    int pos = step[1] + t, tc = t;
+    if (rt) {
+        const int sq = rt[2 * t];
+        pos = rt[2 * t + 1];
+        tc = 0;
+        kstate += (size_t)sq * cs;
+        vstate += (size_t)sq * cs;
+        Kc = (char*)Kc + sq * ks;
+        Vc = (char*)Vc + sq * vs;
+    }
     const float tau = is_full ? 1.0f + log_alpha * logf(fmaxf(1.0f, (float)(pos + 1) / log_floor)) : 1.0f;
     float* q = qrg + (size_t)t * qs;
     float* r = q + roff;
@@ -65,7 +77,8 @@ INK_EXTERN void ink_attn_prep_b(float* __restrict__ qrg, int qs, int roff, const
         const float* st = isk ? kstate : vstate;
         const float* wc = (isk ? kconv : vconv) + (size_t)c * 4;
         const float xv = x[(size_t)t * ch + c];
-        const float s2 = conv_in(x, st, t, 1, c, ch), s1 = conv_in(x, st, t, 2, c, ch), s0 = conv_in(x, st, t, 3, c, ch);
+        const float* xc = x + (size_t)(t - tc) * ch;  // parallel streams: no earlier rows of the same sequence
+        const float s2 = conv_in(xc, st, tc, 1, c, ch), s1 = conv_in(xc, st, tc, 2, c, ch), s0 = conv_in(xc, st, tc, 3, c, ch);
         float y = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + xv * wc[3];
         float scale = rsqrtf(5.0f);
         if (has_dyn) {
@@ -87,13 +100,17 @@ INK_EXTERN void ink_attn_prep_b(float* __restrict__ qrg, int qs, int roff, const
 }
 
 // Causal post conv + residual over a chunk, grid (ch/256, T): o = (x + conv(x)) / sqrt(5); mode 0: resid = o,
-// mode 1: resid += o. The state is read only.
+// mode 1: resid += o. The state is read only. Parallel streams (rt != null): row t's state is s * cs floats in
+// (s = rt[2t]) and the conv reads only the state.
 INK_EXTERN void ink_conv_res_b(const float* __restrict__ xin, const float* __restrict__ w, const float* __restrict__ state,
-                               float* __restrict__ resid, int mode, int ch) {
+                               float* __restrict__ resid, int mode, int ch, const int* __restrict__ rt, int cs) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (c >= ch) return;
     const float xv = xin[(size_t)t * ch + c];
-    const float s2 = conv_in(xin, state, t, 1, c, ch), s1 = conv_in(xin, state, t, 2, c, ch), s0 = conv_in(xin, state, t, 3, c, ch);
+    const int tc = rt ? 0 : t;
+    if (rt) state += (size_t)rt[2 * t] * cs;
+    const float* xc = xin + (size_t)(t - tc) * ch;
+    const float s2 = conv_in(xc, state, tc, 1, c, ch), s1 = conv_in(xc, state, tc, 2, c, ch), s0 = conv_in(xc, state, tc, 3, c, ch);
     const float* wc = w + (size_t)c * 4;
     const float o = (xv + s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + xv * wc[3]) * rsqrtf(5.0f);
     float* rr = resid + (size_t)t * ch + c;
@@ -108,6 +125,17 @@ INK_EXTERN void ink_conv_state_b(const float* __restrict__ x, int T, float* __re
     state[c] = n0;
     state[ch + c] = n1;
     state[2 * ch + c] = n2;
+}
+
+// Parallel streams: advance the conv state of each row's stream by its one input. Grid (ch / 256, T).
+INK_EXTERN void ink_conv_state_m(const float* __restrict__ x, const int* __restrict__ rt, float* __restrict__ state, int cs, int ch) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= ch) return;
+    float* st = state + (size_t)rt[2 * t] * cs;
+    const float a = st[ch + c], b = st[2 * ch + c];
+    st[c] = a;
+    st[ch + c] = b;
+    st[2 * ch + c] = x[(size_t)t * ch + c];
 }
 
 // Router logits per token: grid (E, T), 192 threads (as ink_router4 without the top-k).

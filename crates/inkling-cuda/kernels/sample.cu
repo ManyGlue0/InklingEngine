@@ -30,8 +30,8 @@ __device__ __forceinline__ unsigned long long splitmix(unsigned long long x) {
 }
 }  // namespace smp
 
-extern "C" __global__ void __launch_bounds__(1024) ink_sample(float* __restrict__ x, int n, const SampleParams* __restrict__ P,
-                                                              int* __restrict__ step, int* __restrict__ hist, int* __restrict__ ring) {
+__device__ __forceinline__ void sample_body(float* __restrict__ x, int n, const SampleParams* __restrict__ P, int* __restrict__ step,
+                                            int* __restrict__ hist, int* __restrict__ ring) {
     using namespace smp;
     __shared__ float cl[CAP];
     __shared__ int ci[CAP];
@@ -213,4 +213,18 @@ extern "C" __global__ void __launch_bounds__(1024) ink_sample(float* __restrict_
         step[0] = t;
         step[1] += 1;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(1024) ink_sample(float* __restrict__ x, int n, const SampleParams* __restrict__ P,
+                                                              int* __restrict__ step, int* __restrict__ hist, int* __restrict__ ring) {
+    sample_body(x, n, P, step, hist, ring);
+}
+
+// Parallel streams: one block per batch row r of stream s = rt[2r], logits row x + r * ld, the stream's parameters
+// P[s] and penalty ring rings[s]; steps[4r..] = {token, position, r, 0} (the token goes to hist[r]).
+extern "C" __global__ void __launch_bounds__(1024) ink_sample_rows(float* __restrict__ x, int ld, int n, const SampleParams* __restrict__ P,
+                                                                   int* __restrict__ steps, int* __restrict__ hist, int* __restrict__ rings,
+                                                                   const int* __restrict__ rt) {
+    const int r = blockIdx.x, s = rt[2 * r];
+    sample_body(x + (size_t)r * ld, n, P + s, steps + 4 * r, hist, rings + (size_t)s * smp::RING);
 }

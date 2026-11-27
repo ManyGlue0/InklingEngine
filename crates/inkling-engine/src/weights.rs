@@ -164,11 +164,11 @@ pub struct Weights {
     pub bytes: usize,
 }
 
-struct Loader<'a> {
-    gpu: &'a Gpu,
-    g: &'a Gguf,
-    bufs: HashMap<String, DevBuf>,
-    bytes: usize,
+pub(crate) struct Loader<'a> {
+    pub(crate) gpu: &'a Gpu,
+    pub(crate) g: &'a Gguf,
+    pub(crate) bufs: HashMap<String, DevBuf>,
+    pub(crate) bytes: usize,
 }
 
 impl Loader<'_> {
@@ -189,7 +189,7 @@ impl Loader<'_> {
     }
 
     /// Small tensors (F32/BF16) uploaded as-is.
-    fn raw(&mut self, name: &str) -> Result<u64> {
+    pub(crate) fn raw(&mut self, name: &str) -> Result<u64> {
         let t = self.g.require(name)?;
         ensure!(matches!(t.ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::Q8_0), "{name}: unexpected type {:?}", t.ty);
         let data = self.g.data(t).to_vec();
@@ -209,7 +209,7 @@ impl Loader<'_> {
     }
 
     /// One or more Q8_0 2-D tensors with the same K, row-concatenated and repacked.
-    fn q8(&mut self, names: &[String]) -> Result<Q8M> {
+    pub(crate) fn q8(&mut self, names: &[String]) -> Result<Q8M> {
         let mut soa = Soa { qs: Vec::new(), sc: Vec::new() };
         let mut k0 = 0;
         for n in names {
@@ -421,7 +421,7 @@ pub fn embed_on_host() -> bool {
     std::env::var_os("INKLING_EMBED_GPU").is_none()
 }
 
-fn f32_rows(g: &Gguf, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn f32_rows(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     let t = g.require(name)?;
     ensure!(t.ty == GgmlType::F32, "{name} is not F32");
     Ok(g.data(t).chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
