@@ -367,6 +367,9 @@ Developer commands:
 - **Correctness:** `validate` against reference dumps, `kvstudy`, `cachetest`, `rendertest`, `gemmtest`, `visiontest`,
   `cpumoetest` (CPU experts against the GPU kernel), `codectest` (every weight format: CUDA vs CPU decoders; then
   `python tools/codec_oracle.py` compares with gguf-py).
+- **Smaller GPUs:** the fused MoE kernel's grid follows the SM count, so a large GPU does not exercise the grids of
+  smaller ones. Run `validate` again with `INKLING_MOE_BLOCKS=96` (66 SMs, e.g. RTX 4070 Ti SUPER) and
+  `INKLING_MOE_BLOCKS=32`. The results must be identical to the default grid.
 - **Diagnostics:** `vraminfo` prints total and usable VRAM.
 
 ## How it works
