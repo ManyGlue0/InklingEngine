@@ -24,11 +24,19 @@ INK_EXTERN void ink_mv_bf16b(MVB4 a, int ldy) {
     if (seg >= a.nseg) return;
     const MVSegB& s = a.s[seg];
     const float* x = s.x + (size_t)blockIdx.y * a.K;
-    const __nv_bfloat162* r = reinterpret_cast<const __nv_bfloat162*>(s.w + (size_t)row * a.K);
     float acc = 0.0f;
-    for (int i = threadIdx.x & 31; i < a.K / 2; i += 32) {
-        const float2 w = __bfloat1622float2(r[i]);
-        acc += w.x * x[2 * i] + w.y * x[2 * i + 1];
+    if (s.f32w) {
+        const float2* r = reinterpret_cast<const float2*>(reinterpret_cast<const float*>(s.w) + (size_t)row * a.K);
+        for (int i = threadIdx.x & 31; i < a.K / 2; i += 32) {
+            const float2 w = r[i];
+            acc += w.x * x[2 * i] + w.y * x[2 * i + 1];
+        }
+    } else {
+        const __nv_bfloat162* r = reinterpret_cast<const __nv_bfloat162*>(s.w + (size_t)row * a.K);
+        for (int i = threadIdx.x & 31; i < a.K / 2; i += 32) {
+            const float2 w = __bfloat1622float2(r[i]);
+            acc += w.x * x[2 * i] + w.y * x[2 * i + 1];
+        }
     }
     acc = warp_sum(acc);
     if ((threadIdx.x & 31) == 0) s.y[(size_t)blockIdx.y * ldy + row] = acc;

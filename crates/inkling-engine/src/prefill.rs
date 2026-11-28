@@ -535,12 +535,12 @@ impl Engine {
             self.pre_gemm(&segs, d, t)?;
             let nkc = cfg.n_head_kv * cfg.n_conv;
             let mut mb = MvB4 { k: d as i32, ..Default::default() };
-            mb.s[0] = MvSegB { w: lw.wsink, x: n[iq], y: p.sink.ptr, n: cfg.n_head as i32 };
+            mb.s[0] = MvSegB { w: lw.wsink, x: n[iq], y: p.sink.ptr, n: cfg.n_head as i32, f32w: lw.small_f32 };
             mb.nseg = 1;
             let mut rows = cfg.n_head;
             if !lw.is_swa {
-                mb.s[1] = MvSegB { w: lw.kconv_proj, x: n[ik], y: p.sink.at(cfg.n_head * F32), n: nkc as i32 };
-                mb.s[2] = MvSegB { w: lw.vconv_proj, x: n[iv], y: p.sink.at((cfg.n_head + nkc) * F32), n: nkc as i32 };
+                mb.s[1] = MvSegB { w: lw.kconv_proj, x: n[ik], y: p.sink.at(cfg.n_head * F32), n: nkc as i32, f32w: lw.small_f32 };
+                mb.s[2] = MvSegB { w: lw.vconv_proj, x: n[iv], y: p.sink.at((cfg.n_head + nkc) * F32), n: nkc as i32, f32w: lw.small_f32 };
                 mb.nseg = 3;
                 rows += 2 * nkc;
             }
@@ -622,6 +622,26 @@ impl Engine {
                     Arg::Ptr(lw.ffn_post_conv), Arg::Ptr(conv_ffn), Arg::Ptr(p.x.ptr), Arg::Ptr(hist(3)), Arg::Ptr(self.act.bar.ptr),
                     Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta), Arg::Ptr(self.moe_b_tl.as_ref().map_or(0, |b| b.ptr)),
                     Arg::Ptr(o.rt), Arg::I32(cs as i32),
+                ])?;
+                continue;
+            }
+            if t <= MOE_B_MAX && k == 8 && on_gpu && std::env::var_os("INKLING_NO_MOE_B").is_none() {
+                // short chain, any other format pairing (natively stored, or one tensor NVFP4/Q8_0): each union expert
+                // read once for all its tokens, per-token arithmetic as the decode kernels (ink_moe_*_gen / *7)
+                let ew = |m: weights::ExpM| ExpW { qs: m.qs, sc: m.sc, scale: m.scale, fmt: m.fmt.code(), erange: 0 };
+                let (hq, hd) = p.hq.at(0);
+                let un = p.alist.ptr; // the union (genb::Union, 641 ints) in the routing scratch
+                self.gpu.launch("ink_moe_union_genb", (1, 1), 64, &[Arg::Ptr(p.sel.ptr), Arg::I32(t as i32), Arg::Ptr(un)])?;
+                self.gpu.launch("ink_moe_gate_up_genb", ((cfg.n_ff_exp / 16) as u32, (8 * t) as u32), 256, &[
+                    Arg::Exp(ew(lw.gate_up)), Arg::Ptr(fq.0), Arg::Ptr(fq.1), Arg::Ptr(un), Arg::Ptr(hq), Arg::Ptr(hd),
+                    Arg::F32(cfg.situ_beta), Arg::F32(cfg.situ_linear_beta),
+                ])?;
+                self.gpu.launch("ink_moe_down_genb", ((d / 64) as u32, (8 * t) as u32), 256, &[
+                    Arg::Exp(ew(lw.down)), Arg::Ptr(hq), Arg::Ptr(hd), Arg::Ptr(un), Arg::Ptr(p.ya.ptr),
+                ])?;
+                self.gpu.launch("ink_moe_sum_genb", ((d / 8) as u32, 1), 256, &[
+                    Arg::Exp(ew(lw.down)), Arg::Ptr(p.ya.ptr), Arg::Ptr(p.sel.ptr), Arg::Ptr(p.wts.ptr), Arg::I32(t as i32),
+                    Arg::Ptr(lw.ffn_post_conv), Arg::Ptr(conv_ffn), Arg::Ptr(p.x.ptr), Arg::Ptr(hist(3)), Arg::Ptr(o.rt), Arg::I32(cs as i32),
                 ])?;
                 continue;
             }

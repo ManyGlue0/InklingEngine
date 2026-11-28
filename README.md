@@ -1,8 +1,8 @@
 # InklingEngine
 
 A from-scratch inference engine for **Inkling 2 Mini** (Thinking Machines Lab) on NVIDIA GPUs: a Rust host, hand-written
-CUDA kernels, and nothing else. It runs Unsloth's GGUFs directly, from UD-Q4_K_XL (16.4 GiB) down to UD-IQ1_S
-(7.2 GiB), with every quantization format decoded natively. It serves an OpenAI-compatible API with reasoning, tool
+CUDA kernels, and nothing else. It runs the GGUFs of Unsloth and AtomicChat directly, from AD-Q5_K (17.8 GiB) down
+to AD-IQ1_M (6.8 GiB), with every quantization format decoded natively. It serves an OpenAI-compatible API with reasoning, tool
 calls and image input, and fits a 384k-token context in 24 GB. On smaller GPUs (8 GB and up) it keeps part of the
 experts in system RAM and runs them on the CPU.
 
@@ -86,6 +86,26 @@ itself. The KL column checks this engine against the reference llama.cpp on the 
 every row, and it does. Q4_K_M and IQ4_XS are as good as Q4_K_XL and smaller; Q3_K_XL is the best trade-off for
 16 GB cards; the 1- and 2-bit files lose noticeably more, and the three smallest fit a 12 GB card entirely.
 
+The AD ("Atomic Dynamic") files of [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF)
+run too. They give each tensor its own type: the experts carry the compression (K-quants, IQ formats, Q5_0, Q5_1
+and Q2_0) and attention stays Q8_0. Measured the same way:
+
+| file | size | quality vs BF16 (AtomicChat) | KL vs reference, decode / prefill | decode | prefill, 8k prompt |
+|---|---|---|---|---|---|
+| AD-Q5_K | 17.8 GiB | KLD 0.0052, top-1 97.1% | 0.0040 / 0.0047 | 110 tok/s | 3,320 tok/s |
+| AD-Q4_K | 15.4 GiB | 0.0080, 96.3% | 0.0047 / 0.0048 | 115 tok/s | 3,410 tok/s |
+| AD-IQ4_XS | 14.0 GiB | 0.0101, 95.8% | 0.0039 / 0.0040 | 112 tok/s | 3,210 tok/s |
+| AD-IQ3_S | 12.4 GiB | 0.0205, 94.2% | 0.0083 / 0.0052 | 112 tok/s | 3,200 tok/s |
+| AD-IQ3_XXS | 11.7 GiB | 0.0271, 93.3% | 0.0041 / 0.0064 | 116 tok/s | 3,250 tok/s |
+| AD-IQ2_M | 8.1 GiB | 0.130, 85.7% | 0.0057 / 0.0094 | 128 tok/s | 3,390 tok/s |
+| AD-IQ1_M | 6.8 GiB | 0.236, 81.1% | 0.0108 / 0.0162 | 126 tok/s | 3,290 tok/s |
+
+The quality column is AtomicChat's measurement against their BF16. In the 3-bit and smaller files a few tokens tip
+the other way between this engine and the reference, and those few dominate the mean KL (in AD-IQ3_S five tokens
+make up 40% of it); top-1 agreement with the reference stays at 97–99%. The drafter, parallel requests and CPU
+offload work with all seven. AD-Q6_K, AD-IQ2_S, AD-IQ2_XXS, AD-IQ2_XXS-Q2 and AD-IQ1_S use the same formats but
+were not tested here.
+
 ### Speculative decoding
 With `--draft`, a small drafter model guesses the next few tokens and the main model checks all of them in one
 batched pass. A pass costs less than two ordinary decode steps and keeps every guess up to the first wrong one,
@@ -108,6 +128,8 @@ Decode speed in tok/s, RTX 3090, UD-Q4_K_XL, 3 drafted tokens per step (`--draft
 | code (a Python function) | 110 | 160 | **172** (3.1 tokens per pass) |
 | prose (two explanations) | 110 | 123–134 | **138** |
 
+With AtomicChat's AD files, DFlash2 decodes the same code prompt at 137–163 tok/s (110–127 without a drafter).
+
 The output is unchanged at any temperature. Every position of a pass is sampled by the main model exactly as a
 normal decode step would be, and a guess is kept only if it equals that sample. More drafted tokens per step
 (`--draft-n` up to 7) pay off only on very predictable text such as code. `bench` prints the tokens per pass.
@@ -127,7 +149,7 @@ goes to the free stream whose cache it extends.
 | 4 | 237 tok/s | 59 tok/s |
 | 8 | 297 tok/s | 37 tok/s |
 
-RTX 3090, UD-Q4_K_XL, every stream decoding. Each extra stream needs about 0.4–0.5 GB of VRAM beyond the shared
+RTX 3090, UD-Q4_K_XL, every stream decoding; with AtomicChat's AD files, 4 streams give 206–238 tok/s in total. Each extra stream needs about 0.4–0.5 GB of VRAM beyond the shared
 context (its sliding-window rings): `--ctx 65536 --parallel 4` uses 20.4 GB, against 18.8 GB for one stream. A
 stream's output is the same as it would be alone (bit for bit up to 6 streams; beyond that the projections switch to
 the tensor-core GEMM, which rounds differently). `--parallel` needs the whole model on the GPU (no CPU offload) and
@@ -198,7 +220,9 @@ On a CPU without AVX2 a scalar fallback runs, much slower.
 - **Driver:** a recent NVIDIA driver with CUDA 12.8+ support. Only the driver is needed to run; the toolkit is
   needed only to build.
 - **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): any UD file except UD-Q8_K_XL (see [Quantizations](#quantizations); UD-Q4_K_XL is the default choice, UD-Q3_K_XL for 16 GB
-  cards) and, for images, `mmproj-F32.gguf`. All nine were checked against the reference llama.cpp.
+  cards) and, for images, `mmproj-F32.gguf`. All nine were checked against the reference llama.cpp. Or an AD file
+  from [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (seven checked, see
+  [Quantizations](#quantizations)).
 - **To build:** Rust 1.85 or newer, and the CUDA Toolkit 12.x (`nvcc` on PATH or `CUDA_PATH` set).
 
 Tested with an RTX 3090 on Windows 11 and on Ubuntu 24.04 under WSL2: build, generation, server and image input.
@@ -481,8 +505,10 @@ Developer commands:
   shared across the batch. Sampling, penalties and structured-output masks are per stream.
 - **Speculative decoding.** The drafter reads hidden states that the main model's passes copy out (three looped-layer
   inputs and the final norm). Its guesses go through the batched prefill path with kernels for chains of up to 8
-  tokens: the MoE kernel reads the union of the experts the tokens chose once, so a 4-token pass reads about twice
-  the expert weights of one decode step, not four times. The short convolutions defer their state updates until the
+  tokens: the MoE kernels read the union of the experts the tokens chose once, so a 4-token pass reads about twice
+  the expert weights of one decode step, not four times. Layers whose experts are all NVFP4/Q8_0 have one fused
+  persistent kernel; every other pairing (IQ and K-quant formats, alone or next to NVFP4/Q8_0) has kernels that repeat
+  the decode kernels' arithmetic exactly for each token. The short convolutions defer their state updates until the
   accepted length is known. Each pass is three CUDA graphs (draft, verify + sample every position, commit) with one
   host sync.
 - **Vision.** Native ViT (23 layers) on f16 tensor cores: 2-D RoPE, flash attention, 2×2 patch merge and MLP
@@ -496,7 +522,8 @@ Developer commands:
   drafter.
 - **Speculative decoding:** text only (images and structured output decode without the drafter), and not with CPU
   offload.
-- **One model:** Inkling 2 Mini only, in Unsloth's UD GGUFs (not UD-Q8_K_XL, which uses BF16 weights).
+- **One model:** Inkling 2 Mini only, in Unsloth's UD GGUFs (not UD-Q8_K_XL, which uses BF16 weights) and
+  AtomicChat's AD GGUFs.
 - **Offload:** only the MoE experts move to the CPU; the rest of the model (about 3.3 GiB) and the KV cache stay in
   VRAM.
 - **Hardware:** NVIDIA GPUs only. Native FP4 tensor cores on Blackwell are not used yet; NVFP4 is decoded in
@@ -507,6 +534,7 @@ Developer commands:
 
 - **Inkling 2 Mini** by [Thinking Machines Lab](https://thinkingmachines.ai) (Apache-2.0).
 - **GGUF conversion and quantization** by [Unsloth](https://unsloth.ai), including the DSpark drafter conversion.
+- **AD quantizations** by [AtomicChat](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (Apache-2.0).
 - **DFlash2 drafter** by [Inco AI](https://inco.ai/blog/dflash2/) (Apache-2.0).
 - **Reference implementation:** [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), Unsloth's Inkling 2
   branch. It was used as the numerical reference and as the source of the model, preprocessing and quantization

@@ -220,9 +220,9 @@ mod avx2 {
     /// scalar decoder.
     #[inline]
     #[target_feature(enable = "avx2,fma,f16c")]
-    unsafe fn g32(id: u32, row: *const u8, g: usize, k: usize) -> (__m256i, f32, f32, f32) {
+    pub(super) unsafe fn g32(id: u32, row: *const u8, g: usize, k: usize) -> (__m256i, f32, f32, f32) {
         use crate::codec_tables::*;
-        use crate::codecs::{IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K};
+        use crate::codecs::{IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q2_0, Q3_K, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K};
         let m4 = _mm256_set1_epi8(0x0F);
         let j = g % 8;
         match id {
@@ -351,6 +351,27 @@ mod avx2 {
                 let m4 = _mm_set1_epi8(0x0F);
                 let idx = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(v, 4), m4), _mm_and_si128(v, m4));
                 (_mm256_shuffle_epi8(lut, idx), s, s, 0.0)
+            }
+            Q5_0 | Q5_1 => {
+                // d [m] | qh u32 | qs 16: low nibbles are values 0..15, high nibbles 16..31, bit l of qh is the 5th
+                // bit of value l
+                let (b, o) = if id == Q5_0 { (row.add(g * 22), 2) } else { (row.add(g * 24), 4) };
+                let v = _mm_loadu_si128(b.add(o + 4) as *const __m128i);
+                let m4 = _mm_set1_epi8(0x0F);
+                let q = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(v, 4), m4), _mm_and_si128(v, m4));
+                // qh bits -> bytes (0xFF where set): byte i takes byte i/8 of qh, then tests bit i%8
+                let qh = (b.add(o) as *const u32).read_unaligned() as i32;
+                let shuf = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0);
+                let bytes = _mm256_or_si256(_mm256_shuffle_epi8(_mm256_set1_epi32(qh), shuf), _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe));
+                let hb = _mm256_and_si256(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1)), _mm256_set1_epi8(16));
+                let q = _mm256_or_si256(q, hb);
+                if id == Q5_0 {
+                    let s = f16(b);
+                    (_mm256_sub_epi8(q, _mm256_set1_epi8(16)), s, s, 0.0)
+                } else {
+                    let s = f16(b);
+                    (q, s, s, -f16(b.add(2)))
+                }
             }
             Q2_0 => {
                 let b = row.add(g / 2 * 18);
@@ -925,6 +946,44 @@ impl RaceHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AVX2 group decoders agree with the scalar reference (codecs::g32) on random blocks.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_g32_matches_scalar() {
+        use crate::codecs::{Q5_0, Q5_1};
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let k = 256;
+        for fmt in [Q5_0, Q5_1] {
+            let rb = crate::codecs::row_bytes(fmt, k);
+            let bs = rb / (k / 32);
+            let mut row: Vec<u8> = (0..rb + 64).map(|_| rnd() as u8).collect();
+            for b in 0..k / 32 {
+                // finite f16 scales: d and (Q5_1) m around 0.01..0.03
+                for o in [0, 2] {
+                    let h = half::f16::from_f32(0.01 + (rnd() % 1000) as f32 * 2e-5).to_bits().to_le_bytes();
+                    row[b * bs + o..b * bs + o + 2].copy_from_slice(&h);
+                }
+            }
+            for g in 0..k / 32 {
+                let r = crate::codecs::g32(fmt, &row[..rb], g);
+                let (q, s0, s1, m) = unsafe { avx2::g32(fmt, row.as_ptr(), g, k) };
+                let mut qv = [0i8; 32];
+                unsafe { std::arch::x86_64::_mm256_storeu_si256(qv.as_mut_ptr() as *mut _, q) };
+                assert_eq!(qv, r.q, "format {fmt} group {g}: values");
+                assert_eq!((s0, s1, m), (r.s0, r.s1, r.m), "format {fmt} group {g}: scales");
+            }
+        }
+    }
 
     /// A worker that went to sleep must not miss a job published while it sits between its `epoch` check and its
     /// Condvar wait (the hooks force exactly that interleaving).

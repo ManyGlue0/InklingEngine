@@ -72,6 +72,7 @@ impl GgmlType {
 fn quant_block(id: u32) -> Option<(usize, usize)> {
     Some(match id {
         6 => (32, 22),    // Q5_0: d | qh u32 | qs 16
+        7 => (32, 24),    // Q5_1: d, m | qh u32 | qs 16
         10 => (256, 84),  // Q2_K
         11 => (256, 110), // Q3_K: hmask 32 | qs 64 | scales 12 | d
         12 => (256, 144), // Q4_K: d, dmin | scales 12 | qs 128
@@ -85,6 +86,7 @@ fn quant_block(id: u32) -> Option<(usize, usize)> {
         21 => (256, 110), // IQ3_S: d | qs 64 | qh 8 | signs 32 | scales 4
         22 => (256, 82),  // IQ2_S: d | qs 64 | qh 8 | scales 8
         23 => (256, 136), // IQ4_XS: d | scales_h u16 | scales_l 4 | qs 128
+        29 => (256, 56),  // IQ1_M: qs 32 | qh 16 | scales 8 (f16 super-scale in the scales' top nibbles)
         39 => (32, 17),   // MXFP4: e8m0 | qs 16
         42 => (64, 18),   // Q2_0 (Unsloth): d | qs 16
         _ => return None,
@@ -94,6 +96,7 @@ fn quant_block(id: u32) -> Option<(usize, usize)> {
 fn quant_name(id: u32) -> Option<&'static str> {
     Some(match id {
         6 => "Q5_0",
+        7 => "Q5_1",
         10 => "Q2_K",
         11 => "Q3_K",
         12 => "Q4_K",
@@ -107,6 +110,7 @@ fn quant_name(id: u32) -> Option<&'static str> {
         21 => "IQ3_S",
         22 => "IQ2_S",
         23 => "IQ4_XS",
+        29 => "IQ1_M",
         39 => "MXFP4",
         42 => "Q2_0",
         _ => return None,

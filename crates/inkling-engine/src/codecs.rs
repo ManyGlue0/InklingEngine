@@ -7,6 +7,7 @@ use inkling_core::GgmlType;
 use crate::codec_tables::*;
 
 pub const Q5_0: u32 = 6;
+pub const Q5_1: u32 = 7;
 pub const Q3_K: u32 = 11;
 pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
@@ -19,6 +20,7 @@ pub const IQ4_NL: u32 = 20;
 pub const IQ3_S: u32 = 21;
 pub const IQ2_S: u32 = 22;
 pub const IQ4_XS: u32 = 23;
+pub const IQ1_M: u32 = 29;
 pub const MXFP4: u32 = 39;
 pub const Q2_0: u32 = 42;
 
@@ -32,7 +34,7 @@ pub struct G32 {
 
 /// Formats the generic kernels decode.
 pub fn supported(fmt: u32) -> bool {
-    matches!(fmt, Q5_0 | Q3_K | Q4_K | Q5_K | Q6_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ4_NL | IQ4_XS | MXFP4 | Q2_0)
+    matches!(fmt, Q5_0 | Q5_1 | Q3_K | Q4_K | Q5_K | Q6_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ1_M | IQ4_NL | IQ4_XS | MXFP4 | Q2_0)
 }
 
 /// Bytes of one row of `k` values.
@@ -230,6 +232,38 @@ pub fn g32(fmt: u32, row: &[u8], g: usize) -> G32 {
             }
             r.s0 = f16(b);
             r.s1 = r.s0;
+        }
+        Q5_1 => {
+            // d, m | qh u32 | qs 16: like Q5_0 without the -16, plus the offset m (w = d q + m)
+            let b = &row[g * 24..];
+            let qh = u32le(&b[4..]);
+            for l in 0..16 {
+                r.q[l] = ((b[8 + l] & 15) | (((qh >> l) & 1) << 4) as u8) as i8;
+                r.q[l + 16] = ((b[8 + l] >> 4) | (((qh >> (l + 16)) & 1) << 4) as u8) as i8;
+            }
+            r.s0 = f16(b);
+            r.s1 = r.s0;
+            r.m = -f16(&b[2..]);
+        }
+        IQ1_M => {
+            // qs 32 | qh 16 | scales 8. Group j: 4 grid indices (8 bits in qs, 3 in a qh nibble), a +-1/8 delta per
+            // 8 values (bit 3 of the nibble), 3-bit scales for each half. 8 (grid + delta) is an integer in [-9, 9],
+            // so the scales carry the 1/8 (exact: a power of two).
+            let b = &row[g / 8 * 56..];
+            let sc = |i: usize| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]) as u32;
+            let bits = (sc(0) >> 12) | ((sc(1) >> 8) & 0x00f0) | ((sc(2) >> 4) & 0x0f00) | (sc(3) & 0xf000);
+            let d = half::f16::from_bits(bits as u16).to_f32();
+            for l in 0..4 {
+                let h = (b[32 + 2 * j + l / 2] >> (4 * (l % 2))) as usize;
+                let gv = IQ1S_GRID[b[4 * j + l] as usize | ((h & 7) << 8)];
+                let delta = if h & 8 != 0 { -1 } else { 1 };
+                for jj in 0..8 {
+                    r.q[8 * l + jj] = 8 * ((gv >> (8 * jj)) & 0xff) as u8 as i8 + delta;
+                }
+            }
+            let s = sc(j / 2) >> (6 * (j % 2));
+            r.s0 = d * (2 * (s & 7) + 1) as f32 * 0.125;
+            r.s1 = d * (2 * ((s >> 3) & 7) + 1) as f32 * 0.125;
         }
         Q2_0 => {
             // 64 values per block: d | qs 16, value i = ((qs[i/4] >> 2 (i%4)) & 3) - 1

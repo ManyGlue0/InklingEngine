@@ -65,12 +65,13 @@ INK_EXTERN void ink_mv_q8(MV4 a) {
     if ((threadIdx.x & 31) == 0) s.y[row] = v;
 }
 
-// Multi-segment BF16 matvec (small projections: sink, dynamic conv taps).
+// Multi-segment BF16 (or F32, f32w) matvec (small projections: sink, dynamic conv taps).
 struct MVSegB {
     const __nv_bfloat16* w;
     const float* x;
     float* y;
     int n;
+    int f32w;
 };
 struct MVB4 {
     MVSegB s[4];
@@ -84,11 +85,19 @@ INK_EXTERN void ink_mv_bf16(MVB4 a) {
     while (seg < a.nseg && row >= a.s[seg].n) { row -= a.s[seg].n; ++seg; }
     if (seg >= a.nseg) return;
     const MVSegB& s = a.s[seg];
-    const __nv_bfloat162* r = reinterpret_cast<const __nv_bfloat162*>(s.w + (size_t)row * a.K);
     float acc = 0.0f;
-    for (int i = threadIdx.x & 31; i < a.K / 2; i += 32) {
-        const float2 w = __bfloat1622float2(r[i]);
-        acc += w.x * s.x[2 * i] + w.y * s.x[2 * i + 1];
+    if (s.f32w) {
+        const float2* r = reinterpret_cast<const float2*>(reinterpret_cast<const float*>(s.w) + (size_t)row * a.K);
+        for (int i = threadIdx.x & 31; i < a.K / 2; i += 32) {
+            const float2 w = r[i];
+            acc += w.x * s.x[2 * i] + w.y * s.x[2 * i + 1];
+        }
+    } else {
+        const __nv_bfloat162* r = reinterpret_cast<const __nv_bfloat162*>(s.w + (size_t)row * a.K);
+        for (int i = threadIdx.x & 31; i < a.K / 2; i += 32) {
+            const float2 w = __bfloat1622float2(r[i]);
+            acc += w.x * s.x[2 * i] + w.y * s.x[2 * i + 1];
+        }
     }
     acc = warp_sum(acc);
     if ((threadIdx.x & 31) == 0) s.y[row] = acc;

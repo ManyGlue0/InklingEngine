@@ -126,9 +126,11 @@ pub struct LayerW {
     pub wk: Q8M,
     pub wv: Q8M,
     pub wo: Q8M,
+    /// sink and dynamic-conv projections: BF16 as in the file, or F32 (`small_f32`, other types dequantized)
     pub wsink: u64,
     pub kconv_proj: u64,
     pub vconv_proj: u64,
+    pub small_f32: i32,
     pub q_clip: u64,
     pub rel_clip: u64,
     pub rel_bias: u64,
@@ -188,10 +190,10 @@ impl Loader<'_> {
         Ok(p)
     }
 
-    /// Small tensors (F32/BF16) uploaded as-is.
+    /// Small tensors (F32/BF16) uploaded as-is: the kernels read them in the file's type.
     pub(crate) fn raw(&mut self, name: &str) -> Result<u64> {
         let t = self.g.require(name)?;
-        ensure!(matches!(t.ty, GgmlType::F32 | GgmlType::BF16 | GgmlType::Q8_0), "{name}: unexpected type {:?}", t.ty);
+        ensure!(matches!(t.ty, GgmlType::F32 | GgmlType::BF16), "{name}: type {} is not supported here (expected F32 or BF16)", t.ty.name());
         let data = self.g.data(t).to_vec();
         self.put(name.to_owned(), &data)
     }
@@ -382,6 +384,14 @@ impl Weights {
                 cpu.push(None);
                 (l.experts(&n("ffn_gate_up_exps.weight"), &n("ffn_gate_up_exps.scale"))?, l.experts(&n("ffn_down_exps.weight"), &n("ffn_down_exps.scale"))?)
             };
+            // the sink / dynamic-conv kernels read BF16; any other type is dequantized to F32 (exact for Q8_0)
+            let sp = [n("attn_sink_proj.weight"), n("attn_k_conv_proj.weight"), n("attn_v_conv_proj.weight")];
+            g.require(&sp[0])?;
+            let small_f32 = sp.iter().any(|nm| g.tensor(nm).is_some_and(|t| t.ty != GgmlType::BF16));
+            let mut small = |nm: &str| -> Result<u64> {
+                if g.tensor(nm).is_none() { Ok(0) } else if small_f32 { l.small(nm, false) } else { l.raw(nm) }
+            };
+            let (wsink, kconv_proj, vconv_proj) = (small(&sp[0])?, small(&sp[1])?, small(&sp[2])?);
             let (wqrg, nqrg) = l.mats3([n("attn_q.weight"), n("attn_rel.weight"), n("attn_gate.weight")])?;
             layers.push(LayerW {
                 is_swa: cfg.is_swa[i],
@@ -394,9 +404,10 @@ impl Weights {
                 wk: l.mat(&n("attn_k.weight"))?,
                 wv: l.mat(&n("attn_v.weight"))?,
                 wo: l.mat(&n("attn_output.weight"))?,
-                wsink: l.raw(&n("attn_sink_proj.weight"))?,
-                kconv_proj: l.raw_opt(&n("attn_k_conv_proj.weight"))?,
-                vconv_proj: l.raw_opt(&n("attn_v_conv_proj.weight"))?,
+                wsink,
+                kconv_proj,
+                vconv_proj,
+                small_f32: small_f32 as i32,
                 q_clip: l.raw(&n("attn_q_clip.weight"))?,
                 rel_clip: l.raw(&n("attn_rel_clip.weight"))?,
                 rel_bias: l.raw(&n("attn_rel_bias.weight"))?,

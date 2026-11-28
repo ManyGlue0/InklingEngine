@@ -819,11 +819,11 @@ impl Engine {
         self.gpu.launch("ink_mv_q8q", (rows.div_ceil(8) as u32, 1), 256, &[Arg::MvQ(a)])
     }
 
-    fn mv_bf16(&self, segs: &[(u64, u64, u64, usize)], k: usize) -> Result<()> {
+    fn mv_bf16(&self, segs: &[(u64, u64, u64, usize)], k: usize, f32w: i32) -> Result<()> {
         let mut a = MvB4 { nseg: segs.len() as i32, k: k as i32, ..Default::default() };
         let mut rows = 0;
         for (i, &(w, x, y, n)) in segs.iter().enumerate() {
-            a.s[i] = MvSegB { w, x, y, n: n as i32 };
+            a.s[i] = MvSegB { w, x, y, n: n as i32, f32w };
             rows += n;
         }
         self.gpu.launch("ink_mv_bf16", (rows.div_ceil(8) as u32, 1), 256, &[Arg::MvB(a)])
@@ -966,10 +966,10 @@ impl Engine {
             segs.push((lw.wv, nqv(iv), a.vraw.ptr, kvw));
             self.mv(&segs, d)?;
             let (dk, dv) = if lw.is_swa {
-                self.mv_bf16(&[(lw.wsink, n[iq], sink_ptr, cfg.n_head)], d)?;
+                self.mv_bf16(&[(lw.wsink, n[iq], sink_ptr, cfg.n_head)], d, lw.small_f32)?;
                 (0, 0)
             } else {
-                self.mv_bf16(&[(lw.wsink, n[iq], sink_ptr, cfg.n_head), (lw.kconv_proj, n[ik], dynk_ptr, nkc), (lw.vconv_proj, n[iv], dynv_ptr, nkc)], d)?;
+                self.mv_bf16(&[(lw.wsink, n[iq], sink_ptr, cfg.n_head), (lw.kconv_proj, n[ik], dynk_ptr, nkc), (lw.vconv_proj, n[iv], dynv_ptr, nkc)], d, lw.small_f32)?;
                 (dynk_ptr, dynv_ptr)
             };
             // K/V short convs + clip/norm + cache write, q/r clip + tau

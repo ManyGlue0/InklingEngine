@@ -58,6 +58,8 @@ pub struct MvSegB {
     pub x: u64,
     pub y: u64,
     pub n: i32,
+    /// weights are F32 instead of BF16
+    pub f32w: i32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
