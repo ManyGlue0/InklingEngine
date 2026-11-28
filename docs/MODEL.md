@@ -34,10 +34,13 @@ Prelude = physical layers 0..5, core = 6..17 run 3 passes, coda = 18..23. Every 
 **prelude output** `x_p` with `blocks = prelude_blocks`. For passes 1 and 2, the "bank" of the previous pass is its
 blocks after the first core block (the block pushed at core layer 12), plus that pass's output `x_prev`. Each core
 layer `ip` of passes ≥ 1 computes messages `m = mix(bank, x_prev, Qmsg_ip)` with 4 query rows
-`[res[2i], kv[2i], kv[2i+1], res[2i+1]]` (q, k, v, ffn) from `loop_res_query` / `loop_kv_res_query`, `i = ip − 6`.
+(q, k, v, ffn): the 4 columns of `blk.ip.loop_msg_query` in the merged `inkling2_loop` layout, or in the legacy
+`inkling2` layout the rows `[res[2i], kv[2i], kv[2i+1], res[2i+1]]` of `loop_res_query` / `loop_kv_res_query`,
+`i = ip − 6`.
 
 **Control** (rank 64): `g = W_down [rms(c); rms(m)]` (4608→64), `c' = (1 − tanh(W_forget g)) ⊙ c + tanh(W_gain g) ⊙ m`.
-Controls: q ← loop_attn_*, k ← loop_k_*, v ← loop_v_*, ffn ← loop_mlp_*.
+Controls: q ← loop_q_ctrl_*, k ← loop_k_ctrl_*, v ← loop_v_ctrl_*, ffn ← loop_ffn_ctrl_* (legacy names loop_attn_*,
+loop_k_*, loop_v_*, loop_mlp_*).
 
 ### Layer (physical weights `L`, slot `s`, position `pos`)
 ```

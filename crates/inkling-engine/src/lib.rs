@@ -400,11 +400,13 @@ impl Engine {
         let what = if n_streams > 1 { format!("this model with {n_streams} streams of {n_ctx} positions") } else { format!("this model at context {n_ctx}") };
         check_vram(vram_free, need, &what)?;
         ensure!(n_streams == 1 || plan.n_cpu() == 0, "--parallel needs the whole model on the GPU, but {} MoE layers would run on the CPU; use a smaller --ctx or fewer streams", plan.n_cpu());
+        // the exchange buffer has no pageable fallback: pin it before the experts, which may exhaust what the driver
+        // grants (they fall back to pageable memory)
+        let io = if plan.n_cpu() > 0 { Some(gpu.alloc_host_mapped(std::mem::size_of::<cpu_moe::MoeIo>()).context("CPU offload exchange buffer")?) } else { None };
         let mut w = Weights::load(&gpu, &g, &cfg, &plan.on_cpu)?;
-        let cpu = if plan.n_cpu() > 0 {
+        let cpu = if let Some(io) = io {
             let threads = std::env::var("INKLING_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(cpu_moe::default_threads);
             let moe = Box::new(cpu_moe::CpuMoe::new(std::mem::take(&mut w.cpu), d, cfg.n_ff_exp, cfg.situ_beta, cfg.situ_linear_beta, threads));
-            let io = gpu.alloc_host_mapped(std::mem::size_of::<cpu_moe::MoeIo>()).context("CPU offload exchange buffer")?;
             let cbs = (0..cfg.n_phys).map(|layer| Box::new(cpu_moe::HostCb { moe: &*moe, io: io.host_ptr() as *mut cpu_moe::MoeIo, layer })).collect();
             let bufs = [gpu.alloc(plan.group_bytes)?, gpu.alloc(plan.group_bytes)?];
             let copy_stream = gpu.ctx.new_stream()?;

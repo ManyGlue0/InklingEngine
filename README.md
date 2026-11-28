@@ -63,8 +63,9 @@ So `q8` and `q6` are at that floor and `q4` costs a little. At 32k tokens the ga
 The forward pass is specified in [docs/MODEL.md](docs/MODEL.md).
 
 ### Quantizations
-All UD files of [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (the root folder,
-not `Mainline_Support`) run, except UD-Q8_K_XL, which stores weights in BF16. Each file mixes several formats
+All UD files of [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) run, except
+UD-Q8_K_XL, which stores weights in BF16. Both layouts load: the current one (llama.cpp's merged `inkling2_loop`,
+which Unsloth switched to on 2026-11-23) and the earlier `inkling2` files. Each file mixes several formats
 (NVFP4, Q8_0, the K-quants, the IQ formats, MXFP4 and Unsloth's Q2_0). The engine decodes all of them in its own
 kernels, on the GPU and in the CPU offload path. Measured on the RTX 3090:
 
@@ -196,8 +197,7 @@ On a CPU without AVX2 a scalar fallback runs, much slower.
   offload table; with UD-Q4_K_XL about 15 GB free for an 8 GB card, 11 GB for 12 GB, 7 GB for 16 GB).
 - **Driver:** a recent NVIDIA driver with CUDA 12.8+ support. Only the driver is needed to run; the toolkit is
   needed only to build.
-- **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): any UD file in the root folder
-  except UD-Q8_K_XL (see [Quantizations](#quantizations); UD-Q4_K_XL is the default choice, UD-Q3_K_XL for 16 GB
+- **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): any UD file except UD-Q8_K_XL (see [Quantizations](#quantizations); UD-Q4_K_XL is the default choice, UD-Q3_K_XL for 16 GB
   cards) and, for images, `mmproj-F32.gguf`. All nine were checked against the reference llama.cpp.
 - **To build:** Rust 1.85 or newer, and the CUDA Toolkit 12.x (`nvcc` on PATH or `CUDA_PATH` set).
 
@@ -496,8 +496,7 @@ Developer commands:
   drafter.
 - **Speculative decoding:** text only (images and structured output decode without the drafter), and not with CPU
   offload.
-- **One model:** Inkling 2 Mini only, in the UD GGUFs of Unsloth's root folder (not UD-Q8_K_XL, which uses BF16
-  weights, and not the `Mainline_Support` layout).
+- **One model:** Inkling 2 Mini only, in Unsloth's UD GGUFs (not UD-Q8_K_XL, which uses BF16 weights).
 - **Offload:** only the MoE experts move to the CPU; the rest of the model (about 3.3 GiB) and the KV cache stay in
   VRAM.
 - **Hardware:** NVIDIA GPUs only. Native FP4 tensor cores on Blackwell are not used yet; NVFP4 is decoded in

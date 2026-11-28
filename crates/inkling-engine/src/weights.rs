@@ -204,6 +204,21 @@ impl Loader<'_> {
         self.put(format!("{name}#f16"), inkling_cuda::as_bytes(&h))
     }
 
+    /// Small matrix dequantized on the host (F32, BF16, Q8_0 or a native codec) and uploaded as F16 or F32.
+    fn small(&mut self, name: &str, f16: bool) -> Result<u64> {
+        let t = self.g.require(name)?;
+        if t.ty == GgmlType::F32 {
+            return if f16 { self.f16(name) } else { self.raw(name) };
+        }
+        let v = tensor_f32(self.g, name)?;
+        if f16 {
+            let h: Vec<u16> = v.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect();
+            self.put(format!("{name}#f16"), inkling_cuda::as_bytes(&h))
+        } else {
+            self.put(format!("{name}#f32"), inkling_cuda::as_bytes(&v))
+        }
+    }
+
     fn raw_opt(&mut self, name: &str) -> Result<u64> {
         if self.g.tensor(name).is_some() { self.raw(name) } else { Ok(0) }
     }
@@ -318,8 +333,14 @@ impl Weights {
         let mut host_bufs = Vec::new();
         let mut cpu = Vec::with_capacity(cfg.n_phys);
         let d = cfg.n_embd;
-        let res = f32_rows(g, "loop_res_query.weight")?;
-        let kv = f32_rows(g, "loop_kv_res_query.weight")?;
+        // merged upstream layout: per-layer `loop_msg_query` and `loop_{q,k,v,ffn}_ctrl_*`; legacy: two global query
+        // tables and `loop_{attn,k,v,mlp}_*`
+        let merged = g.tensor(&format!("blk.{}.loop_msg_query.weight", cfg.core_start)).is_some();
+        let (res, kv) = if merged {
+            (Vec::new(), Vec::new())
+        } else {
+            (f32_rows(g, "loop_res_query.weight")?, f32_rows(g, "loop_kv_res_query.weight")?)
+        };
 
         let mut layers = Vec::with_capacity(cfg.n_phys);
         for i in 0..cfg.n_phys {
@@ -327,18 +348,26 @@ impl Weights {
             let lp = if (cfg.core_start..cfg.core_end).contains(&i) {
                 let f16 = std::env::var_os("INKLING_LOOP_F32").is_none();
                 let mut lw = LoopW { f16, down: [0; 4], gain: [0; 4], forget: [0; 4], msg_query: 0 };
-                for (c, nm) in ["attn", "k", "v", "mlp"].iter().enumerate() {
+                let names = if merged { ["q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl"] } else { ["attn", "k", "v", "mlp"] };
+                for (c, nm) in names.iter().enumerate() {
                     for (dst, kind) in [(&mut lw.down[c], "down"), (&mut lw.gain[c], "gain"), (&mut lw.forget[c], "forget")] {
                         let name = n(&format!("loop_{nm}_{kind}.weight"));
-                        *dst = if f16 { l.f16(&name)? } else { l.raw(&name)? };
+                        *dst = l.small(&name, f16)?;
                     }
                 }
-                // message queries of core layer ci: rows [res[2ci], kv[2ci], kv[2ci+1], res[2ci+1]] (q, k, v, ffn)
-                let ci = i - cfg.core_start;
-                let mut q = Vec::with_capacity(4 * d);
-                q.extend_from_slice(&res[2 * ci * d..(2 * ci + 1) * d]);
-                q.extend_from_slice(&kv[2 * ci * d..(2 * ci + 2) * d]);
-                q.extend_from_slice(&res[(2 * ci + 1) * d..(2 * ci + 2) * d]);
+                // message queries of core layer ci (q, k, v, ffn); legacy rows [res[2ci], kv[2ci], kv[2ci+1], res[2ci+1]]
+                let q = if merged {
+                    let q = f32_rows(g, &n("loop_msg_query.weight"))?;
+                    ensure!(q.len() == 4 * d, "{}: expected {d} x 4", n("loop_msg_query.weight"));
+                    q
+                } else {
+                    let ci = i - cfg.core_start;
+                    let mut q = Vec::with_capacity(4 * d);
+                    q.extend_from_slice(&res[2 * ci * d..(2 * ci + 1) * d]);
+                    q.extend_from_slice(&kv[2 * ci * d..(2 * ci + 2) * d]);
+                    q.extend_from_slice(&res[(2 * ci + 1) * d..(2 * ci + 2) * d]);
+                    q
+                };
                 lw.msg_query = l.put(n("msg_query"), inkling_cuda::as_bytes(&q))?;
                 Some(lw)
             } else {
@@ -419,6 +448,29 @@ impl Weights {
 /// Whether the token embedding table lives in host memory (default) instead of VRAM.
 pub fn embed_on_host() -> bool {
     std::env::var_os("INKLING_EMBED_GPU").is_none()
+}
+
+/// Any 2-D tensor of a small, dequantizable type as F32 values in row order.
+pub(crate) fn tensor_f32(g: &Gguf, name: &str) -> Result<Vec<f32>> {
+    let t = g.require(name)?;
+    let data = g.data(t);
+    let k = t.dims[0] as usize;
+    Ok(match t.ty {
+        GgmlType::F32 => data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        GgmlType::BF16 => data.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+        GgmlType::Q8_0 => data
+            .chunks_exact(34)
+            .flat_map(|b| {
+                let d = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+                b[2..].iter().map(move |&q| d * q as i8 as f32)
+            })
+            .collect(),
+        ty if crate::codecs::supported(ty.id()) => {
+            let rb = crate::codecs::row_bytes(ty.id(), k);
+            data.chunks_exact(rb).flat_map(|r| crate::codecs::dequant_row(ty.id(), r, k)).collect()
+        }
+        ty => bail!("{name}: type {} is not supported here", ty.name()),
+    })
 }
 
 pub(crate) fn f32_rows(g: &Gguf, name: &str) -> Result<Vec<f32>> {

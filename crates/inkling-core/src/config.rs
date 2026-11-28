@@ -1,8 +1,11 @@
 //! Inkling 2 model configuration and the per-token execution schedule (the looped layer passes).
 //!
-//! Reference: llama.cpp `src/models/inkling2.cpp` + `inkling2-loop.cpp` (branch inkling2-loop-legacy-layout).
-//! The legacy looped GGUF (arch `inkling2`, `inkling2.num_loops`) stores per-visit hparams arrays for 48 visits but
-//! only 24 physical blocks of weights; layers [core_start, core_end) run `num_loops` passes.
+//! Reference: llama.cpp `src/models/inkling2.cpp` + `inkling2-loop.cpp`.
+//! Two GGUF layouts of the same model are accepted:
+//! - legacy (arch `inkling2`, `inkling2.num_loops`): per-visit hparams arrays for 48 visits but only 24 physical
+//!   blocks of weights; layers [core_start, core_end) run `num_loops` passes;
+//! - merged upstream (arch `inkling2_loop`, `inkling2_loop.loop.{start,end,count}`): `block_count` and the arrays
+//!   count the 24 physical blocks.
 
 use anyhow::{Result, ensure};
 
@@ -67,27 +70,44 @@ fn arr_u64(g: &Gguf, key: &str) -> Result<Vec<u64>> {
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.str("general.architecture")?;
-        ensure!(arch == "inkling2", "unsupported architecture `{arch}` (expected inkling2)");
-        let k = |s: &str| format!("inkling2.{s}");
+        let merged = match &*arch {
+            "inkling2" => false,
+            "inkling2_loop" => true,
+            _ => anyhow::bail!("unsupported architecture `{arch}` (expected inkling2 or inkling2_loop)"),
+        };
+        let k = |s: &str| format!("{arch}.{s}");
 
-        let n_visit = g.u64(&k("block_count"))? as usize;
-        let core_start = g.u64(&k("loop.core_start"))? as usize;
-        let core_end = g.u64(&k("loop.core_end"))? as usize;
-        let n_passes = g.u64(&k("num_loops"))? as usize;
+        let (n_phys, core_start, core_end, n_passes);
+        if merged {
+            n_phys = g.u64(&k("block_count"))? as usize;
+            core_start = g.u64(&k("loop.start"))? as usize;
+            core_end = g.u64(&k("loop.end"))? as usize;
+            n_passes = g.u64(&k("loop.count"))? as usize;
+            ensure!(!matches!(g.get(&k("loop.varying")), Some(Value::Bool(true))), "variable loop counts are not supported");
+        } else {
+            let n_visit = g.u64(&k("block_count"))? as usize;
+            core_start = g.u64(&k("loop.core_start"))? as usize;
+            core_end = g.u64(&k("loop.core_end"))? as usize;
+            n_passes = g.u64(&k("num_loops"))? as usize;
+            ensure!(n_passes >= 1 && core_end > core_start, "invalid looped layout");
+            let extra = (n_passes - 1) * (core_end - core_start);
+            ensure!(core_end + extra <= n_visit, "invalid looped layout");
+            n_phys = n_visit - extra;
+        }
+        ensure!(n_passes >= 2 && core_start < core_end && core_end <= n_phys, "invalid loop core [{core_start}, {core_end}) x {n_passes} for {n_phys} layers");
         let n_core = core_end - core_start;
         let n_extra = (n_passes - 1) * n_core;
-        ensure!(n_passes >= 2 && core_end + n_extra <= n_visit, "invalid looped layout");
-        let n_phys = n_visit - n_extra;
+        let n_visit = n_phys + n_extra;
 
-        // fold the per-visit arrays back to physical layers (visit v -> physical layer)
-        let phys_of_visit = |v: usize| {
-            if v < core_start { v } else if v < core_end + n_extra { core_start + (v - core_start) % n_core } else { v - n_extra }
+        // per-layer arrays count either the visits (legacy) or the physical layers (merged)
+        let phys_of = |i: usize, len: usize| {
+            if len == n_phys || i < core_start { i } else if i < core_end + n_extra { core_start + (i - core_start) % n_core } else { i - n_extra }
         };
-        let swa_visit: Vec<u64> = arr_u64(g, &k("attention.sliding_window_pattern"))?;
-        ensure!(swa_visit.len() == n_visit, "sliding_window_pattern length {} != {n_visit}", swa_visit.len());
+        let swa_arr: Vec<u64> = arr_u64(g, &k("attention.sliding_window_pattern"))?;
+        ensure!(swa_arr.len() == n_visit || swa_arr.len() == n_phys, "sliding_window_pattern length {} (expected {n_phys} or {n_visit})", swa_arr.len());
         let mut is_swa = vec![false; n_phys];
-        for (v, &s) in swa_visit.iter().enumerate() {
-            is_swa[phys_of_visit(v)] = s != 0;
+        for (i, &s) in swa_arr.iter().enumerate() {
+            is_swa[phys_of(i, swa_arr.len())] = s != 0;
         }
         let heads = arr_u64(g, &k("attention.head_count"))?;
         let heads_kv = arr_u64(g, &k("attention.head_count_kv"))?;
