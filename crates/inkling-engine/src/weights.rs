@@ -469,6 +469,7 @@ pub(crate) fn tensor_f32(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     Ok(match t.ty {
         GgmlType::F32 => data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
         GgmlType::BF16 => data.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+        GgmlType::F16 => data.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
         GgmlType::Q8_0 => data
             .chunks_exact(34)
             .flat_map(|b| {

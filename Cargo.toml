@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/inkling-core", "crates/inkling-cuda", "crates/inkling-engine", "crates/inkling-cli", "crates/inkling-server"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ManyGlue0/InklingEngine"

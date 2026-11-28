@@ -220,9 +220,10 @@ On a CPU without AVX2 a scalar fallback runs, much slower.
 - **Driver:** a recent NVIDIA driver with CUDA 12.8+ support. Only the driver is needed to run; the toolkit is
   needed only to build.
 - **Model files:** from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth): any UD file except UD-Q8_K_XL (see [Quantizations](#quantizations); UD-Q4_K_XL is the default choice, UD-Q3_K_XL for 16 GB
-  cards) and, for images, `mmproj-F32.gguf`. All nine were checked against the reference llama.cpp. Or an AD file
-  from [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (seven checked, see
-  [Quantizations](#quantizations)).
+  cards). All nine were checked against the reference llama.cpp. Or an AD file from
+  [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (seven checked, see
+  [Quantizations](#quantizations)), including their uncensored builds. For images, a vision projector from either
+  repository: `mmproj-F32.gguf`, or the F16, BF16 and Q8_0 variants.
 - **To build:** Rust 1.85 or newer, and the CUDA Toolkit 12.x (`nvcc` on PATH or `CUDA_PATH` set).
 
 Tested with an RTX 3090 on Windows 11 and on Ubuntu 24.04 under WSL2: build, generation, server and image input.

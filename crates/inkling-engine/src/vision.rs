@@ -261,21 +261,25 @@ impl Vision {
             ensure!(a.len() == 3, "{k}: expected 3 values");
             Ok([a[0].as_f64().unwrap_or(0.5) as f32, a[1].as_f64().unwrap_or(0.5) as f32, a[2].as_f64().unwrap_or(0.5) as f32])
         };
-        let raw = |name: &str| -> Result<&[u8]> {
+        // tensors as F32 bytes: F32 as stored, F16 / BF16 / Q8_0 projectors dequantized (exact)
+        let raw = |name: &str| -> Result<std::borrow::Cow<'_, [u8]>> {
             let t = g.require(name)?;
-            ensure!(matches!(t.ty, inkling_core::gguf::GgmlType::F32), "{name}: expected an F32 mmproj tensor");
-            Ok(g.data(t))
+            if t.ty == inkling_core::gguf::GgmlType::F32 {
+                return Ok(std::borrow::Cow::Borrowed(g.data(t)));
+            }
+            let v = crate::weights::tensor_f32(&g, name)?;
+            Ok(std::borrow::Cow::Owned(as_bytes(&v).to_vec()))
         };
-        let f32b = |name: &str| -> Result<DevBuf> { gpu.upload(raw(name)?) };
-        let f16b = |name: &str| -> Result<DevBuf> { gpu.upload(as_bytes(&f16_bytes(raw(name)?))) };
+        let f32b = |name: &str| -> Result<DevBuf> { gpu.upload(&raw(name)?) };
+        let f16b = |name: &str| -> Result<DevBuf> { gpu.upload(as_bytes(&f16_bytes(&raw(name)?))) };
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
             let n = |s: &str| format!("v.blk.{i}.{s}");
             let mut qkv: Vec<u16> = Vec::with_capacity(3 * d * d);
             let mut qkv_b: Vec<u8> = Vec::with_capacity(3 * d * 4);
             for p in ["attn_q", "attn_k", "attn_v"] {
-                qkv.extend(f16_bytes(raw(&n(&format!("{p}.weight")))?));
-                qkv_b.extend_from_slice(raw(&n(&format!("{p}.bias")))?);
+                qkv.extend(f16_bytes(&raw(&n(&format!("{p}.weight")))?));
+                qkv_b.extend_from_slice(&raw(&n(&format!("{p}.bias")))?);
             }
             layers.push(VitLayer {
                 ln1_w: f32b(&n("ln1.weight"))?,
@@ -297,7 +301,7 @@ impl Vision {
         // patch embedding: [D][3 * ps * ps] padded to a multiple of 32
         let k = 3 * patch * patch;
         let kp = k.div_ceil(32) * 32;
-        let pw = f16_bytes(raw("v.patch_embd.weight")?);
+        let pw = f16_bytes(&raw("v.patch_embd.weight")?);
         ensure!(pw.len() == d * k, "patch embedding shape");
         let mut pwp = vec![0u16; d * kp];
         for r in 0..d {
